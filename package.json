@@ -1,0 +1,40 @@
+{
+  "name": "ai-usage-overlay-v3",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Floating overlay showing usage limits across AI subscriptions",
+  "author": "ayoub",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test.js",
+    "test:ui": "node ui-check.mjs",
+    "build": "node build.mjs"
+  },
+  "build": {
+    "appId": "com.local.ai-usage-overlay-v3",
+    "productName": "AI Usage Overlay v3",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "providers.js",
+      "themes.js",
+      "fonts/**",
+      "assets/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "artifactName": "AIUsageOverlayV3-Setup-${version}.${ext}",
+      "shortcutName": "AI Usage Overlay v3"
+    }
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "electron-builder": "^25.0.0",
+    "puppeteer-core": "^25.9.0"
+  }
+}

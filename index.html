@@ -1,0 +1,596 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>AI Usage Overlay</title>
+<style>
+  @font-face { font-family: Geist; src: url(fonts/geist.woff2) format('woff2'); font-weight: 100 900; font-display: block; }
+  /* Registered so it can transition: every hairline on the page animates by moving this one number. */
+  @property --p { syntax: '<percentage>'; inherits: false; initial-value: 0%; }
+  :root {
+    /* Noir. Every other theme overrides these on <body>, from themes.js. */
+    --bg: #171b23;
+    --bg-hi: #222833;
+    --line: #a4adbb26;
+    --fg: #f3f5f8;
+    --dim: #a4adbb;
+    --track: #ffffff1a;
+    --active: #ffffff0f;
+    --shadow: #0009;
+    --shadow-strong: #000c;
+    --highlight: #ffffff0b;
+    --blur: 0px;
+    --saturate: 100%;
+    --out: cubic-bezier(0.22, 1, 0.36, 1);
+    --in: cubic-bezier(0.4, 0, 1, 1);
+    --morph: cubic-bezier(0.32, 0.72, 0, 1);
+    interpolate-size: allow-keywords; /* lets the capsule grow to its content's auto size */
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: transparent; overflow: hidden; }
+  /* clip, not hidden: the capsule waits past the window's edge and must not make the page scrollable */
+  #stage { position: fixed; inset: 0; overflow: clip; }
+  body {
+    /* Declared on body, not :root, so they mix with the theme's colours rather than Noir's. */
+    --warn: color-mix(in srgb, #f5a623 78%, var(--fg));
+    --hot: color-mix(in srgb, #ff4d3d 78%, var(--fg));
+    --soft: color-mix(in srgb, var(--fg) 84%, var(--bg));
+    --halo: rgb(from var(--bg) r g b); /* the theme's background, made opaque */
+    --gap: 8px; /* how far the capsule floats off the screen edge */
+    font: 13px/1.35 Geist, 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+    color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+    cursor: default;
+    user-select: none;
+  }
+  .fig { font-variant-numeric: tabular-nums; letter-spacing: -0.035em; }
+  .g { color: var(--c); line-height: 1; }
+
+  /* ---- a hairline: every reading has one, filled to its percentage. Amber from 75%, red from 90%. */
+  .hair {
+    --tone: var(--c);
+    display: block;
+    height: 2px;
+    border-radius: 1px;
+    background: linear-gradient(90deg, var(--tone) var(--p), var(--track) var(--p));
+    transition: --p 700ms var(--out);
+  }
+  .warn > .hair { --tone: var(--warn); }
+  .hot > .hair { --tone: var(--hot); }
+  .rewind .hair, .rewind #lip i { transition: none; } /* land on empty, so the next value sweeps up */
+
+  /* ---- the capsule. At rest there is no surface at all: the marks, numbers and bars float on whatever
+     is underneath. Hovered, it grows into the panel and its surface fades in behind it. The numbers
+     never move while it grows. */
+  #island {
+    position: absolute;
+    display: flex;
+    border-radius: 20px;
+    isolation: isolate;
+    transform: var(--away);
+    transition: transform 300ms var(--out);
+  }
+  /* The surface, a layer of its own so it can fade: shown while the panel is open or you are carrying
+     the capsule, so you can see what you are holding. */
+  #island::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    pointer-events: none;
+    background-color: var(--bg);
+    /* A faint sheen from the top edge for depth, unless the theme brings its own surface. */
+    background-image: var(--surface, linear-gradient(180deg, color-mix(in srgb, var(--fg) 4%, transparent), transparent 110px));
+    backdrop-filter: blur(var(--blur)) saturate(var(--saturate));
+    border: 1px solid color-mix(in srgb, var(--fg) 14%, var(--line));
+    box-shadow: 0 18px 44px var(--shadow), 0 2px 6px color-mix(in srgb, var(--shadow) 50%, transparent), inset 0 1px 0 var(--highlight);
+    opacity: 0;
+    transition: opacity 200ms var(--out);
+  }
+  .open #island::before, .dragging #island::before { opacity: 1; }
+  .e-top #island { top: var(--gap); left: 50%; flex-direction: column; --home: translateX(-50%); --away: translate(-50%, calc(-100% - var(--gap) - 2px)); }
+  .e-bottom #island { bottom: var(--gap); left: 50%; flex-direction: column-reverse; --home: translateX(-50%); --away: translate(-50%, calc(100% + var(--gap) + 2px)); }
+  .e-left #island { left: var(--gap); top: 50%; flex-direction: row; --home: translateY(-50%); --away: translate(calc(-100% - var(--gap) - 2px), -50%); }
+  .e-right #island { right: var(--gap); top: 50%; flex-direction: row-reverse; --home: translateY(-50%); --away: translate(calc(100% + var(--gap) + 2px), -50%); }
+  .revealed #island { transform: var(--home); }
+  body:not(.revealed) #island { transition-duration: 190ms; transition-timing-function: var(--in); }
+  .dragging #island { transform: var(--home) scale(1.04); transition: none; }
+  .dragging #island::before { box-shadow: 0 24px 56px var(--shadow-strong); }
+
+  /* ---- the pill: per provider its mark, its number, and a bar under both. Space separates them, not
+     rules. Numbers sit right so the % signs line up down a side pill. */
+  /* With no surface behind it, a halo in the theme's background keeps it legible on anything: unseen on
+     a dark editor, a subtitle-style outline over a bright page. */
+  #summary {
+    display: flex;
+    justify-content: center;
+    gap: 18px;
+    flex-shrink: 0;
+    padding: 9px 14px 11px;
+    /* Stacked small shadows make a crisp outline; a wide blur reads as a smudge on light pages. */
+    filter: drop-shadow(0 0 0.6px var(--halo)) drop-shadow(0 0 0.6px var(--halo)) drop-shadow(0 0 1.2px var(--halo));
+    cursor: grab;
+  }
+  .e-left #summary, .e-right #summary { flex-direction: column; gap: 10px; padding: 10px 11px 12px; }
+  .dragging #summary { cursor: grabbing; }
+  .chip { display: grid; grid-template-columns: auto 1fr; align-items: baseline; column-gap: 9px; row-gap: 5px; min-width: 62px; }
+  /* A touch of stroke: at Small, ✳ is otherwise a hairline. */
+  .chip .g { font-size: 15px; -webkit-text-stroke: 0.4px currentColor; }
+  .chip .fig { text-align: right; }
+  .e-top .chip .fig, .e-bottom .chip .fig { text-align: left; } /* in a row there is no column to line up */
+  .chip b { font-size: 20px; font-weight: 600; line-height: 20px; }
+  .chip small { margin-left: 1px; color: var(--dim); font-size: 11px; font-weight: 500; letter-spacing: 0; }
+  .chip .hair { grid-column: 1 / -1; height: 3px; border-radius: 1.5px; background: linear-gradient(90deg, var(--tone) var(--p), color-mix(in srgb, var(--fg) 22%, transparent) var(--p)); }
+  .chip.off small { display: none; }
+  .chip.off b { color: var(--dim); font-weight: 400; }
+  .chip.warn b { color: var(--warn); }
+  .chip.hot b { color: var(--hot); }
+  .chip.hot .hair, #lip .hot { animation: pulse 1.8s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+
+  /* ---- the panel: a table, one line per limit, the columns lined up across every provider */
+  /* Size zooms the pill and the lip; the panel only grows past Large, never shrinks (--z = max(1, --s)).
+     Inside a zoomed element vh and vw are zoomed too, hence the divisions below. */
+  #summary, #lip { zoom: var(--s, 1); }
+  #details { zoom: var(--z, 1); display: flex; width: 0; height: 0; overflow: hidden; transition: width 340ms var(--morph), height 340ms var(--morph); }
+  .open #details { width: auto; height: auto; }
+  .inner {
+    container-type: inline-size;
+    flex-shrink: 0; /* keeps its width while the closed capsule clips it, or the bars hide before they sweep */
+    display: flex;
+    flex-direction: column;
+    width: min(300px, calc((100vw - 32px) / var(--z, 1)));
+    max-height: calc((100vh - 26px - 60px * var(--s, 1)) / var(--z, 1));
+    padding: 2px 14px 10px;
+    border-top: 1px solid var(--line);
+    opacity: 0;
+    transition: opacity 140ms linear;
+  }
+  .e-bottom .inner { padding: 8px 14px 4px; border-top: 0; border-bottom: 1px solid var(--line); }
+  /* Beside the pill the panel can be the shorter of the two: it fills the height and centres on it. */
+  .e-left .inner, .e-right .inner { justify-content: center; width: min(300px, calc((100vw - 26px - 86px * var(--s, 1)) / var(--z, 1))); max-height: calc((100vh - 36px) / var(--z, 1)); padding-top: 8px; border-top: 0; }
+  .e-left .inner { padding-left: 12px; border-left: 1px solid var(--line); }
+  .e-right .inner { padding-right: 12px; border-right: 1px solid var(--line); }
+  .open .inner { opacity: 1; transition-delay: 110ms; }
+
+  #sections { min-height: 0; margin-right: -8px; padding-right: 8px; overflow-y: auto; }
+  /* The -webkit- form, because the standard scrollbar-width keeps Windows' arrow buttons. */
+  #sections::-webkit-scrollbar { width: 4px; }
+  #sections::-webkit-scrollbar-thumb { border-radius: 2px; background: var(--line); }
+  .prov { padding-top: 10px; }
+  .prov + .prov { padding-top: 14px; }
+  header { display: flex; align-items: baseline; gap: 7px; padding-bottom: 2px; }
+  header .g { font-size: 11px; }
+  header b { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+  header span:last-child { color: var(--dim); font-size: 11.5px; }
+  .prov header span:last-child { min-width: 0; margin-left: auto; text-align: right; overflow-wrap: anywhere; }
+  /* The label column is fixed and the bar takes the rest, so it runs from the name to its number. */
+  .row { display: grid; grid-template-columns: 76px minmax(24px, 1fr) 40px 62px; align-items: center; column-gap: 10px; min-height: 24px; font-size: 12.5px; }
+  .row .l { color: var(--soft); overflow-wrap: anywhere; }
+  .row .hair { height: 3px; border-radius: 1.5px; }
+  .row .pc { font-weight: 600; text-align: right; }
+  .row .pc small { margin-left: 1px; color: var(--dim); font-size: 10.5px; font-weight: 500; letter-spacing: 0; }
+  .row .rs { color: var(--dim); font-size: 11.5px; text-align: right; white-space: nowrap; }
+  .pc b { font-weight: inherit; } /* b means bolder: inside a 600 span that is 900 */
+  .row.zero .l, .row.zero .pc b { color: var(--dim); } /* unused limits step back, so the used ones read first */
+  .row.warn .pc b { color: var(--warn); }
+  .row.hot .pc b { color: var(--hot); }
+  /* Too narrow for the bar: the number says it alone. */
+  @container (max-width: 250px) {
+    .row { grid-template-columns: minmax(0, 1fr) 40px 62px; }
+    .row .hair { display: none; }
+  }
+  .bank, .status { padding-top: 3px; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
+  .bank b { color: var(--soft); font-weight: 600; }
+  .status.warn { color: var(--warn); }
+  .status.bad { color: var(--hot); }
+  code { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, currentColor 13%, transparent); font: 0.95em 'Cascadia Mono', Consolas, monospace; }
+
+  .foot { display: flex; align-items: center; gap: 2px; flex-shrink: 0; padding-top: 12px; }
+  #ft { flex: 1; min-width: 0; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
+  button {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    color: var(--dim);
+    background: transparent;
+    border: 0;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: color 120ms, background 120ms, opacity 120ms;
+  }
+  button:hover:not(:disabled) { color: var(--fg); background: color-mix(in srgb, var(--fg) 10%, transparent); }
+  button:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button svg { width: 14px; height: 14px; }
+  #rf[aria-busy='true'] svg { animation: spin 800ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* A reset takes the panel over for six seconds, then gives it back. */
+  #notice { display: none; padding: 10px 0 2px; }
+  .noticing #notice { display: block; }
+  .noticing #sections, .noticing .foot { display: none; }
+  .life { animation: life 6s linear forwards; }
+  @keyframes life { from { --p: 100%; } to { --p: 0%; } }
+
+  /* ---- the lip: what stays on the edge while the capsule is away, one level per provider */
+  #lip { position: absolute; display: flex; gap: 3px; transition: opacity 120ms linear 150ms; }
+  .e-right #lip, .e-left #lip { top: 50%; flex-direction: column; transform: translateY(-50%); }
+  .e-top #lip, .e-bottom #lip { left: 50%; transform: translateX(-50%); }
+  .e-right #lip { right: 0; }
+  .e-left #lip { left: 0; }
+  .e-top #lip { top: 0; }
+  .e-bottom #lip { bottom: 0; }
+  .revealed #lip { opacity: 0; transition-delay: 0s; }
+  #lip i {
+    --dir: 0deg;
+    --tone: var(--c);
+    width: 5px;
+    height: 24px;
+    background: linear-gradient(var(--dir), var(--tone) var(--p), var(--bg) var(--p));
+    box-shadow: 0 0 0 1px var(--line), 0 2px 8px var(--shadow);
+    transition: --p 700ms var(--out);
+  }
+  #lip .warn { --tone: var(--warn); }
+  #lip .hot { --tone: var(--hot); }
+  .e-top #lip i, .e-bottom #lip i { --dir: 90deg; width: 24px; height: 5px; }
+  .e-right #lip i { border-radius: 3px 0 0 3px; }
+  .e-left #lip i { border-radius: 0 3px 3px 0; }
+  .e-top #lip i { border-radius: 0 0 3px 3px; }
+  .e-bottom #lip i { border-radius: 3px 3px 0 0; }
+  #lip .off { opacity: 0.4; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-delay: 0s !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      transition-delay: 0s !important;
+    }
+  }
+
+  /* ---- Showpiece themes: --aura paints a drifting wash above the surface and below every child, so
+     text and bars stay crisp. It lives on the surface, so it only runs while the panel is open. */
+  #island::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    pointer-events: none;
+    background: var(--aura, none);
+    background-size: var(--aura-size, auto);
+    opacity: 0;
+    mix-blend-mode: var(--aura-blend, normal);
+    filter: var(--aura-filter, none);
+  }
+  .open #island::after {
+    opacity: var(--aura-op, 0);
+    animation: var(--aura-anim, none) var(--aura-dur, 18s) ease-in-out infinite alternate;
+  }
+  @keyframes aurora-drift {
+    from { background-position: 0% 100%, 100% 0%, 50% 50%; }
+    to { background-position: 85% 0%, 15% 100%, 40% 30%; }
+  }
+  @keyframes molten-breathe {
+    from { background-position: 50% 106%, 8% 0%, 95% 25%; opacity: 0.65; }
+    to { background-position: 50% 80%, 16% 12%, 85% 35%; opacity: 1; }
+  }
+  @keyframes iridescent-flow {
+    from { background-position: 0% 50%; }
+    to { background-position: 100% 50%; }
+  }
+  @keyframes star-drift {
+    from { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0% 50%, 50% 50%; }
+    to { background-position: -60px 120px, 80px -40px, 40px 90px, -90px -60px, 120px 60px, -40px -80px, 70px 110px, -110px 30px, 100% 50%, 40% 50%; }
+  }
+  @keyframes chrome-sheen {
+    from { background-position: -80% 0; }
+    to { background-position: 180% 0; }
+  }
+  @keyframes grid-scroll {
+    from { background-position: 0 0, 0 0, 100% 100%; }
+    to { background-position: 0 52px, 52px 0, 100% 85%; }
+  }
+  @keyframes plasma-swirl {
+    from { background-position: 0% 50%; }
+    to { background-position: 100% 50%; }
+  }
+  @keyframes eclipse-breathe {
+    from { background-position: 50% 50%; opacity: 0.55; }
+    to { background-position: 50% 48%; opacity: 1; }
+  }
+  @keyframes supernova-pulse {
+    from { background-position: 50% 50%, 50% 50%; opacity: 0.6; }
+    to { background-position: 52% 48%, 50% 44%; opacity: 1; }
+  }
+  @keyframes lava-blobs {
+    from { background-position: 0% 0%, 100% 100%, 50% 0%; }
+    to { background-position: 60% 100%, 20% 0%, 80% 100%; }
+  }
+  @keyframes sonar-ping {
+    from { background-position: 50% 50%; opacity: 0.45; }
+    to { background-position: 50% 50%; opacity: 0.9; }
+  }
+  @keyframes glacier-shimmer {
+    from { background-position: 10% 90%; }
+    to { background-position: 90% 10%; }
+  }
+</style>
+
+<div id="stage">
+  <div id="lip" aria-hidden="true"></div>
+  <div id="island" role="region" aria-label="AI usage">
+    <div id="summary"></div>
+    <div id="details">
+      <div class="inner">
+        <div id="sections"></div>
+        <div id="notice" aria-live="polite"></div>
+        <div class="foot">
+          <span id="ft"></span>
+          <button id="rf" title="Refresh" aria-label="Refresh"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" /><path d="M13.6 2.2v3.4h-3.4" /></svg></button>
+          <button id="mn" title="Overlay settings" aria-label="Overlay settings"><svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3.2" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.8" cy="8" r="1.3" /></svg></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const island = $('#island');
+  const summary = $('#summary');
+  const sections = $('#sections');
+  const noticeEl = $('#notice');
+  const lip = $('#lip');
+  const ft = $('#ft');
+  const rf = $('#rf');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+  const body = document.body;
+  let data = [];
+  let open = false; // main's word: the cursor is on the capsule
+  let notice = null;
+  let noticeTimer = 0;
+  let drawn = ''; // the sections' last markup, so an unchanged push touches nothing
+
+  const esc = (s) => String(s ?? '').replace(/[<&"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '"': '&quot;' })[c]);
+  const level = (pct) => (pct >= 90 ? 'hot' : pct >= 75 ? 'warn' : '');
+  const pctText = (n) => String(Math.round(n * 10) / 10);
+  const setP = (el, p) => el.style.setProperty('--p', Math.max(0, Math.min(100, p)) + '%');
+  const ago = (t) => {
+    const m = Math.floor((Date.now() - t) / 60000);
+    return 'Updated ' + (m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.floor(m / 60) + ' hr ago');
+  };
+  body.className = 'e-right'; // until main says otherwise, so the capsule is never unplaced
+
+  // Counts in whole numbers and lands on `text`, so 42.6 rolls up through integers and ends exact.
+  function countTo(el, to, delay, text = String(to)) {
+    const from = parseInt(el.textContent, 10);
+    cancelAnimationFrame(el.roll);
+    if (reduced.matches || !Number.isFinite(from) || from === to) return void (el.textContent = text);
+    const t0 = performance.now();
+    const step = (t) => {
+      const k = Math.min(1, Math.max(0, t - t0 - delay) / 700);
+      el.textContent = k < 1 ? Math.round(from + (to - from) * (1 - (1 - k) ** 3)) : text;
+      if (k < 1) el.roll = requestAnimationFrame(step);
+    };
+    el.roll = requestAnimationFrame(step);
+  }
+
+  // ---- the pill and the lip, built once per provider list and patched after, so hairlines animate
+  function buildSummary() {
+    summary.innerHTML = data.map((p, i) =>
+      '<div class="chip" role="img" style="--c:' + esc(p.color) + '">' +
+        '<span class="g">' + esc(p.glyph) + '</span><span class="fig"><b>—</b><small>%</small></span>' +
+        '<i class="hair" style="transition-delay:' + i * 70 + 'ms"></i>' +
+      '</div>').join('');
+    lip.innerHTML = data.map((p) => '<i style="--c:' + esc(p.color) + '"></i>').join('');
+  }
+
+  function syncSummary() {
+    if (summary.children.length !== data.length) {
+      buildSummary();
+      return sweep();
+    }
+    data.forEach((p, i) => {
+      const off = !(p.rows || []).length;
+      const pct = off ? 0 : p.ringPercent ?? 0;
+      const chip = summary.children[i];
+      const tab = lip.children[i];
+      setP(chip.querySelector('.hair'), pct);
+      setP(tab, pct);
+      for (const el of [chip, tab]) {
+        el.classList.toggle('off', off);
+        el.classList.toggle('warn', level(pct) === 'warn');
+        el.classList.toggle('hot', level(pct) === 'hot');
+      }
+      const num = chip.querySelector('b');
+      if (off) {
+        cancelAnimationFrame(num.roll);
+        num.textContent = '—';
+      } else countTo(num, Math.round(pct), i * 70);
+      chip.setAttribute('aria-label', p.name + ': ' + (off ? 'usage unavailable' : Math.round(pct) + '% used'));
+    });
+  }
+
+  // Empty every hairline with transitions off, then let syncSummary sweep them up to the real numbers.
+  function sweep() {
+    body.classList.add('rewind');
+    [...summary.querySelectorAll('.hair'), ...lip.children].forEach((el) => setP(el, 0));
+    void body.offsetWidth;
+    body.classList.remove('rewind');
+    summary.querySelectorAll('b').forEach((b) => (b.textContent = '0'));
+    syncSummary();
+  }
+
+  // ---- the panel: every provider, every limit
+  // "4 banked resets expire Oct 4, 5, 22 and 29": every date, the month once per run of dates in it.
+  function banked(p) {
+    const n = p.bankedResets;
+    if (!Number.isSafeInteger(n) || n < 1) return '';
+    const ts = (p.bankedResetExpiries || []).filter(Number.isFinite);
+    const days = ts.map((t, i) => {
+      const d = new Date(t);
+      const run = i > 0 && new Date(ts[i - 1]).getMonth() === d.getMonth();
+      return (run ? '' : d.toLocaleDateString('en-US', { month: 'short' }) + ' ') + d.getDate();
+    });
+    const list = days.length > 1 ? days.slice(0, -1).join(', ') + ' and ' + days.at(-1) : days[0];
+    return '<p class="bank"><b class="fig">' + n + '</b> banked ' + (n === 1 ? 'reset' : 'resets') +
+      (list ? (n === 1 ? ' expires ' : ' expire ') + esc(list) : '') + '</p>';
+  }
+
+  function section(p) {
+    const rows = p.rows || [];
+    const wait = p.waitMs > 0 ? Math.ceil(p.waitMs / 1000) : 0;
+    const lines = [];
+    if (!rows.length) lines.push(p.error ? [p.error, ' bad'] : ['Waiting for usage data…', '']);
+    if (wait) lines.push(['Rate limited, retry in ' + (wait < 60 ? wait + 's' : Math.ceil(wait / 60) + ' min'), ' warn']);
+    else if (p.note) lines.push([p.note, '']);
+    // A provider that has fallen behind says so; the footer speaks for the ones that are current.
+    else if (p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push([ago(p.updatedAt), '']);
+    const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : ''; // OpenCode Go's plan is "Go": say it once
+    return '<section class="prov" style="--c:' + esc(p.color) + '">' +
+      '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span>' + esc(plan) + '</span></header>' +
+      rows.map((r) =>
+        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + r.label) + '" data-p="' + r.percent + '">' +
+          '<span class="l">' + esc(r.label) + '</span><i class="hair"></i>' +
+          '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span>' +
+          '<span class="rs">' + esc(r.resets) + '</span>' +
+        '</div>').join('') +
+      banked(p) +
+      // Providers write commands in backticks ("run `claude` to sign in"); show them as code.
+      lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
+    '</section>';
+  }
+
+  // Hairlines start where the previous markup left them, or empty when the panel is opening.
+  function drawSections(opening) {
+    const html = data.map(section).join('');
+    if (html === drawn && !opening) return;
+    drawn = html;
+    const was = new Map([...sections.querySelectorAll('[data-k]')].map((el) => [el.dataset.k, Number(el.dataset.p)]));
+    sections.innerHTML = html;
+    const rows = [...sections.querySelectorAll('[data-k]')];
+    const hair = (el) => el.querySelector('.hair');
+    rows.forEach((el) => setP(hair(el), opening ? 0 : was.get(el.dataset.k) ?? 0));
+    void sections.offsetWidth;
+    rows.forEach((el, n) => {
+      const delay = opening ? 120 + n * 30 : 0;
+      const p = Number(el.dataset.p);
+      hair(el).style.transitionDelay = delay ? delay + 'ms' : '';
+      setP(hair(el), p);
+      if (!opening) return;
+      // Only as the panel opens: each number counts up with its line.
+      const b = el.querySelector('.pc b');
+      b.textContent = '0';
+      countTo(b, p, delay, pctText(p));
+    });
+  }
+
+  function syncFoot() {
+    const newest = Math.max(0, ...data.map((p) => p.updatedAt || 0));
+    ft.textContent = newest ? ago(newest) : 'Loading…';
+    rf.removeAttribute('aria-busy');
+    rf.disabled = data.length > 0 && data.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest
+  }
+
+  rf.onclick = () => {
+    // Immediate feedback, because a refresh can legitimately change nothing on screen.
+    rf.disabled = true;
+    rf.setAttribute('aria-busy', 'true');
+    window.api.refresh();
+  };
+  $('#mn').onclick = () => window.api.menu();
+
+  function shown() {
+    body.classList.toggle('open', open || Boolean(notice));
+    body.classList.toggle('noticing', Boolean(notice) && !open);
+    sendRects();
+  }
+
+  function showNotice(n) {
+    clearTimeout(noticeTimer);
+    notice = n;
+    if (n) {
+      noticeEl.style.setProperty('--c', n.color);
+      noticeEl.innerHTML =
+        '<header><span class="g">' + esc(n.glyph) + '</span><b>' + esc(n.name) + '</b><span>limit reset</span></header>' +
+        n.rows.map((r) => '<div class="row"><span class="l">' + esc(r.label) + '</span><i class="hair life"></i>' +
+          '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span><span class="rs">just now</span></div>').join('');
+      noticeTimer = setTimeout(() => showNotice(null), 6000);
+    }
+    shown();
+  }
+
+  // ---- main does the hit-testing, so it needs to know where everything ended up
+  let frame = 0;
+  const box = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
+  };
+  function sendRects() {
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => window.api.rects({ lip: box(lip), island: box(island) }));
+  }
+
+  function refresh() {
+    syncSummary();
+    drawSections(false);
+    syncFoot();
+    sendRects();
+  }
+
+  window.api.onLayout((l) => {
+    body.classList.remove('e-left', 'e-right', 'e-top', 'e-bottom');
+    body.classList.add('e-' + l.edge);
+    body.dataset.theme = l.theme || 'noir';
+    body.style.cssText = l.css || '';
+    body.style.setProperty('--s', l.scale || 1);
+    body.style.setProperty('--z', Math.max(1, l.scale || 1));
+    buildSummary();
+    refresh();
+  });
+
+  window.api.onData((d) => {
+    data = d;
+    refresh();
+  });
+
+  window.api.onOpen((v) => {
+    if (v === open) return;
+    open = v;
+    if (open) {
+      clearTimeout(noticeTimer);
+      notice = null;
+      drawSections(true); // fill the hairlines as the panel grows, not after
+    }
+    shown();
+  });
+
+  window.api.onReset(showNotice);
+
+  window.api.onReveal((v) => {
+    body.classList.toggle('revealed', v);
+    if (v) sweep(); // the hairlines fill as the capsule slides out
+    sendRects();
+  });
+  window.api.onDragging((v) => body.classList.toggle('dragging', v));
+  island.addEventListener('transitionend', sendRects);
+
+  // Grab the pill to move the capsule; main follows the cursor and snaps on release.
+  summary.addEventListener('mousedown', (e) => e.button === 0 && window.api.dragStart());
+  addEventListener('mouseup', () => window.api.dragEnd());
+  addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    window.api.menu();
+  });
+  addEventListener('resize', sendRects);
+
+  window.api.get().then((d) => {
+    data = d;
+    refresh();
+  });
+</script>
