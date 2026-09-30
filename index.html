@@ -42,7 +42,9 @@
     user-select: none;
   }
   .fig { font-variant-numeric: tabular-nums; letter-spacing: -0.035em; }
-  .g { color: var(--c); line-height: 1; }
+  /* Each mark sits in a box of its own, centred: ✳ ◉ ▣ come from fallback fonts with three different
+     baselines, so aligning them to the text's baseline leaves them riding at three different heights. */
+  .g { display: inline-grid; place-items: center; width: 1.3em; height: 1.3em; color: var(--c); line-height: 1; }
 
   /* ---- a hairline: every reading has one, filled to its percentage. Amber from 75%, red from 90%. */
   .hair {
@@ -106,20 +108,21 @@
     gap: 18px;
     flex-shrink: 0;
     padding: 9px 14px 11px;
-    /* Stacked small shadows make a crisp outline; a wide blur reads as a smudge on light pages. */
-    filter: drop-shadow(0 0 0.6px var(--halo)) drop-shadow(0 0 0.6px var(--halo)) drop-shadow(0 0 1.2px var(--halo));
+    /* Four unblurred 1px shadows, one per side, chain into a hard outline. A blur reads as a smudge on light pages. */
+    filter: drop-shadow(1px 0 0 var(--halo)) drop-shadow(-1px 0 0 var(--halo)) drop-shadow(0 1px 0 var(--halo)) drop-shadow(0 -1px 0 var(--halo));
     cursor: grab;
   }
   .e-left #summary, .e-right #summary { flex-direction: column; gap: 10px; padding: 10px 11px 12px; }
   .dragging #summary { cursor: grabbing; }
   .chip { display: grid; grid-template-columns: auto 1fr; align-items: baseline; column-gap: 9px; row-gap: 5px; min-width: 62px; }
-  /* A touch of stroke: at Small, ✳ is otherwise a hairline. */
+  /* A touch of stroke: ✳ is otherwise a hairline, and the outline around the pill swallows it on a bright page. */
   .chip .g { font-size: 15px; -webkit-text-stroke: 0.4px currentColor; }
   .chip .fig { text-align: right; }
   .e-top .chip .fig, .e-bottom .chip .fig { text-align: left; } /* in a row there is no column to line up */
   .chip b { font-size: 20px; font-weight: 600; line-height: 20px; }
-  .chip small { margin-left: 1px; color: var(--dim); font-size: 11px; font-weight: 500; letter-spacing: 0; }
-  .chip .hair { grid-column: 1 / -1; height: 3px; border-radius: 1.5px; background: linear-gradient(90deg, var(--tone) var(--p), color-mix(in srgb, var(--fg) 22%, transparent) var(--p)); }
+  .chip small { margin-left: 1px; color: var(--soft); font-size: 11px; font-weight: 500; letter-spacing: 0; }
+  /* An opaque track: a see-through one turns to grey mud over a bright page, with nothing behind the pill to tint it. */
+  .chip .hair { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--tone) var(--p), color-mix(in srgb, var(--fg) 30%, var(--halo)) var(--p)); }
   .chip.off small { display: none; }
   .chip.off b { color: var(--dim); font-weight: 400; }
   .chip.warn b { color: var(--warn); }
@@ -158,15 +161,17 @@
   #sections::-webkit-scrollbar-thumb { border-radius: 2px; background: var(--line); }
   .prov { padding-top: 10px; }
   .prov + .prov { padding-top: 14px; }
-  header { display: flex; align-items: baseline; gap: 7px; padding-bottom: 2px; }
-  header .g { font-size: 11px; }
+  /* The mark's box is as tall as the name's first line, so the two share a centre even when the plan wraps. */
+  header { display: flex; align-items: flex-start; gap: 6px; padding-bottom: 2px; }
+  header .g { width: 14px; height: calc(13px * 1.35); font-size: 12px; }
   header b { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
-  header span:last-child { color: var(--dim); font-size: 11.5px; }
+  header span:last-child { padding-top: 1px; color: var(--dim); font-size: 11.5px; }
   .prov header span:last-child { min-width: 0; margin-left: auto; text-align: right; overflow-wrap: anywhere; }
   /* The label column is fixed and the bar takes the rest, so it runs from the name to its number. */
-  .row { display: grid; grid-template-columns: 76px minmax(24px, 1fr) 40px 62px; align-items: center; column-gap: 10px; min-height: 24px; font-size: 12.5px; }
+  /* 44px for the number: OpenCode Go reports 18.4%, and 40px left it touching the bar. */
+  .row { display: grid; grid-template-columns: 72px minmax(24px, 1fr) 44px 62px; align-items: center; column-gap: 8px; min-height: 24px; font-size: 12.5px; }
   .row .l { color: var(--soft); overflow-wrap: anywhere; }
-  .row .hair { height: 3px; border-radius: 1.5px; }
+  .row .hair { height: 4px; border-radius: 2px; }
   .row .pc { font-weight: 600; text-align: right; }
   .row .pc small { margin-left: 1px; color: var(--dim); font-size: 10.5px; font-weight: 500; letter-spacing: 0; }
   .row .rs { color: var(--dim); font-size: 11.5px; text-align: right; white-space: nowrap; }
@@ -176,7 +181,7 @@
   .row.hot .pc b { color: var(--hot); }
   /* Too narrow for the bar: the number says it alone. */
   @container (max-width: 250px) {
-    .row { grid-template-columns: minmax(0, 1fr) 40px 62px; }
+    .row { grid-template-columns: minmax(0, 1fr) 44px 62px; }
     .row .hair { display: none; }
   }
   .bank, .status { padding-top: 3px; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
@@ -211,6 +216,7 @@
   /* A reset takes the panel over for six seconds, then gives it back. */
   #notice { display: none; padding: 10px 0 2px; }
   .noticing #notice { display: block; }
+  #notice header span:last-child { color: var(--c); font-weight: 500; } /* the event, in the provider's colour */
   .noticing #sections, .noticing .foot { display: none; }
   .life { animation: life 6s linear forwards; }
   @keyframes life { from { --p: 100%; } to { --p: 0%; } }
