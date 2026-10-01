@@ -159,17 +159,21 @@
   /* The -webkit- form, because the standard scrollbar-width keeps Windows' arrow buttons. */
   #sections::-webkit-scrollbar { width: 4px; }
   #sections::-webkit-scrollbar-thumb { border-radius: 2px; background: var(--line); }
-  .prov { padding-top: 10px; }
-  .prov + .prov { padding-top: 14px; }
+  /* A hairline between providers, with equal room either side, so the table reads as one ledger. */
+  .prov { padding: 9px 0 10px; }
+  .prov + .prov { border-top: 1px solid var(--line); }
   /* The mark's box is as tall as the name's first line, so the two share a centre even when the plan wraps. */
   header { display: flex; align-items: flex-start; gap: 6px; padding-bottom: 2px; }
   header .g { width: 14px; height: calc(13px * 1.35); font-size: 12px; }
-  header b { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+  header b { flex-shrink: 0; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; } /* the plan tag gives way, never the name */
   header span:last-child { padding-top: 1px; color: var(--dim); font-size: 11.5px; }
-  .prov header span:last-child { min-width: 0; margin-left: auto; text-align: right; overflow-wrap: anywhere; }
+  /* The plan is a tag, outlined in the same hairline as the rules. */
+  /* One line: a long plan ellipsizes, with the whole name in its tooltip, rather than wrapping into a box. */
+  .prov header span:last-child { min-width: 0; margin: 1px 0 0 auto; padding: 0 6px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--line); font-size: 11px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .prov header span:empty { display: none; } /* OpenCode Go's plan repeats its name, so the renderer drops it */
   /* The label column is fixed and the bar takes the rest, so it runs from the name to its number. */
   /* 44px for the number: OpenCode Go reports 18.4%, and 40px left it touching the bar. */
-  .row { display: grid; grid-template-columns: 72px minmax(24px, 1fr) 44px 62px; align-items: center; column-gap: 8px; min-height: 24px; font-size: 12.5px; }
+  .row { display: grid; grid-template-columns: 72px minmax(24px, 1fr) 44px 62px; align-items: center; column-gap: 8px; min-height: 22px; font-size: 12.5px; }
   .row .l { color: var(--soft); overflow-wrap: anywhere; }
   .row .hair { height: 4px; border-radius: 2px; }
   .row .pc { font-weight: 600; text-align: right; }
@@ -190,7 +194,7 @@
   .status.bad { color: var(--hot); }
   code { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, currentColor 13%, transparent); font: 0.95em 'Cascadia Mono', Consolas, monospace; }
 
-  .foot { display: flex; align-items: center; gap: 2px; flex-shrink: 0; padding-top: 12px; }
+  .foot { display: flex; align-items: center; gap: 2px; flex-shrink: 0; padding-top: 8px; border-top: 1px solid var(--line); }
   #ft { flex: 1; min-width: 0; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
   button {
     display: grid;
@@ -459,7 +463,7 @@
     else if (p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push([ago(p.updatedAt), '']);
     const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : ''; // OpenCode Go's plan is "Go": say it once
     return '<section class="prov" style="--c:' + esc(p.color) + '">' +
-      '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span>' + esc(plan) + '</span></header>' +
+      '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span title="' + esc(plan) + '">' + esc(plan) + '</span></header>' +
       rows.map((r) =>
         '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + r.label) + '" data-p="' + r.percent + '">' +
           '<span class="l">' + esc(r.label) + '</span><i class="hair"></i>' +
