@@ -196,8 +196,9 @@ function recentRollouts(root) {
   return days.sort().slice(-2);
 }
 
-function newestRollout() {
-  let best = null;
+// Newest first, by modification time.
+function rollouts() {
+  const found = [];
   for (const root of CODEX_SESSION_ROOTS) for (const day of recentRollouts(root)) {
     let names;
     try {
@@ -209,34 +210,36 @@ function newestRollout() {
       if (!n.endsWith('.jsonl')) continue;
       const p = path.join(day, n);
       try {
-        const m = fs.statSync(p).mtimeMs;
-        if (!best || m > best.m) best = { p, m };
+        found.push({ p, m: fs.statSync(p).mtimeMs });
       } catch {
         /* file rotated away mid-scan */
       }
     }
   }
-  return best;
+  return found.sort((a, b) => b.m - a.m);
 }
 
+// The last usage event in a rollout's tail, as { rl, at }: at is when Codex logged it (NaN if it didn't say).
 function lastRateLimits(file) {
   let buf;
+  let fd;
   try {
-    const fd = fs.openSync(file, 'r');
+    fd = fs.openSync(file, 'r');
     const size = fs.fstatSync(fd).size;
     const len = Math.min(size, TAIL_BYTES);
     buf = Buffer.alloc(len);
     fs.readSync(fd, buf, 0, len, size - len);
-    fs.closeSync(fd);
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd); // this process runs for days; a failed read must not keep the handle
   }
   const lines = buf.toString('utf8').split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].includes('"rate_limits"')) continue;
     try {
-      const rl = JSON.parse(lines[i])?.payload?.rate_limits;
-      if (rl) return rl;
+      const line = JSON.parse(lines[i]);
+      if (line?.payload?.rate_limits) return { rl: line.payload.rate_limits, at: Date.parse(line.timestamp) };
     } catch {
       /* a truncated first line, or a line that only mentions the word */
     }
@@ -244,10 +247,27 @@ function lastRateLimits(file) {
   return null;
 }
 
-function readCodexFallback(note) {
-  const f = newestRollout();
-  if (!f) return { error: 'No Codex sessions found.' };
-  return { ...shapeCodex(lastRateLimits(f.p)), updatedAt: f.m, ...(note ? { note } : {}) };
+// `why` is why live usage didn't come. It rides along on the reading, so main can still say it when it
+// keeps a newer reading already on screen instead of this older local one.
+function readCodexFallback(why) {
+  const files = rollouts();
+  // Soft, like the no-usage case below: a reading already on screen stays instead of being blanked.
+  if (!files.length) return { error: 'No Codex sessions found.', soft: true };
+  // The newest usage event wins, by its own time. Appending a message to an old session bumps its file
+  // time without new usage, and a clock change or restored file times can put an event after its file's
+  // time, so file time can't end the search early. It only orders it, which settles ties: the newest
+  // file wins. Undated events rank below every dated one. A just-started session has no event and is skipped.
+  // ponytail: reads every rollout of the last two days (256 KiB tail each); fine at a 5-minute poll.
+  let best = null;
+  for (const f of files) {
+    const hit = lastRateLimits(f.p);
+    const shaped = hit && shapeCodex(hit.rl);
+    if (!shaped || shaped.error) continue;
+    const at = Number.isFinite(hit.at) ? hit.at : -Infinity;
+    if (!best || at > best.at) best = { shaped, at };
+  }
+  if (!best) return { error: 'No Codex usage in recent sessions — run `codex` once.', soft: true };
+  return { ...best.shaped, ...(best.at > -Infinity ? { updatedAt: best.at } : {}), note: why + '; showing local usage.', why: why + '.' };
 }
 
 async function readCodex() {
@@ -257,7 +277,7 @@ async function readCodex() {
   } catch {
     /* local usage is still available without credentials */
   }
-  if (!tokens?.access_token) return readCodexFallback('Live refresh unavailable; showing local usage.');
+  if (!tokens?.access_token) return readCodexFallback('Live refresh unavailable');
 
   const headers = {
     Authorization: `Bearer ${tokens.access_token}`,
@@ -277,10 +297,10 @@ async function readCodex() {
         // Expiry lookup failure must not discard the live usage or reset count.
       }
     }
-    return shaped.error ? readCodexFallback('Live usage unavailable; showing local usage.') : { ...shaped, updatedAt: Date.now() };
+    return shaped.error ? readCodexFallback('Live usage unavailable') : { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
-    return readCodexFallback('Live refresh failed; showing local usage.');
+    return readCodexFallback('Live refresh failed');
   }
 }
 
@@ -325,4 +345,4 @@ const PROVIDERS = [
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
 ];
 
-module.exports = { PROVIDERS, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits, newestRollout };
+module.exports = { PROVIDERS, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

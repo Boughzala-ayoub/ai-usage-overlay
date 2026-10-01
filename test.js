@@ -133,9 +133,18 @@ fs.writeFileSync(
   '{"broken":"line",\n' +
     JSON.stringify({ payload: { rate_limits: { primary: { used_percent: 5, window_minutes: 300 } } } }) + '\n' +
     '{"type":"message","text":"mentions rate_limits but has none"}\n' +
-    JSON.stringify({ payload: { rate_limits: { primary: { used_percent: 9, window_minutes: 300 } } } }) + '\n'
+    JSON.stringify({ timestamp: '2026-09-29T01:00:00Z', payload: { rate_limits: { primary: { used_percent: 9, window_minutes: 300 } } } }) + '\n'
 );
-assert.strictEqual(lastRateLimits(tmp).primary.used_percent, 9);
+assert.strictEqual(lastRateLimits(tmp).rl.primary.used_percent, 9);
+assert.strictEqual(lastRateLimits(tmp).at, Date.parse('2026-09-29T01:00:00Z'), 'a reading is as fresh as its event, not its file');
+// A read that fails after the open still closes the file.
+const { readSync, closeSync } = fs;
+let closed = 0;
+fs.readSync = () => { throw new Error('EIO'); };
+fs.closeSync = (fd) => { closed++; closeSync(fd); };
+assert.strictEqual(lastRateLimits(tmp), null);
+Object.assign(fs, { readSync, closeSync });
+assert.strictEqual(closed, 1, 'no leaked handle');
 fs.unlinkSync(tmp);
 assert.strictEqual(lastRateLimits(path.join(os.tmpdir(), 'nope.jsonl')), null);
 
@@ -145,19 +154,39 @@ const rolloutDir = path.join(codexHome, 'sessions', '2026', '08', '30');
 fs.mkdirSync(rolloutDir, { recursive: true });
 fs.writeFileSync(
   path.join(rolloutDir, 'rollout-test.jsonl'),
-  JSON.stringify({ payload: { rate_limits: { primary: { used_percent: 77, window_minutes: 10080 } } } }) + '\n'
+  JSON.stringify({ timestamp: '2026-08-30T01:00:00Z', payload: { rate_limits: { primary: { used_percent: 77, window_minutes: 10080 } } } }) + '\n'
 );
-const previousCodexHome = process.env.CODEX_HOME;
-process.env.CODEX_HOME = codexHome;
-const originalHomedir = os.homedir;
-os.homedir = () => codexHome;
-delete require.cache[require.resolve('./providers')];
-const configuredProvider = require('./providers').PROVIDERS.find((p) => p.id === 'codex');
-os.homedir = originalHomedir;
-if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-else process.env.CODEX_HOME = previousCodexHome;
+// A session started since then, with no usage event yet: newer, but it must not hide the reading above.
+const freshSession = path.join(rolloutDir, 'rollout-new.jsonl');
+fs.writeFileSync(freshSession, JSON.stringify({ timestamp: '2026-08-30T09:00:00Z', type: 'session_meta', payload: {} }) + '\n');
+fs.utimesSync(freshSession, new Date(), new Date(Date.now() + 60_000));
+// Orca's root, with a file changed more recently than the one above but holding an older usage event.
+// Event time picks the reading, across roots, whatever the file times say.
+const orcaDir = path.join(codexHome, 'orca', 'sessions', '2026', '08', '30');
+fs.mkdirSync(orcaDir, { recursive: true });
+const orcaFile = path.join(orcaDir, 'rollout-orca.jsonl');
+fs.writeFileSync(orcaFile, JSON.stringify({ timestamp: '2026-08-30T00:30:00Z', payload: { rate_limits: { primary: { used_percent: 20, window_minutes: 10080 } } } }) + '\n');
+fs.utimesSync(orcaFile, new Date(), new Date(Date.now() + 30_000));
+
+// providers.js reads its paths once, at require. Orca's root is set too, or the test reads the real one.
+function loadCodex(home, orca) {
+  const saved = { CODEX_HOME: process.env.CODEX_HOME, ORCA_CODEX_HOME: process.env.ORCA_CODEX_HOME };
+  const homedir = os.homedir;
+  Object.assign(process.env, { CODEX_HOME: home, ORCA_CODEX_HOME: orca });
+  os.homedir = () => home;
+  delete require.cache[require.resolve('./providers')];
+  const codex = require('./providers').PROVIDERS.find((p) => p.id === 'codex');
+  os.homedir = homedir;
+  for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  return codex;
+}
+const configuredProvider = loadCodex(codexHome, path.join(codexHome, 'orca'));
 configuredProvider.read()
-  .then((configured) => assert.strictEqual(configured.rows[0].percent, 77, 'Codex usage follows CODEX_HOME'))
+  .then((configured) => {
+    assert.strictEqual(configured.rows[0].percent, 77, 'the newest usage event wins, past a newer session with none and a newer file with an older one');
+    assert.strictEqual(configured.updatedAt, Date.parse('2026-08-30T01:00:00Z'), 'fallback freshness comes from the event');
+    assert.strictEqual(configured.why, 'Live refresh unavailable.', 'a fallback says why live usage did not come');
+  })
   .then(async () => {
     fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'wrong-home-token' } }));
     fs.mkdirSync(path.join(codexHome, '.codex'));
@@ -238,5 +267,110 @@ configuredProvider.read()
       else process.env.OPENCODE_API_KEY = originalKey;
     }
   })
+  .then(async () => {
+    // No session files at all, as in an empty or unreadable tree, is soft too, so a reading on screen survives it.
+    const empty = path.join(codexHome, 'empty');
+    fs.mkdirSync(empty);
+    const none = await loadCodex(empty, empty).read();
+    assert.ok(none.error && none.soft, 'no sessions keeps the last reading');
+
+    // An event stamped after its file's last write (a clock change, file times restored on their own)
+    // still counts: file time orders the search but doesn't end it.
+    const skew = path.join(codexHome, 'skew');
+    const skewDir = path.join(skew, 'sessions', '2026', '10', '01');
+    fs.mkdirSync(skewDir, { recursive: true });
+    const rollout = (name, percent, at, mtime) => {
+      const file = path.join(skewDir, name);
+      fs.writeFileSync(file, JSON.stringify({ timestamp: at, payload: { rate_limits: { primary: { used_percent: percent, window_minutes: 300 } } } }) + '\n');
+      fs.utimesSync(file, new Date(mtime), new Date(mtime));
+    };
+    rollout('a.jsonl', 20, '2026-10-01T01:00:00Z', '2026-10-01T01:10:00Z');
+    rollout('b.jsonl', 80, '2026-10-01T01:05:00Z', '2026-10-01T00:55:00Z');
+    const skewed = await loadCodex(skew, skew).read();
+    assert.strictEqual(skewed.rows[0].percent, 80, 'the newest event wins even when its file looks older');
+  })
+  .then(mainChecks)
   .then(() => console.log('ok'))
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+
+// --- main.js polling and persistence, with Electron faked and fake providers: the paths no renderer test reaches.
+async function mainChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-main-'));
+  const on = {};
+  const electron = {
+    app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
+    ipcMain: { on() {}, handle() {} },
+    globalShortcut: { unregisterAll() {} },
+  };
+  const mod = { exports: {} };
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { readOne, saveState, gate, last };';
+  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : require(id)), mod, __dirname);
+  const { readOne, saveState, gate, last } = mod.exports;
+  const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+  const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
+    await new Promise((r) => setTimeout(r, wait));
+    return { rows: [{ label: 'Weekly', percent }], updatedAt: 1 };
+  } });
+  const realNow = Date.now;
+  try {
+    // Three providers landing inside one save debounce all reach disk, and quit doesn't wait for the debounce.
+    await Promise.all(['claude', 'codex', 'opencode-go'].map((id) => readOne(reading(id, 5), true)));
+    on['will-quit']();
+    assert.deepStrictEqual(Object.keys(saved().cache).sort(), ['claude', 'codex', 'opencode-go'], 'no provider lost from the saved cache');
+
+    // Two refreshes of one provider share a request, so a slow older answer can't land last.
+    let calls = 0;
+    const slow = reading('codex', 9, 20);
+    const read = slow.read;
+    slow.read = () => (calls++, read());
+    await Promise.all([readOne(slow, true), readOne(slow, true)]);
+    assert.strictEqual(calls, 1, 'overlapping refreshes join one request');
+
+    // A local fallback older than the live reading on screen is no news; a newer reading still lands.
+    const codexAt = (percent, updatedAt, extra) => ({ id: 'codex', everyMs: 0, read: async () => ({ rows: [{ label: '5h limit', percent }], updatedAt, ...extra }) });
+    await readOne(codexAt(80, 2000), true);
+    await readOne(codexAt(20, 1000, { note: 'Live refresh failed; showing local usage.', why: 'Live refresh failed.' }), true);
+    assert.strictEqual(last.get('codex').rows[0].percent, 80, 'an older fallback keeps the newer reading');
+    assert.strictEqual(last.get('codex').note, 'Live refresh failed.', 'and says why it did not move');
+    await readOne(codexAt(10, 3000, { note: 'Live refresh failed; showing local usage.', why: 'Live refresh failed.' }), true);
+    assert.strictEqual(last.get('codex').rows[0].percent, 10, 'a newer fallback still lands');
+
+    // Retry-After runs from the 429's arrival, 14s after the request left.
+    let clock = realNow();
+    Date.now = () => clock;
+    await readOne({ id: 'claude', everyMs: 0, read: async () => ((clock += 14_000), { error: 'Rate limited', soft: true, retryAfter: 60 }) }, true);
+    assert.strictEqual(gate.get('claude'), clock + 60_000, 'gate counts from receipt');
+    Date.now = realNow;
+
+    // A save that fails partway, writing or replacing, leaves the last good file whole and keeps its
+    // changes for the next save.
+    saveState({ theme: 'paper' });
+    on['will-quit']();
+    const { writeFileSync, renameSync } = fs;
+    try {
+      fs.writeFileSync = (file, data, ...rest) => {
+        writeFileSync(file, String(data).slice(0, 10), ...rest);
+        throw Object.assign(new Error('no space left'), { code: 'ENOSPC' });
+      };
+      saveState({ scale: 0.68 });
+      on['will-quit']();
+      assert.strictEqual(saved().theme, 'paper', 'a partial write leaves the saved file whole');
+      fs.writeFileSync = writeFileSync;
+      fs.renameSync = () => { throw Object.assign(new Error('file in use'), { code: 'EPERM' }); };
+      saveState({ edge: 'left' });
+      on['will-quit']();
+      assert.strictEqual(saved().theme, 'paper', 'so does a failed replace');
+    } finally {
+      Object.assign(fs, { writeFileSync, renameSync });
+    }
+    saveState({ autoHide: false });
+    on['will-quit']();
+    const after = saved();
+    assert.deepStrictEqual([after.theme, after.scale, after.edge, after.autoHide], ['paper', 0.68, 'left', false], 'failed saves wait for the next one');
+    assert.ok(Object.keys(after.cache).length, 'with the readings already saved');
+  } finally {
+    Date.now = realNow;
+    on['will-quit']?.(); // flush before the folder goes, or a pending save recreates it
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}

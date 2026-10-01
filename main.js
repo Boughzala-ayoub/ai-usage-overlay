@@ -72,6 +72,8 @@ const panelScale = () => Math.max(1, scale);
 const last = new Map(); // id -> last good { plan, rows, updatedAt }
 const fetched = new Map(); // id -> ms of the last read attempt
 const gate = new Map(); // id -> ms before which we must not ask again (a 429's Retry-After)
+const inflight = new Map(); // id -> the read in progress; a second refresh joins it rather than racing it
+let cache = {}; // id -> last good reading, as saved. Kept here: building it from disk loses readings that land within one save debounce.
 
 // ---- state
 // v3 keeps its own state beside v2's. Its first save copies v2's settings and last readings, which are
@@ -94,15 +96,26 @@ let pending = {};
 function saveState(patch) {
   Object.assign(pending, patch);
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-      fs.writeFileSync(statePath(), JSON.stringify({ ...readState(), ...pending }));
-    } catch {
-      /* remembering where the capsule sits is a nicety, not worth crashing over */
-    }
+  saveTimer = setTimeout(flushState, 400);
+}
+// Also called on quit, which doesn't wait for the debounce. The whole state goes to a sibling file that
+// replaces state.json only once it is complete, so a write that fails partway (a full disk) can't leave
+// half a file where the settings were. The changes stay pending until a save actually lands.
+function flushState() {
+  clearTimeout(saveTimer);
+  if (!Object.keys(pending).length) return;
+  const tmp = statePath() + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify({ ...readState(), ...pending }), { flush: true });
+    fs.renameSync(tmp, statePath());
     pending = {};
-  }, 400);
+  } catch {
+    // Remembering settings is a nicety, not worth crashing over. Try again later, not in a tight loop;
+    // the next save and quit try too.
+    // ponytail: retries every 30s for as long as the disk refuses; a backoff if that ever matters.
+    saveTimer = setTimeout(flushState, 30_000);
+  }
 }
 
 const on = () => PROVIDERS.filter((p) => enabled.includes(p.id));
@@ -133,7 +146,8 @@ function snapshot() {
 const push = () => alive() && win.webContents.send('data', snapshot());
 
 function showResetNotice(p, rows) {
-  if (!rows.length || !alive()) return;
+  // A read still in flight when you hid the overlay or dropped the provider must not beep or reveal it.
+  if (!rows.length || !alive() || !visible || !enabled.includes(p.id)) return;
   shell.beep();
   if (open) return; // the open panel already shows the fresh numbers
   noticeUntil = Date.now() + NOTICE_MS;
@@ -142,7 +156,14 @@ function showResetNotice(p, rows) {
   win.webContents.send('reset', { id: p.id, name: p.name, glyph: p.glyph, color: p.color, rows });
 }
 
-async function readOne(p, force) {
+// One read per provider at a time. Two overlapping refreshes used to race, and a slow older answer
+// landing last rolled the numbers back and beeped a reset that never happened.
+function readOne(p, force) {
+  if (!inflight.has(p.id)) inflight.set(p.id, readFresh(p, force).finally(() => inflight.delete(p.id)));
+  return inflight.get(p.id);
+}
+
+async function readFresh(p, force) {
   const now = Date.now();
   // The gate is the whole rate-limit answer: a 429's Retry-After stops every later request,
   // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint.
@@ -153,16 +174,23 @@ async function readOne(p, force) {
   const prev = last.get(p.id);
   if (res.error && res.soft) {
     if (res.retryAfter) {
-      gate.set(p.id, now + res.retryAfter * 1000);
+      gate.set(p.id, Date.now() + res.retryAfter * 1000); // from the 429's arrival, not the request's start
       saveState({ gate: Object.fromEntries(gate) });
     }
     // Soft means the numbers on screen are still the best we have: keep them, add a note.
     if (prev) return last.set(p.id, { ...prev, note: res.error });
   }
+  // A fallback (it carries `why`) is an old observation, and can be older than the numbers on screen.
+  // Then it's no news: keep the newer ones, say why they didn't move, and never read the drop as a
+  // reset. Undated counts as oldest. Live readings skip this: they are "now", whatever the clock did.
+  if (res.why && prev?.rows?.length && (res.updatedAt ?? -Infinity) < (prev.updatedAt ?? -Infinity)) {
+    return last.set(p.id, { ...prev, note: res.why });
+  }
   last.set(p.id, res);
   if (!res.error) {
     showResetNotice(p, resetRows(prev?.rows, res.rows));
-    saveState({ cache: { ...(readState().cache || {}), [p.id]: res } });
+    cache[p.id] = res;
+    saveState({ cache });
   }
 }
 
@@ -414,7 +442,8 @@ function loadState() {
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
   displayId = screen.getAllDisplays().some((d) => d.id === st.displayId) ? st.displayId : screen.getPrimaryDisplay().id;
   // Last good numbers, so a restart paints real levels before the first request comes back.
-  for (const [id, v] of Object.entries(st.cache || {})) last.set(id, v);
+  if (st.cache && typeof st.cache === 'object') cache = st.cache;
+  for (const [id, v] of Object.entries(cache)) last.set(id, v);
   for (const [id, v] of Object.entries(st.gate || {})) if (v > Date.now()) gate.set(id, v);
 }
 
@@ -532,4 +561,5 @@ app.on('will-quit', () => {
   clearInterval(cursorTimer);
   clearInterval(snapTimer);
   globalShortcut.unregisterAll();
+  flushState(); // a setting or 429 gate from the last 400ms would otherwise die with the debounce
 });

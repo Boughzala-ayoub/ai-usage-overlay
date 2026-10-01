@@ -246,6 +246,16 @@ await page.evaluate(async (data) => {
   if (Math.abs(chipS / chipL - 0.68) > 0.05 || lineS !== lineL) throw new Error(`Size should shrink the pill only: chip ${chipL} -> ${chipS}, reset line ${lineL} -> ${lineS}`);
   await measure(1);
 }, data);
+// Swapping one provider for another keeps the count, and the layout can arrive before the new list:
+// the chips must still take the new providers' marks and colours.
+await page.evaluate((data) => {
+  const ev = window.__overlayEvents;
+  ev.layout({ edge: 'right', theme: 'noir' });
+  ev.data(data);
+  ev.data([data[1], { ...data[0], id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283' }]);
+  const chips = [...document.querySelectorAll('.chip')].map((c) => c.querySelector('.g').textContent + c.style.getPropertyValue('--c'));
+  if (chips.join() !== '◉#10a37f,▣#fab283') throw new Error('Chips kept the old providers\' marks: ' + chips);
+}, data);
 await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
 await page.evaluate(async () => {
   window.__overlayEvents.open(false);

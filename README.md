@@ -36,8 +36,11 @@ icon is three level rows, so you can tell the two apart.
 | OpenCode Go | `~/.local/share/opencode/auth.json` (or `OPENCODE_API_KEY`) then `opencode.ai/zen/go/v1/usage` | 5 min |
 
 Codex uses only `~/.codex/auth.json` for login and re-reads it on every refresh. If the request
-fails, the overlay reads the newest rollout across `CODEX_HOME`, Orca's runtime home, and
-`~/.codex`.
+fails, the overlay reads the rollouts across `CODEX_HOME`, Orca's runtime home, and `~/.codex`, and
+takes the newest usage event by that event's own time. File times only order the search, since a new
+message in an old session touches the file without new usage. The reading is dated by its event. If
+it is older than the numbers already on screen, the newer numbers stay, with a note saying live
+refresh failed, and the drop is not announced as a reset.
 
 Claude re-reads the credentials file on every refresh instead of holding the token, because Claude
 Code rotates it in place.
@@ -66,8 +69,8 @@ That provider's section says `Rate limited, retry in 47s`. Refresh still asks th
 and turns itself off only when every provider is gated. Nothing is hidden and nothing is silently
 dropped.
 
-The request also carries `User-Agent: claude-code/2.1.0`, which is what Claude Code and Orca both
-send. Orca's other trick, a hidden pty that runs `claude`, sends `/usage` and scrapes the TUI, is
+The request also carries `User-Agent: claude-cli/2.1.280 (external, cli)`, the one Claude Code
+sends. Orca's other trick, a hidden pty that runs `claude`, sends `/usage` and scrapes the TUI, is
 several hundred lines of terminal parsing. Not worth it here.
 
 ## Moving it
@@ -83,7 +86,8 @@ puts the capsule back on the right of the primary display.
 
 - Right-click the capsule, or click the tray icon, for the menu.
 - `Providers` in that menu has a checkbox per provider. Unchecking one drops its chip and its section.
-- Ctrl+Alt+U hides and shows the overlay. Hidden means hidden: no polling, no requests.
+- Ctrl+Alt+U hides and shows the overlay. Hidden means no polling and no new requests. A request
+  already under way still finishes and updates the numbers, but it can't beep or bring the overlay back.
 - `Size` sets how much room the pill takes on the edge, from Small to Extra large. The open panel
   never shrinks below Large, because at Small its reset times would be 7px; it only grows, at Extra
   large. Both are CSS `zoom` on their own element, and main sizes the window from the two.
