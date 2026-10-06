@@ -456,6 +456,9 @@ function createWindow() {
     resizable: false,
     movable: false, // we move it ourselves, from the cursor poll
     skipTaskbar: true,
+    // skipTaskbar only asks the taskbar of the moment to drop the button (one ITaskbarList::DeleteTab);
+    // a taskbar that rebuilds its list later doesn't know. A tool window never gets a button at all.
+    type: 'toolbar',
     focusable: false, // an overlay that steals focus off a click is worse than one you can't focus
     hasShadow: false,
     show: false,
