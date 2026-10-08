@@ -115,6 +115,78 @@ puts the capsule back on the right of the primary display.
   the menu and the renderer read. The animated Showpiece themes also need their keyframes, which
   live at the bottom of `index.html`.
 
+## Phone bubble
+
+`phone/` is an Android app that floats a slim tab above every other app, docked on the screen's
+edge. Per provider the tab shows its logo inside a ring that fills clockwise to the same number as
+its chip on the PC, with the number under it. A ring turns amber at 75% and red at 90%, and pulses
+when red. The logos are Claude's and OpenAI's from Simple Icons and OpenCode's from its favicon; a
+provider without one keeps the PC's glyph. Drag the tab anywhere: it lifts as a whole capsule, and
+on release it glides to the nearer side and the corners on that edge square off as it docks, with a
+tick of the phone's vibration. Tap it and the panel pulls out of its inner side, level with it, with
+every limit and reset. Tap anywhere outside the panel, or press Back, to close it.
+
+The `⋯` in the panel's footer opens the settings. The theme (all 96), which providers show, and which
+limit each summary number reads are the PC's tray menu, shared both ways: change one on the phone
+and the PC's overlay follows at once, and the other way round. The bubble's size (Small, Medium,
+Large), hiding at the edge when idle, links to each usage page and Remove bubble are the phone's
+own. Hidden at the edge, the tab slides off after 3 seconds untouched and leaves a 12dp lip with
+one level per provider, as the PC's lip does; a tap on it brings the tab back.
+
+The credentials never leave the PC. The overlay serves the phone on `127.0.0.1:7430`, and Tailscale
+carries the port to the phone. Run this once and it survives reboots:
+
+```
+tailscale serve --bg --https=8443 http://127.0.0.1:7430
+```
+
+| Route | What it does |
+|---|---|
+| `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. `POST` is the panel's Refresh. |
+| `GET /api/events` | The same, as a stream: once on connecting, then on every change. Countdowns move once a minute, so a phone hears at most that often when nothing else changes. |
+| `GET /api/options` | The tray menu's choices: themes, providers, summary limits, usage pages. |
+| `POST /api/settings` | `{ theme, enabled, choices }`, any of them, applied as the tray menu applies them. JSON only. |
+
+Requests for any host but loopback or a `*.ts.net` name get a 403. That stops a web page that points
+its own domain at 127.0.0.1 from reading anything. Settings take `application/json` only, which a
+form or a no-cors fetch from another page can't send without a CORS preflight that this server never
+answers. There is no pairing token, unlike Loom's phone remote: anyone on your tailnet can read the
+percentages and change the theme, and nothing more.
+
+```
+node phone/build.mjs                       # phone\out\ai-usage-bubble.apk
+node phone/check.mjs                       # bubble.html in headless Chrome against a stand-in PC
+tailscale file cp phone/out/ai-usage-bubble.apk <phone>:
+```
+
+The build uses the bare SDK tools (aapt2, javac, d8, zipalign, apksigner), with no Gradle. It wants
+a JDK 17+ and build-tools plus a platform under `%LOCALAPPDATA%\Android\Sdk`. It bakes the PC's
+tailnet address in as the app's default and signs with `~/.android/debug.keystore`, so each new
+build installs over the last.
+
+On the phone, install the APK, open AI Usage, check the address and tap Show bubble. Android asks
+once for "Display over other apps". A quiet notification keeps the bubble alive, and its Remove
+button takes it away.
+
+`bubble.html` is both states. Collapsed, `Bubble.java` sizes the window to the tab plus 12dp beside
+it and above and below for the shadow (50x154 dp at Medium; the page sends the size with
+`Android.size()`), and handles every touch itself, so a drag never reaches the page. It calls
+`press()`, `lift()`, `dock(side)` and `peek()` as the finger and the idle timer move the tab. A tap
+first tells the page where the window sits, then gives the window the whole screen. The page's
+layout follows the window's width, so it can never draw the panel in the small window or the tab
+alone in the big one. When the screen turns or the bubble's size changes with the panel open,
+`Bubble.java` works out the tab's place again for the new screen, its insets and density, and sends it
+with `anchor()`, so the tab stays flush with its edge and closing lands it there. Closing runs the
+other way: the panel shrinks back into the tab, then the page calls `Android.collapse()`. The page keeps the last answer in localStorage. When the PC is off or
+out of reach, the tab greys out and the panel says how old the numbers are. Every snapshot the overlay
+sends carries `run`, an id for this run of the overlay, and `rev`, one higher than the last snapshot it
+made. The page keeps the newest by `rev`, whichever way it came and in whatever order: a read snapshots
+only after its provider answers, so it can be newer than a stream message that reached the phone first,
+and an old answer landing late is dropped. A new `run` (the overlay restarted) wins whatever its
+`rev`, and the run it replaced is retired, so a late snapshot from before the restart can't come back.
+A snapshot without numbers counts as the oldest. A stream that got a 502 while the overlay was down starts
+again on the next good read.
+
 ## Why main polls the cursor
 
 `setIgnoreMouseEvents(true, { forward: true })` is the documented way to keep a click-through window
@@ -152,5 +224,6 @@ hover or drag paths, since that is the only way to test the parts Chromium does 
 ## Not built yet
 
 Drag to reorder the chips, more than one account per provider, and any provider whose usage is not
-already on disk. Copilot's quota needs a live call to `api.github.com/copilot_internal/user`, and
+already on disk. On the phone: drag-to-dismiss (use the notification's Remove), starting the bubble at
+boot, an iPhone version (iOS lets no app draw over others), and reset notices. Copilot's quota needs a live call to `api.github.com/copilot_internal/user`, and
 Cursor's needs a pasted session cookie.

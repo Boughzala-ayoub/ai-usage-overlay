@@ -1,0 +1,600 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>AI usage bubble</title>
+<style>
+  /* Loaded from the PC, which the page's base URL points at. Away from it, the phone's own font stands in. */
+  @font-face { font-family: Geist; src: url(/fonts/geist.woff2) format('woff2'); font-weight: 100 900; font-display: swap; }
+  @property --p { syntax: '<percentage>'; inherits: false; initial-value: 0%; }
+  @property --n { syntax: '<number>'; inherits: true; initial-value: 0; } /* a ring's fill, 0 to 100 */
+  :root {
+    /* Noir, until the PC says which theme it wears. */
+    --bg: #171b23;
+    --line: #a4adbb26;
+    --fg: #f3f5f8;
+    --dim: #a4adbb;
+    --track: #ffffff1a;
+    --shadow: #0009;
+    --shadow-strong: #000c;
+    --highlight: #ffffff0b;
+    --out: cubic-bezier(0.22, 1, 0.36, 1);
+    --in: cubic-bezier(0.4, 0, 1, 1);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: transparent; overflow: hidden; }
+  body {
+    --warn: color-mix(in srgb, #f5a623 78%, var(--fg));
+    --hot: color-mix(in srgb, #ff4d3d 78%, var(--fg));
+    --soft: color-mix(in srgb, var(--fg) 84%, var(--bg));
+    --surface-or-sheen: var(--surface, linear-gradient(180deg, color-mix(in srgb, var(--fg) 6%, transparent), transparent 120px));
+    --z: 1; /* the bubble's size on this phone: Small 0.85, Medium 1, Large 1.2 */
+    font: 14px/1.35 Geist, system-ui, sans-serif;
+    color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  .fig { font-variant-numeric: tabular-nums; letter-spacing: -0.035em; }
+  .g { display: inline-grid; place-items: center; width: 1.3em; height: 1.3em; color: var(--c); line-height: 1; }
+  .logo { fill: var(--c); }
+
+  /* ---- the tab: a 38x130 half-capsule (at Medium) docked on the screen's edge. Per provider its logo
+     inside a ring that fills clockwise to its usage, and the number under it. Its window is 12px wider and
+     24px taller, for the shadow. Lifted while you drag, it is a whole capsule; docked, the corners on the
+     edge square off against it. Hidden at the edge, a lip of it stays on screen with a level per provider. */
+  #tab {
+    position: fixed;
+    top: 12px;
+    left: var(--home);
+    z-index: 2;
+    width: calc(38px * var(--z));
+    height: calc(130px * var(--z));
+    border-radius: calc(19px * var(--z));
+    background-color: var(--bg);
+    background-image: var(--surface, linear-gradient(180deg, color-mix(in srgb, var(--fg) 8%, transparent), transparent 45%, color-mix(in srgb, #000 22%, transparent)));
+    box-shadow: 0 6px 14px var(--shadow-strong);
+    transition: transform 140ms var(--out);
+  }
+  body { --home: 6px; } /* where the tab sits in its window: centred, or flush with the screen's edge */
+  .dock-right { --home: 12px; }
+  .dock-left { --home: 0px; }
+  body.lifted { --home: 6px; }
+  .dock-right #tab { border-radius: calc(19px * var(--z)) 7px 7px calc(19px * var(--z)); box-shadow: -3px 4px 12px var(--shadow); }
+  .dock-left #tab { border-radius: 7px calc(19px * var(--z)) calc(19px * var(--z)) 7px; box-shadow: 3px 4px 12px var(--shadow); }
+  body.lifted #tab { border-radius: calc(19px * var(--z)); box-shadow: 0 6px 14px var(--shadow-strong); }
+  body.pressed #tab { transform: scale(0.94); } /* under a finger, before it is a drag or a tap */
+  /* The slide only while Bubble.java moves it, or the tab would slide across the small window as the panel closes. */
+  .morph #tab { transition: transform 140ms var(--out), left 260ms var(--out), border-radius 260ms var(--out), box-shadow 260ms; }
+  #tab::after { content: ''; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 13%, var(--line)), inset 0 1px 0 var(--highlight); pointer-events: none; }
+  #cells { zoom: var(--z); display: flex; flex-direction: column; justify-content: space-between; height: 130px; padding: 6px 0; transition: opacity 200ms; }
+  .cell { --tone: var(--c); display: grid; justify-items: center; row-gap: 1px; transition: --n 900ms var(--out); }
+  @starting-style { .cell { --n: 0; } } /* the rings sweep up from empty when the tab first shows */
+  .dial { position: relative; display: grid; place-items: center; width: 24px; height: 24px; }
+  .ring { position: absolute; inset: 0; overflow: visible; transform: rotate(-90deg); } /* from twelve o'clock */
+  .ring circle { fill: none; stroke-width: 3; }
+  .ring .track { stroke: color-mix(in srgb, var(--fg) 11%, transparent); }
+  /* pathLength 100, so the dash is the percentage. At 0% the round cap leaves a dot at the top. */
+  .ring .arc { stroke: var(--tone); stroke-linecap: round; stroke-dasharray: var(--n) 100; filter: drop-shadow(0 0 2px color-mix(in srgb, var(--tone) 70%, transparent)); }
+  .dial .logo { width: 11px; height: 11px; }
+  .cell b { font-size: 11.5px; font-weight: 650; line-height: 12px; }
+  .cell small { margin-left: 0.5px; color: var(--dim); font-size: 7px; font-weight: 500; letter-spacing: 0; }
+  .cell.warn, #lip .warn { --tone: var(--warn); }
+  .cell.hot, #lip .hot { --tone: var(--hot); }
+  .cell.warn b { color: var(--warn); }
+  .cell.hot b { color: var(--hot); }
+  .cell.hot .arc, #lip .hot { animation: pulse 1.6s ease-in-out infinite; }
+  .cell.off .arc { display: none; }
+  .cell.off .logo { opacity: 0.5; }
+  .cell.off b { color: var(--dim); font-weight: 400; }
+  /* The lip: what shows of the tab while it hides at the edge, one level per provider, as on the PC. */
+  #lip { position: absolute; top: 14%; bottom: 14%; display: flex; flex-direction: column; gap: 4px; width: 4px; opacity: 0; transition: opacity 200ms; }
+  .dock-right #lip { left: 4px; }
+  .dock-left #lip { right: 4px; }
+  #lip i { --tone: var(--c); flex: 1; border-radius: 2px; background: linear-gradient(to top, var(--tone) var(--p), color-mix(in srgb, var(--fg) 16%, transparent) var(--p)); }
+  .peek #lip { opacity: 1; }
+  .peek #cells { opacity: 0; }
+  .away #tab { filter: saturate(0.25) brightness(0.8); } /* the PC is out of reach: these are the last numbers it gave */
+  @keyframes pulse { 50% { opacity: 0.25; } }
+
+  #scrim, #dock { display: none; }
+
+  /* ---- open: the window has the whole screen. The tab stays exactly where it was, and the panel pulls
+     out of its inner side like an edge panel, level with it, pushed up only as far as the screen needs. */
+  @media (min-width: 200px) {
+    #tab { left: var(--x); top: var(--y); }
+    #scrim { display: block; position: fixed; inset: 0; background: #0009; animation: fade 220ms linear both; }
+    #dock { position: fixed; top: calc(var(--top) + 12px); bottom: calc(var(--bot) + 12px); display: flex; flex-direction: column; }
+    .dock-right #dock { left: 12px; right: calc(100vw - var(--x) + 10px); align-items: flex-end; }
+    .dock-left #dock { left: calc(var(--x) + 38px * var(--z) + 10px); right: 12px; align-items: flex-start; }
+    /* Room above the card to put it level with the tab. It gives way before the card does, so near the
+       bottom the card rides up instead of shrinking. */
+    #dock::before { content: ''; flex: 0 1000 calc(var(--y) - var(--top) - 12px); }
+    #card {
+      display: flex;
+      flex-direction: column;
+      flex: 0 1 auto;
+      width: 100%;
+      max-width: 420px;
+      min-height: 0;
+      padding: 4px 16px 10px;
+      border-radius: 22px;
+      background-color: var(--bg);
+      background-image: var(--surface-or-sheen);
+      border: 1px solid color-mix(in srgb, var(--fg) 14%, var(--line));
+      box-shadow: 0 18px 44px var(--shadow), inset 0 1px 0 var(--highlight);
+      animation: pull 300ms var(--out) both;
+    }
+    .dock-right #card { transform-origin: calc(100% + 10px + 19px * var(--z)) calc(65px * var(--z)); }
+    .dock-left #card { transform-origin: calc(-10px - 19px * var(--z)) calc(65px * var(--z)); }
+    .closing #scrim { animation: fade 160ms linear reverse both; }
+    .closing #card { animation: push 160ms var(--in) both; }
+  }
+  @keyframes fade { from { opacity: 0; } }
+  @keyframes pull { from { opacity: 0; transform: scale(0.3); } }
+  @keyframes push { to { opacity: 0; transform: scale(0.3); } }
+
+  /* ---- the panel, ruled as the PC's: one line per limit, the columns lined up across providers */
+  #usage, #prefs { min-height: 0; overflow-y: auto; overscroll-behavior: contain; container-type: inline-size; }
+  .prefs #usage, #prefs { display: none; }
+  .prefs #prefs { display: block; }
+  .prov { padding: 11px 0 12px; }
+  .prov + .prov { border-top: 1px solid var(--line); }
+  header { display: flex; align-items: flex-start; gap: 7px; padding-bottom: 4px; }
+  header .g { width: 16px; height: calc(15px * 1.35); font-size: 14px; }
+  header .logo { width: 14px; height: 14px; }
+  header b { flex-shrink: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  header span:last-child { min-width: 0; margin: 1px 0 0 auto; padding: 0 7px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--line); color: var(--dim); font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header span:empty { display: none; }
+  .row { display: grid; grid-template-columns: 78px minmax(24px, 1fr) 48px 70px; align-items: center; column-gap: 9px; min-height: 28px; }
+  /* Beside the tab on a narrow phone: too narrow for the bar, so the number says it alone. */
+  @container (max-width: 270px) {
+    .row { grid-template-columns: minmax(0, 1fr) 48px 70px; }
+    .row .hair { display: none; }
+  }
+  .row .l { color: var(--soft); overflow-wrap: anywhere; }
+  .hair { --tone: var(--c); display: block; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--tone) var(--p), var(--track) var(--p)); animation: fill 700ms var(--out) both; }
+  @keyframes fill { from { --p: 0%; } }
+  .row .pc { font-weight: 600; text-align: right; }
+  .pc small { margin-left: 1px; color: var(--dim); font-size: 11px; font-weight: 500; letter-spacing: 0; }
+  .row .rs { color: var(--dim); font-size: 12.5px; text-align: right; white-space: nowrap; }
+  .row.zero .l, .row.zero .pc { color: var(--dim); }
+  .row.warn .hair { --tone: var(--warn); }
+  .row.warn .pc { color: var(--warn); }
+  .row.hot .hair { --tone: var(--hot); }
+  .row.hot .pc { color: var(--hot); }
+  .bank, .status { padding-top: 4px; color: var(--dim); font-size: 12.5px; overflow-wrap: anywhere; }
+  .bank b { color: var(--soft); font-weight: 600; }
+  .status.warn { color: var(--warn); }
+  .status.bad { color: var(--hot); }
+  #away { padding: 12px 0 2px; }
+  code { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, currentColor 13%, transparent); font: 0.95em ui-monospace, monospace; }
+
+  /* ---- settings, in the same card: the PC's tray menu, plus what only this phone has */
+  #prefs { --ring: var(--fg); padding-bottom: 6px; } /* the page's own ink, for the chosen theme's outline */
+  #prefs h3 { padding: 16px 0 8px; font-size: 13px; font-weight: 600; color: var(--soft); }
+  #prefs h4 { padding: 6px 0 6px; font-size: 12px; font-weight: 500; color: var(--dim); }
+  #prefs .hint { padding-top: 12px; color: var(--dim); font-size: 12.5px; }
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 8px; }
+  /* Each swatch's chip wears its own theme: the theme's colours are set on the chip, and its name stays in the page's. */
+  .sw { display: grid; place-items: stretch; gap: 4px; min-width: 0; width: 100%; height: auto; padding: 0; color: var(--dim); text-align: left; }
+  .sw i { display: grid; place-items: center; height: 38px; border-radius: 10px; background-color: var(--bg); background-image: var(--surface, none); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 14%, var(--line)); color: var(--fg); font: 600 13px/1 Geist, system-ui, sans-serif; font-style: normal; }
+  .sw span { overflow: hidden; font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+  .sw[aria-pressed='true'] i { box-shadow: 0 0 0 2px var(--ring); }
+  .sw[aria-pressed='true'] span { color: var(--ring); }
+  .opt { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+  .opt + .opt { border-top: 1px solid var(--line); }
+  .opt > span:not(.g) { flex: 1; min-width: 0; }
+  .opt .g .logo, .pick .logo, .links .logo { width: 14px; height: 14px; }
+  input[role='switch'] { flex-shrink: 0; position: relative; width: 38px; height: 22px; margin: 0; appearance: none; border-radius: 11px; background: color-mix(in srgb, var(--fg) 18%, transparent); transition: background 160ms; }
+  input[role='switch']::before { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--fg); transition: transform 160ms var(--out); }
+  input[role='switch']:checked { background: color-mix(in srgb, var(--fg) 70%, transparent); }
+  input[role='switch']:checked::before { transform: translateX(16px); background: var(--bg); }
+  input[role='switch']:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  .pick { padding: 4px 0 10px; }
+  .pick .who { display: flex; align-items: center; gap: 6px; padding-bottom: 6px; color: var(--soft); font-size: 13px; }
+  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+  .seg button, .links button { width: auto; height: 34px; margin: 0; padding: 0 12px; border-radius: 17px; box-shadow: inset 0 0 0 1px var(--line); color: var(--soft); font: 500 13px/1 Geist, system-ui, sans-serif; }
+  .seg button[aria-pressed='true'] { background: var(--fg); box-shadow: none; color: var(--bg); }
+  .links { display: flex; flex-wrap: wrap; gap: 6px; }
+  .links button { display: inline-flex; align-items: center; gap: 6px; }
+  #remove { width: 100%; height: 44px; margin: 18px 0 0; border-radius: 12px; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hot) 40%, transparent); color: var(--hot); font: 600 14px/1 Geist, system-ui, sans-serif; }
+  #prefs .err { padding-top: 12px; color: var(--hot); font-size: 12.5px; }
+
+  .foot { display: flex; align-items: center; gap: 4px; flex-shrink: 0; padding-top: 6px; border-top: 1px solid var(--line); }
+  #ft { flex: 1; min-width: 0; color: var(--dim); font-size: 12.5px; }
+  button { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px; padding: 0; color: var(--dim); background: transparent; border: 0; border-radius: 12px; font: inherit; }
+  .foot button:last-child { margin-right: -12px; }
+  button:active:not(:disabled) { color: var(--fg); background: color-mix(in srgb, var(--fg) 10%, transparent); }
+  button:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
+  button:disabled { opacity: 0.4; }
+  .foot svg { width: 18px; height: 18px; }
+  .prefs #rf, #mn .back, .prefs #mn .dots { display: none; }
+  .prefs #mn .back { display: block; }
+  #rf[aria-busy='true'] svg { animation: spin 800ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  }
+</style>
+
+<div id="scrim"></div>
+<div id="tab" role="button" aria-label="AI usage"><div id="cells"></div><div id="lip" aria-hidden="true"></div></div>
+<div id="dock">
+  <div id="card" role="dialog" aria-label="AI usage">
+    <div id="usage">
+      <p id="away" class="status warn" hidden></p>
+      <div id="sections"></div>
+    </div>
+    <div id="prefs"></div>
+    <div class="foot">
+      <span id="ft"></span>
+      <button id="rf" aria-label="Refresh"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" /><path d="M13.6 2.2v3.4h-3.4" /></svg></button>
+      <button id="mn" aria-label="Settings" aria-expanded="false">
+        <svg class="dots" viewBox="0 0 16 16" fill="currentColor"><circle cx="3.2" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.8" cy="8" r="1.3" /></svg>
+        <svg class="back" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.5 5.5 8l4.5 4.5" /></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const body = document.body;
+  const tab = $('#tab');
+  const cells = $('#cells');
+  const lip = $('#lip');
+  const card = $('#card');
+  const sections = $('#sections');
+  const prefs = $('#prefs');
+  const away = $('#away');
+  const ft = $('#ft');
+  const rf = $('#rf');
+  const mn = $('#mn');
+  // The PC's last answer, kept for when it's out of reach: { css, theme, enabled, choices, providers, at }.
+  let data = null;
+  let reached = true;
+  let drawn = '';
+  const stored = (k, fallback) => {
+    try {
+      return JSON.parse(localStorage.getItem(k)) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  const store = (k, v) => {
+    try {
+      localStorage.setItem(k, JSON.stringify(v));
+    } catch {}
+  };
+  data = stored('usage', null);
+
+  const esc = (s) => String(s ?? '').replace(/[<&"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '"': '&quot;' })[c]);
+  const level = (pct) => (pct >= 90 ? 'hot' : pct >= 75 ? 'warn' : '');
+  const pctText = (n) => String(Math.round(n * 10) / 10);
+  const ago = (t) => {
+    const m = Math.floor((Date.now() - t) / 60000);
+    return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.floor(m / 60) + ' hr ago' : Math.floor(m / 1440) + ' d ago';
+  };
+
+  // ---- the PC: a stream that brings every change as it happens (a theme picked on the PC lands here at
+  // once), and a read each minute, which also asks the PC for anything due and says if it's out of reach.
+  // The PC numbers its snapshots (run, rev: one higher each snapshot it makes), and the page keeps the
+  // newest by that number, from the stream, a read, a Refresh or a settings answer alike. Arrival order
+  // can't tell: a read snapshots after its provider answers, so it may be newer than a stream message that
+  // reached the phone first. Unnumbered snapshots, from an overlay older than the numbers or saved before
+  // them, count as the oldest.
+  // A new run (the overlay restarted) wins whatever its number, and the run it replaces is retired: a late
+  // snapshot from that one, asked before the restart, can't come back. Run ids aren't ordered, so a PC clock
+  // set back can't freeze the phone. Kept in memory only: after a reload every request goes to the current run.
+  const retired = new Set();
+  const newer = (d) => !Number.isFinite(d.rev) || (!retired.has(d.run) && (!Number.isFinite(data?.rev) || d.run !== data.run || d.rev > data.rev));
+  function take(d) {
+    if (!newer(d)) return false;
+    if (Number.isFinite(d.rev) && Number.isFinite(data?.rev) && d.run !== data.run) retired.add(data.run);
+    data = { ...d, at: Date.now() };
+    reached = true;
+    store('usage', data);
+    draw();
+    return true;
+  }
+  let es = null;
+  async function load(refresh) {
+    try {
+      const r = await fetch('/api/usage', { method: refresh ? 'POST' : 'GET', signal: AbortSignal.timeout(refresh ? 60000 : 20000) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const state = await r.json();
+      reached = true;
+      if (!take(state)) draw(); // newer state is already here; this answer still says the PC is there
+      // A stream that got a 502 while the PC's overlay was down has given up for good: start another.
+      if (es?.readyState === EventSource.CLOSED) listen();
+    } catch {
+      reached = false;
+      draw();
+    }
+  }
+  function listen() {
+    es = new EventSource('/api/events');
+    es.onmessage = (e) => take(JSON.parse(e.data));
+    // A dropped connection it retries by itself; whether the PC is reachable is the minute's read to say.
+  }
+  async function post(settings) {
+    const r = await fetch('/api/settings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings), signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    take(await r.json());
+  }
+
+  // The providers' own marks, on a 24-unit grid: Claude's and OpenAI's from Simple Icons (CC0), OpenCode's
+  // from opencode.ai's favicon. A provider without one here keeps the PC's glyph.
+  const LOGOS = {
+    claude: '<path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/>',
+    codex: '<path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"/>',
+    "opencode-go": '<path fill-rule="evenodd" d="M18 19.5H6v-15h12zM15 7.5H9v9h6z"/><path d="M15 10.5v6H9v-6z" opacity=".45"/>',
+  };
+  const mark = (p, cls) => '<span class="' + cls + '">' + (LOGOS[p.id] ? '<svg class="logo" viewBox="0 0 24 24" aria-hidden="true">' + LOGOS[p.id] + '</svg>' : esc(p.glyph)) + '</span>';
+
+  // ---- the tab: built once per provider list and patched after, so the rings sweep rather than redraw
+  function drawTab(list) {
+    const ids = list.map((p) => p.id).join() || 'none';
+    if (cells.dataset.ids !== ids) {
+      cells.dataset.ids = ids;
+      const ring = '<svg class="ring" viewBox="0 0 32 32"><circle class="track" cx="16" cy="16" r="14" pathLength="100"/><circle class="arc" cx="16" cy="16" r="14" pathLength="100"/></svg>';
+      cells.innerHTML = list.length
+        ? list.map((p) => '<div class="cell" style="--c:' + esc(p.color) + '"><span class="dial">' + ring + mark(p, 'g') + '</span><b class="fig"></b></div>').join('')
+        : '<div class="cell off"><b>…</b></div>';
+      lip.innerHTML = list.map((p) => '<i style="--c:' + esc(p.color) + '"></i>').join('');
+    }
+    list.forEach((p, i) => {
+      const off = !(p.rows || []).length;
+      const pct = Math.round(off ? 0 : p.ringPercent ?? 0);
+      const c = cells.children[i];
+      c.className = 'cell ' + (off ? 'off' : level(pct));
+      c.style.setProperty('--n', Math.max(0, Math.min(100, pct)));
+      c.querySelector('b').innerHTML = off ? '—' : pct + '<small>%</small>';
+      lip.children[i].className = off ? '' : level(pct);
+      lip.children[i].style.setProperty('--p', Math.max(0, Math.min(100, pct)) + '%');
+    });
+    tab.setAttribute('aria-label', 'AI usage: ' + list.map((p) => p.name + ' ' + Math.round(p.ringPercent ?? 0) + '%').join(', '));
+  }
+
+  // ---- the panel, as the PC's index.html words it
+  function banked(p) {
+    const n = p.bankedResets;
+    if (!Number.isSafeInteger(n) || n < 1) return '';
+    const ts = (p.bankedResetExpiries || []).filter(Number.isFinite);
+    const days = ts.map((t, i) => {
+      const d = new Date(t);
+      const run = i > 0 && new Date(ts[i - 1]).getMonth() === d.getMonth();
+      return (run ? '' : d.toLocaleDateString('en-US', { month: 'short' }) + ' ') + d.getDate();
+    });
+    const list = days.length > 1 ? days.slice(0, -1).join(', ') + ' and ' + days.at(-1) : days[0];
+    return '<p class="bank"><b class="fig">' + n + '</b> banked ' + (n === 1 ? 'reset' : 'resets') +
+      (list ? (n === 1 ? ' expires ' : ' expire ') + esc(list) : '') + '</p>';
+  }
+
+  function section(p) {
+    const rows = p.rows || [];
+    const wait = p.waitMs > 0 ? Math.ceil(p.waitMs / 1000) : 0;
+    const lines = [];
+    if (!rows.length) lines.push(p.error ? [p.error, ' bad'] : ['Waiting for usage data…', '']);
+    if (wait) lines.push(['Rate limited, retry in ' + (wait < 60 ? wait + 's' : Math.ceil(wait / 60) + ' min'), ' warn']);
+    else if (p.note) lines.push([p.note, '']);
+    if (!wait && p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push(['Updated ' + ago(p.updatedAt), '']);
+    const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : '';
+    return '<section class="prov" style="--c:' + esc(p.color) + '">' +
+      '<header>' + mark(p, 'g') + '<b>' + esc(p.name) + '</b><span>' + esc(plan) + '</span></header>' +
+      rows.map((r, i) =>
+        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '">' +
+          '<span class="l">' + esc(r.label) + '</span>' +
+          '<i class="hair" style="--p:' + Math.max(0, Math.min(100, r.percent)) + '%;animation-delay:' + (120 + i * 40) + 'ms"></i>' +
+          '<span class="pc fig">' + pctText(r.percent) + '<small>%</small></span>' +
+          '<span class="rs">' + esc(r.resets) + '</span>' +
+        '</div>').join('') +
+      banked(p) +
+      lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
+    '</section>';
+  }
+
+  // ---- settings. The theme, the providers and each summary number belong to the PC and are shared with
+  // it; the size and hiding at the edge are this phone's own.
+  let options = null; // the PC's menu: { themes, providers, choices, pages }, asked for once
+  let prefsError = '';
+  let prefsDrawn = '';
+  const SIZES = [['Small', 0.85], ['Medium', 1], ['Large', 1.2]];
+  // Noir is the stylesheet's own default, so its theme string is empty; its chip needs the colours spelled out.
+  const NOIR = '--bg:#171b23;--line:#a4adbb26;--fg:#f3f5f8;--dim:#a4adbb';
+  let size = stored('size', 1);
+  let autoHide = stored('autoHide', false);
+
+  function drawPrefs() {
+    if (!body.classList.contains('prefs')) return;
+    let html;
+    if (!options) html = '<p class="err">' + esc(prefsError || 'Loading settings from the PC…') + '</p>';
+    else {
+      const on = data?.enabled || [];
+      const chosen = data?.choices || {};
+      html = '<p class="hint">Theme, providers and the bubble\'s numbers are shared with the PC.</p>' +
+        (prefsError ? '<p class="err">' + esc(prefsError) + '</p>' : '') +
+        '<h3>Theme</h3>' +
+        options.themes.map(([group, list]) => '<h4>' + esc(group) + '</h4><div class="swatches">' +
+          list.map(([id, label, css]) => '<button class="sw" data-theme="' + esc(id) + '" aria-pressed="' + (data?.theme === id) + '"><i style="' + esc(css || NOIR) + '">Aa</i><span>' + esc(label) + '</span></button>').join('') +
+        '</div>').join('') +
+        '<h3>Providers</h3>' +
+        options.providers.map((p) => '<label class="opt" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + '<span>' + esc(p.name) + '</span><input type="checkbox" role="switch" data-provider="' + esc(p.id) + '"' + (on.includes(p.id) ? ' checked' : '') + '></label>').join('') +
+        '<h3>Number on the bubble</h3>' +
+        options.providers.filter((p) => options.choices[p.id] && on.includes(p.id)).map((p) => '<div class="pick" style="--c:' + esc(p.color) + '"><span class="who">' + mark(p, 'g') + esc(p.name) + '</span><div class="seg">' +
+          options.choices[p.id].map(([label, row]) => '<button data-choice="' + esc(p.id) + '" data-row="' + esc(row) + '" aria-pressed="' + ((chosen[p.id] || '') === row) + '">' + esc(label) + '</button>').join('') +
+        '</div></div>').join('') +
+        '<h3>This phone</h3>' +
+        '<div class="pick"><span class="who">Bubble size</span><div class="seg">' +
+          SIZES.map(([label, z]) => '<button data-size="' + z + '" aria-pressed="' + (size === z) + '">' + label + '</button>').join('') +
+        '</div></div>' +
+        '<label class="opt"><span>Hide at the edge when idle</span><input type="checkbox" role="switch" id="autohide"' + (autoHide ? ' checked' : '') + '></label>' +
+        '<h3>Usage pages</h3><div class="links">' +
+          options.providers.filter((p) => options.pages[p.id]).map((p) => '<button data-page="' + esc(options.pages[p.id]) + '" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + esc(p.name) + '</button>').join('') +
+        '</div>' +
+        '<button id="remove">Remove bubble</button>';
+    }
+    if (html !== prefsDrawn) prefs.innerHTML = prefsDrawn = html;
+  }
+
+  async function showPrefs(on) {
+    body.classList.toggle('prefs', on);
+    mn.setAttribute('aria-expanded', on);
+    mn.setAttribute('aria-label', on ? 'Back to usage' : 'Settings');
+    draw();
+    if (!on || options) return;
+    try {
+      const r = await fetch('/api/options', { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      options = await r.json();
+      prefsError = '';
+    } catch {
+      prefsError = "Settings come from the PC, and it can't be reached right now.";
+    }
+    drawPrefs();
+  }
+
+  // A change goes to the PC, which answers with the new state; a theme shows here before the answer does.
+  async function change(settings) {
+    prefsError = '';
+    try {
+      await post(settings);
+    } catch {
+      prefsError = "The PC didn't take that change: it can't be reached right now.";
+      draw(); // back to what the PC last said
+    }
+  }
+
+  prefs.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.theme) {
+      const chip = b.querySelector('i').getAttribute('style');
+      document.documentElement.style.cssText = chip === NOIR ? '' : chip;
+      prefs.querySelectorAll('.sw').forEach((s) => s.setAttribute('aria-pressed', s === b));
+      change({ theme: b.dataset.theme });
+    } else if (b.dataset.choice) change({ choices: { [b.dataset.choice]: b.dataset.row } });
+    else if (b.dataset.size) setSize(Number(b.dataset.size));
+    else if (b.dataset.page) window.Android ? Android.open(b.dataset.page) : window.open(b.dataset.page);
+    else if (b.id === 'remove') window.Android?.remove();
+  });
+  prefs.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.dataset.provider) change({ enabled: [...prefs.querySelectorAll('[data-provider]')].filter((x) => x.checked).map((x) => x.dataset.provider) });
+    else if (t.id === 'autohide') setAutoHide(t.checked);
+  });
+
+  // The tab's size: the page draws it, and tells Bubble.java how big a window it needs.
+  function setSize(z) {
+    size = SIZES.some(([, s]) => s === z) ? z : 1;
+    store('size', size);
+    body.style.setProperty('--z', size);
+    window.Android?.size(Math.ceil(38 * size) + 12, Math.ceil(130 * size) + 24);
+    draw();
+  }
+  function setAutoHide(on) {
+    autoHide = on;
+    store('autoHide', on);
+    window.Android?.autoHide(on);
+  }
+
+  function draw() {
+    const list = data?.providers || [];
+    if (data?.css !== undefined) document.documentElement.style.cssText = data.css;
+    body.classList.toggle('away', !reached);
+    drawTab(list);
+    // Redrawn only on change, or every bar would sweep again at each minute's read.
+    const html = list.map(section).join('');
+    if (html !== drawn) sections.innerHTML = drawn = html;
+    away.hidden = reached;
+    away.textContent = data
+      ? "Can't reach the PC. These numbers are from " + ago(data.at) + '.'
+      : "Can't reach the PC. Is it on, with the overlay running and Tailscale connected on both?";
+    const newest = Math.max(0, ...list.map((p) => p.updatedAt || 0));
+    ft.textContent = body.classList.contains('prefs') ? 'Settings' : newest ? 'Updated ' + ago(newest) : reached ? 'Loading…' : '';
+    rf.removeAttribute('aria-busy');
+    rf.disabled = list.length > 0 && list.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest
+    drawPrefs();
+  }
+
+  // ---- Bubble.java's words while you handle the tab: pressed under a finger, lifted as a drag starts,
+  // docked as it glides to a side, and hidden at the edge or back out of it.
+  let settle = 0;
+  function morph() {
+    body.classList.add('morph');
+    clearTimeout(settle);
+    settle = setTimeout(() => body.classList.remove('morph'), 400);
+  }
+  function dock(side, animate = true) {
+    // Only after a drag or a change of side: a dock as the panel closes would slide the tab in from where
+    // it sat in the big window.
+    if (animate && (body.classList.contains('lifted') || !body.classList.contains('dock-' + side))) morph();
+    body.classList.remove('lifted', 'dock-left', 'dock-right');
+    body.classList.add('dock-' + side);
+  }
+  function lift() {
+    morph();
+    body.classList.add('lifted');
+  }
+  const press = (on) => body.classList.toggle('pressed', on);
+  const peek = (on) => body.classList.toggle('peek', on);
+
+  // ---- open and close. Bubble.java calls expand() with the window's place on screen, then gives the
+  // window the screen, and takes it back on Android.collapse(). The layout follows the window's size, so
+  // it can't show the panel in the small window or the tab alone in the big one.
+  const wide = () => innerWidth >= 200;
+  function expand(wx, wy, top, bot) {
+    // A tap right after a drag: no slide may carry on into the big window, or out of it on closing.
+    clearTimeout(settle);
+    body.classList.remove('morph', 'pressed');
+    anchor(wx, wy, top, bot);
+    load();
+  }
+  // Where the tab sits on screen while the panel is open: its window's place, plus where the docked tab sits
+  // in that window (flush with the screen's edge, 12px down). Bubble.java sends it again when the screen
+  // turns or the bubble's size changes, so the tab follows its edge instead of keeping its old place.
+  function anchor(wx, wy, top, bot) {
+    const home = parseFloat(getComputedStyle(body).getPropertyValue('--home')) || 0;
+    for (const [k, v] of Object.entries({ x: wx + home, y: wy + 12, top, bot })) body.style.setProperty('--' + k, v + 'px');
+  }
+  // The window goes back to the tab once the panel has gone back into it. The timer is for an animation
+  // that never reports (animations stopped); whichever comes first hands over, once.
+  let closing = 0;
+  function shut() {
+    if (!wide() || closing) return;
+    body.classList.add('closing');
+    closing = setTimeout(closed, 400);
+  }
+  function closed() {
+    if (!closing) return;
+    clearTimeout(closing); // or a quick reopen and close would have this one cut that close short
+    closing = 0;
+    if (window.Android) Android.collapse();
+    else body.classList.remove('closing'); // in a browser nothing shrinks the window
+  }
+  card.addEventListener('animationend', (e) => e.animationName === 'push' && closed());
+  addEventListener('resize', () => {
+    if (wide()) return;
+    body.classList.remove('closing');
+    showPrefs(false); // it opens on the numbers next time
+  });
+  // Open, a tap anywhere but the panel closes it: the backdrop, the tab, or the empty part of #dock that
+  // holds the panel level with the tab. Collapsed, Bubble.java takes every touch, so this never fires there.
+  // The path the click took, not where its target is now: a settings button redraws the settings as it is
+  // tapped, so by the time the click reaches here its target is no longer in the page.
+  addEventListener('click', (e) => e.composedPath().includes(card) || shut());
+  rf.onclick = () => {
+    rf.disabled = true;
+    rf.setAttribute('aria-busy', 'true');
+    load(true);
+  };
+  mn.onclick = () => showPrefs(!body.classList.contains('prefs'));
+
+  dock(window.Android?.side() || 'right', false);
+  setSize(size);
+  setAutoHide(autoHide);
+  draw();
+  load();
+  listen();
+  setInterval(load, 60000);
+</script>

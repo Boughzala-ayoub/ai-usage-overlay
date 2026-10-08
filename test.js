@@ -302,10 +302,16 @@ async function mainChecks() {
     ipcMain: { on() {}, handle() {} },
     globalShortcut: { unregisterAll() {} },
   };
+  // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
+  let phoneHandler = null;
+  const http = { createServer: (fn) => ((phoneHandler = fn), { on() { return this; }, listen() { return this; } }) };
+  // One provider whose read the checks hold and finish by hand; no real account is ever asked.
+  const held = { read: async () => ({ rows: [] }) };
+  const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { readOne, saveState, gate, last };';
-  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : require(id)), mod, __dirname);
-  const { readOne, saveState, gate, last } = mod.exports;
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { readOne, saveState, gate, last, servePhone };';
+  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
+  const { readOne, saveState, gate, last, servePhone } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -368,6 +374,62 @@ async function mainChecks() {
     const after = saved();
     assert.deepStrictEqual([after.theme, after.scale, after.edge, after.autoHide], ['paper', 0.68, 'left', false], 'failed saves wait for the next one');
     assert.ok(Object.keys(after.cache).length, 'with the readings already saved');
+
+    // The phone's settings: whatever arrives, the handler answers, and nothing escapes as an unhandled
+    // rejection in the main process. Unknown keys, constructor and __proto__ among them, change nothing.
+    servePhone();
+    const ask = (method, url, body, { type = 'application/json', abort = false } = {}) => new Promise((resolve) => {
+      const req = {
+        method, url, headers: { host: '127.0.0.1:7430', 'content-type': type }, on() {},
+        async *[Symbol.asyncIterator]() {
+          if (abort) throw Object.assign(new Error('aborted'), { code: 'ECONNRESET' });
+          if (body !== undefined) yield Buffer.from(body);
+        },
+      };
+      const res = { status: 200, headersSent: false, writeHead(s) { this.status = s; this.headersSent = true; return this; }, write() {}, end(b) { resolve({ status: this.status, body: String(b ?? '') }); } };
+      try {
+        Promise.resolve(phoneHandler(req, res)).catch((e) => resolve({ threw: e.message }));
+      } catch (e) {
+        resolve({ threw: e.message });
+      }
+      setTimeout(() => resolve({ hung: true }), 1000);
+    });
+    for (const body of ['null', '[]', '"paper"', '7', 'not json']) {
+      const r = await ask('POST', '/api/settings', body);
+      assert.strictEqual(r.status, 400, `settings body ${body} gets a 400, not ${JSON.stringify(r)}`);
+    }
+    const aborted = await ask('POST', '/api/settings', undefined, { abort: true });
+    assert.ok(!aborted.threw && !aborted.hung, `an aborted upload is answered, not ${JSON.stringify(aborted)}`);
+    assert.strictEqual((await ask('POST', '/api/settings', '{}', { type: 'text/plain' })).status, 415, 'settings take JSON only');
+    assert.strictEqual((await ask('POST', '/api/settings', JSON.stringify({ theme: 'x'.repeat(20_000) }))).status, 413, 'a huge body is refused');
+    const odd = await ask('POST', '/api/settings', '{"choices":{"constructor":"x","__proto__":"Session","toString":""},"theme":7,"enabled":"claude"}');
+    assert.strictEqual(odd.status, 200, `unknown settings are ignored, not ${JSON.stringify(odd)}`);
+    assert.deepStrictEqual(JSON.parse(odd.body).choices, {}, 'and change nothing');
+
+    // Snapshots are numbered in the order the PC makes them, which is not the order they reach a phone: a
+    // read waits on its provider before it snapshots, so a stream message sent meanwhile is the older one,
+    // though it arrives first. The phone keeps the newest by number.
+    last.set('claude', { rows: [{ label: 'Weekly', percent: 10 }], updatedAt: 1 });
+    gate.delete('claude');
+    let finish = null;
+    held.read = () => new Promise((r) => (finish = r));
+    const usage = ask('GET', '/api/usage');
+    for (let i = 0; i < 50 && !finish; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(finish, 'the read is waiting on its provider');
+    const streamed = [];
+    let hangUp = () => {};
+    phoneHandler(
+      { method: 'GET', url: '/api/events', headers: { host: '127.0.0.1:7430' }, on: (e, fn) => e === 'close' && (hangUp = fn) },
+      { writeHead() { return this; }, write: (chunk) => streamed.push(JSON.parse(String(chunk).replace(/^data: /, ''))), end() {} }
+    );
+    finish({ rows: [{ label: 'Weekly', percent: 80 }], updatedAt: 2 });
+    const fresh = JSON.parse((await usage).body);
+    hangUp();
+    const [cached] = streamed;
+    assert.strictEqual(cached.providers[0].rows[0].percent, 10, 'the stream opened on the cached reading');
+    assert.strictEqual(fresh.providers[0].rows[0].percent, 80, 'the read answered with the fresh one');
+    assert.ok(typeof fresh.run === 'string' && fresh.run === cached.run, `both from one run of the overlay, not ${fresh.run} and ${cached.run}`);
+    assert.ok(fresh.rev > cached.rev, `the fresh snapshot is numbered after the cached one, not ${fresh.rev} after ${cached.rev}`);
   } finally {
     Date.now = realNow;
     on['will-quit']?.(); // flush before the folder goes, or a pending save recreates it

@@ -1,6 +1,7 @@
 'use strict';
 const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell } = require('electron');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { PROVIDERS, fmtReset, ringPercent, resetRows } = require('./providers');
 const THEME_GROUPS = require('./themes');
@@ -22,6 +23,7 @@ const CLOSE_MS = 420; // grace to cross the gap between the edge and the capsule
 const SNAP_MS = 200;
 const NOTICE_MS = 6000;
 const HOTKEY = 'Control+Alt+U';
+const PHONE_PORT = 7430; // `tailscale serve --bg --https=8443 http://127.0.0.1:7430` carries it to the phone
 const EDGES = ['left', 'right', 'top', 'bottom'];
 // Which limit each provider's summary chip reads; '' is the highest. Codex has no choice worth a menu.
 const NUMBER_CHOICES = {
@@ -143,7 +145,10 @@ function snapshot() {
   });
 }
 
-const push = () => alive() && win.webContents.send('data', snapshot());
+function push() {
+  if (alive()) win.webContents.send('data', snapshot());
+  tellPhones();
+}
 
 function showResetNotice(p, rows) {
   // A read still in flight when you hid the overlay or dropped the provider must not beep or reveal it.
@@ -200,6 +205,98 @@ async function tick(force = false) {
   push(); // every beat, even with no new data: the countdowns need re-rendering
 }
 
+// ---- the phone bubble (phone/), over Tailscale. It gets what the panel shows, and shares the theme,
+// the providers and what each summary number reads with this overlay, both ways. The credentials stay in
+// this process. The tailnet is the lock, and settings take JSON only (below), so a web page open on this
+// PC can't post them.
+// ponytail: no pairing, unlike Loom's remote, since all it can do is read numbers and change cosmetic
+// settings; add a token if it ever does more.
+const phones = new Set(); // open /api/events streams
+let toldPhones = '';
+// Every snapshot carries this run of the overlay and a number one higher than the last snapshot made, so a
+// phone keeps the newest however they reach it: a read snapshots only after its provider answers, so it can
+// be newer than a stream message that left while it waited, though it arrives after it.
+const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+let snapshots = 0;
+function phoneState() {
+  const t = THEMES.find(([id]) => id === theme);
+  return { css: t ? t[2] : '', theme, enabled, choices, providers: snapshot() };
+}
+const numbered = (state) => JSON.stringify({ ...state, run, rev: ++snapshots });
+function phonePayload() {
+  return numbered(phoneState());
+}
+// On every push and theme change, but only when something changed: the countdowns move once a minute,
+// and a phone shouldn't wake every 15 s for the same numbers.
+function tellPhones() {
+  if (!phones.size) return;
+  const state = phoneState();
+  const same = JSON.stringify(state);
+  if (same === toldPhones) return;
+  toldPhones = same;
+  const body = numbered(state);
+  for (const res of phones) res.write('data: ' + body + '\n\n');
+}
+
+function servePhone() {
+  const json = (res, body) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(typeof body === 'string' ? body : JSON.stringify(body));
+  };
+  const answer = async (req, res) => {
+    // A site that points its own name at 127.0.0.1 can't read this: only loopback and tailnet names.
+    if (!/^(127\.0\.0\.1|localhost|[\w-]+\.[\w-]+\.ts\.net)(:\d+)?$/.test(req.headers.host || '')) return res.writeHead(403).end();
+    const url = req.url.split('?')[0];
+    if (url === '/fonts/geist.woff2') {
+      res.writeHead(200, { 'content-type': 'font/woff2', 'cache-control': 'max-age=86400' });
+      return res.end(fs.readFileSync(path.join(__dirname, 'fonts', 'geist.woff2')));
+    }
+    if (url === '/api/usage') {
+      // GET reads only what is due, as the tick would; POST is the phone's Refresh. Both stop at a 429's gate.
+      await Promise.allSettled(on().map((p) => readOne(p, req.method === 'POST')));
+      push();
+      return json(res, phonePayload());
+    }
+    if (url === '/api/events') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
+      res.write('data: ' + phonePayload() + '\n\n');
+      phones.add(res);
+      return req.on('close', () => phones.delete(res));
+    }
+    if (url === '/api/options') {
+      return json(res, { themes: THEME_GROUPS, providers: PROVIDERS.map(({ id, name, glyph, color }) => ({ id, name, glyph, color })), choices: NUMBER_CHOICES, pages: USAGE_PAGES });
+    }
+    if (url === '/api/settings' && req.method === 'POST') {
+      // A form or a no-cors fetch from a page can't send JSON without a preflight, which this server never answers.
+      if (!/^application\/json\b/.test(req.headers['content-type'] || '')) return res.writeHead(415).end();
+      let body = '';
+      for await (const chunk of req) if ((body += chunk).length > 10_000) return res.writeHead(413).end();
+      let want;
+      try {
+        want = JSON.parse(body);
+      } catch {
+        return res.writeHead(400).end();
+      }
+      if (!want || typeof want !== 'object' || Array.isArray(want)) return res.writeHead(400).end(); // null, a list, a bare value
+      if (typeof want.theme === 'string') setTheme(want.theme);
+      if (Array.isArray(want.enabled)) setEnabled(want.enabled);
+      if (want.choices && typeof want.choices === 'object') for (const [id, row] of Object.entries(want.choices)) setChoice(id, row);
+      return json(res, phonePayload());
+    }
+    res.writeHead(404).end();
+  };
+  http
+    .createServer((req, res) =>
+      // An upload cut off midway, or a fault of ours: answer if there is still anyone to answer, and never
+      // let it escape as an unhandled rejection in the main process.
+      answer(req, res).catch(() => {
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      }))
+    .on('error', () => {}) // the port is taken (a second copy): that copy just has no phone
+    .listen(PHONE_PORT, '127.0.0.1');
+}
+
 // ---- geometry
 
 const areaFor = (id) => (screen.getAllDisplays().find((d) => d.id === id) || screen.getPrimaryDisplay()).workArea;
@@ -242,6 +339,7 @@ function place(animate) {
 }
 
 function sendLayout() {
+  tellPhones();
   if (!alive()) return;
   const t = THEMES.find(([id]) => id === theme);
   win.webContents.send('layout', { edge, count: on().length, theme, css: t ? t[2] : '', scale });
@@ -311,6 +409,35 @@ function pollCursor() {
 }
 
 // ---- chrome
+// The settings the phone shares, set from the tray menu or the phone alike. Each ignores what it doesn't know.
+
+function setTheme(id) {
+  if (!THEMES.some(([t]) => t === id)) return;
+  theme = id;
+  saveState({ theme });
+  sendLayout();
+  tray.setContextMenu(menu()); // radio groups don't span submenus; the rebuild unticks the old one
+}
+
+function setEnabled(ids) {
+  // Keep the declared order however you toggle them, so cells never shuffle.
+  enabled = PROVIDERS.filter((q) => ids.includes(q.id)).map((q) => q.id);
+  saveState({ enabled, known: PROVIDERS.map((q) => q.id) });
+  tray.setContextMenu(menu());
+  setOpen(false);
+  place(true);
+  push(); // the phones hear now, not after the readings the tick may wait on
+  tick();
+}
+
+function setChoice(id, row) {
+  // Own keys only: a "constructor" or "__proto__" from the phone names nothing here.
+  if (!Object.hasOwn(NUMBER_CHOICES, id) || !NUMBER_CHOICES[id].some(([, r]) => r === row)) return;
+  choices = { ...choices, [id]: row };
+  saveState({ rings: choices }); // the key predates the redesign, so old settings carry over
+  tray.setContextMenu(menu());
+  push();
+}
 
 function menu() {
   const rebuild = () => tray.setContextMenu(menu());
@@ -320,11 +447,7 @@ function menu() {
       label,
       type: 'radio',
       checked: (choices[p.id] || '') === row,
-      click: () => {
-        choices = { ...choices, [p.id]: row };
-        saveState({ rings: choices }); // the key predates the redesign, so old settings carry over
-        push();
-      },
+      click: () => setChoice(p.id, row),
     })),
   }));
   return Menu.buildFromTemplate([
@@ -337,16 +460,7 @@ function menu() {
         label: p.name,
         type: 'checkbox',
         checked: enabled.includes(p.id),
-        click: (item) => {
-          const ids = item.checked ? [...enabled, p.id] : enabled.filter((id) => id !== p.id);
-          // Keep the declared order however you toggle them, so cells never shuffle.
-          enabled = PROVIDERS.filter((q) => ids.includes(q.id)).map((q) => q.id);
-          saveState({ enabled, known: PROVIDERS.map((q) => q.id) });
-          rebuild();
-          setOpen(false);
-          place(true);
-          tick();
-        },
+        click: (item) => setEnabled(item.checked ? [...enabled, p.id] : enabled.filter((id) => id !== p.id)),
       })),
     },
     ...(numberMenus.length ? [{ label: 'Summary shows', submenu: numberMenus }] : []),
@@ -370,14 +484,9 @@ function menu() {
         label: group,
         submenu: list.map(([id, label]) => ({
           label,
-          type: 'checkbox', // radio groups don't span submenus; the rebuild unticks the old one
+          type: 'checkbox',
           checked: theme === id,
-          click: () => {
-            theme = id;
-            saveState({ theme });
-            sendLayout();
-            rebuild();
-          },
+          click: () => setTheme(id),
         })),
       })),
     },
@@ -514,6 +623,7 @@ app.whenReady().then(() => {
   globalShortcut.register(HOTKEY, toggle); // false when another copy already holds it; the menu still works
   timer = setInterval(tick, TICK_MS);
   cursorTimer = setInterval(pollCursor, CURSOR_MS);
+  if (!SHOT) servePhone();
 });
 
 ipcMain.on('rects', (_e, r) => {
