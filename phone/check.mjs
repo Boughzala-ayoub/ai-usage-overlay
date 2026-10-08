@@ -386,6 +386,12 @@ try {
   await page.screenshot({ path: path.join(shots, 'settings-412-paper.png') });
   await page.click('#prefs [data-provider="codex"]');
   await until(() => document.querySelectorAll('#cells .cell').length === 2, 'providers: Codex off the tab');
+  // The tab shrinks to the two left, and they still fit inside it.
+  await settle();
+  const two = await rect(page, '#tab');
+  if (!near(two.b - two.t, 89.5)) fail(`providers: with two the tab is ${(two.b - two.t).toFixed(1)} tall`);
+  const tight = await page.evaluate(({ t, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.top < t + 4 || x.bottom > b - 4; }).length, two);
+  if (tight) fail(`providers: with two, ${tight} rings or numbers crowd the tab's ends`);
   if (!posts.some((p) => p.body.enabled && !p.body.enabled.includes('codex') && p.body.enabled.length === 2)) fail(`providers: the PC got ${JSON.stringify(posts.at(-1))}`);
   await page.click('#prefs [data-provider="codex"]');
   await until(() => document.querySelectorAll('#cells .cell').length === 3, 'providers: Codex back on the tab');

@@ -169,8 +169,9 @@ once for "Display over other apps". A quiet notification keeps the bubble alive,
 button takes it away.
 
 `bubble.html` is both states. Collapsed, `Bubble.java` sizes the window to the tab plus 12dp beside
-it and above and below for the shadow (50x154 dp at Medium; the page sends the size with
-`Android.size()`), and handles every touch itself, so a drag never reaches the page. It calls
+it and above and below for the shadow (50x154 dp at Medium with three providers, 40.5 dp less
+for each one hidden; the page sends the size with `Android.size()`), and handles every touch
+itself, so a drag never reaches the page. It calls
 `press()`, `lift()`, `dock(side)` and `peek()` as the finger and the idle timer move the tab. A tap
 first tells the page where the window sits, then gives the window the whole screen. The page's
 layout follows the window's width, so it can never draw the panel in the small window or the tab
