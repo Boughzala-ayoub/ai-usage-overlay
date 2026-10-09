@@ -133,6 +133,18 @@ Large), hiding at the edge when idle, links to each usage page and Remove bubble
 own. Hidden at the edge, the tab slides off after 3 seconds untouched and leaves a 12dp lip with
 one level per provider, as the PC's lip does; a tap on it brings the tab back.
 
+The scissors in the footer snip part of the screen to the phone's clipboard, as Win+Shift+S does on
+the PC. The panel and the tab get out of the way and the screen dims. Drag over what you want and
+let go. The bubble hides its window, takes a screenshot, copies that rectangle as a PNG and docks
+again with a short buzz. A tap instead of a drag, or Back, cancels. The screenshot comes from an
+accessibility service, `Snipper.java`. It asks for no events and no window content, so the screenshot
+for a snip is all it ever sees. Turn it on once under Settings, Accessibility, Installed apps, AI
+Usage snipping. For a sideloaded app Android greys that switch out until you open App info, tap ⋮
+and pick Allow restricted settings. Until the service is on, the scissors show a note with a button
+for each screen. The clipboard gets a `content://com.local.aiusage.snips/` URI, which `Snips.java`
+serves from the app's cache. The provider isn't exported, so only the app the clipboard hands the
+snip to can read it. Each new snip deletes the ones older than a day.
+
 The credentials never leave the PC. The overlay serves the phone on `127.0.0.1:7430`, and Tailscale
 carries the port to the phone. Run this once and it survives reboots:
 
@@ -226,5 +238,6 @@ hover or drag paths, since that is the only way to test the parts Chromium does 
 
 Drag to reorder the chips, more than one account per provider, and any provider whose usage is not
 already on disk. On the phone: drag-to-dismiss (use the notification's Remove), starting the bubble at
-boot, an iPhone version (iOS lets no app draw over others), and reset notices. Copilot's quota needs a live call to `api.github.com/copilot_internal/user`, and
+boot, an iPhone version (iOS lets no app draw over others), reset notices, and sending a snip
+anywhere but the phone's clipboard (the share sheet, the Gallery, the PC's clipboard). Copilot's quota needs a live call to `api.github.com/copilot_internal/user`, and
 Cursor's needs a pasted session cookie.

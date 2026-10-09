@@ -1,26 +1,34 @@
 package com.local.aiusage;
 
+import android.accessibilityservice.AccessibilityService;
 import android.animation.ValueAnimator;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.hardware.HardwareBuffer;
 import android.net.Uri;
 import android.os.IBinder;
+import android.provider.Settings;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -29,6 +37,9 @@ import android.view.animation.DecelerateInterpolator;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 import android.widget.FrameLayout;
+import android.widget.Toast;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -38,8 +49,8 @@ import java.nio.charset.StandardCharsets;
  * on it is a drag (gliding to dock on the nearer side, as Messenger's heads do) or a tap. A tap gives the
  * window the whole screen and the page pulls the panel out of the tab. With auto-hide on, an idle tab
  * slides off the edge but for a lip, and a tap on the lip brings it back. The page reads the PC itself;
- * this moves and sizes the window and tells the page what the finger is doing. Both states use screen
- * coordinates, so the tab never jumps.
+ * this moves and sizes the window, tells the page what the finger is doing, and copies the snips the page
+ * marks out. Both states use screen coordinates, so the tab never jumps.
  */
 public class Bubble extends Service {
   static final int MARGIN = 12; // dp the window has beyond the tab, inside the screen, for the shadow
@@ -302,18 +313,19 @@ public class Bubble extends Service {
   // ---- the page's words. They arrive on WebView's own thread, so each hands its work to the window's.
 
   /** Once its closing animation has run. */
-  @JavascriptInterface public void collapse() {
-    root.post(() -> {
-      if (!open) return;
-      open = false;
-      lp.x = restX;
-      lp.y = restY;
-      lp.width = w();
-      lp.height = h();
-      lp.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-      wm.updateViewLayout(root, lp);
-      snap(); // the screen may have turned while the panel was open
-    });
+  @JavascriptInterface public void collapse() { root.post(this::fold); }
+
+  /** The window back to the tab, from the open panel or a snip. */
+  void fold() {
+    if (!open || !root.isAttachedToWindow()) return;
+    open = false;
+    lp.x = restX;
+    lp.y = restY;
+    lp.width = w();
+    lp.height = h();
+    lp.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+    wm.updateViewLayout(root, lp);
+    snap(); // the screen may have turned while the panel was open
   }
 
   @JavascriptInterface public String side() { return side; }
@@ -349,6 +361,71 @@ public class Bubble extends Service {
   }
 
   @JavascriptInterface public void remove() { root.post(this::stopSelf); }
+
+  // ---- snipping. The page dims the screen and takes the rectangle; this takes the screenshot through
+  // Snipper and copies that part of it.
+
+  @JavascriptInterface public boolean canSnip() { return Snipper.on != null; }
+
+  /** Where Snipper is switched on: Accessibility, or App info, where a sideloaded app's restricted settings are allowed. */
+  @JavascriptInterface public void settings(String where) {
+    Intent i = "app".equals(where)
+        ? new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))
+        : new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+    root.post(() -> {
+      startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+      js("shut()");
+    });
+  }
+
+  /** The rectangle the page took, as fractions of the screen, to the clipboard as a PNG. */
+  @JavascriptInterface public void snipped(double x, double y, double w, double h) {
+    root.post(() -> {
+      Snipper s = Snipper.on;
+      if (!open) return;
+      if (s == null) { // switched off since the page asked
+        fold();
+        return;
+      }
+      root.setVisibility(View.INVISIBLE); // out of its own picture
+      // ponytail: a fixed wait for the hidden window to leave the screen; a frame-commit callback if the dim ever shows in a snip
+      root.postDelayed(() -> s.takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new AccessibilityService.TakeScreenshotCallback() {
+        @Override public void onSuccess(AccessibilityService.ScreenshotResult r) {
+          fold();
+          root.setVisibility(View.VISIBLE);
+          new Thread(() -> copy(r, x, y, w, h)).start(); // a PNG takes a moment to write
+        }
+
+        @Override public void onFailure(int code) {
+          fold();
+          root.setVisibility(View.VISIBLE);
+          Toast.makeText(Bubble.this, "Couldn't take the screenshot (error " + code + ")", Toast.LENGTH_SHORT).show();
+        }
+      }), 150);
+    });
+  }
+
+  void copy(AccessibilityService.ScreenshotResult r, double x, double y, double w, double h) {
+    try (HardwareBuffer buffer = r.getHardwareBuffer()) {
+      Bitmap screen = Bitmap.wrapHardwareBuffer(buffer, r.getColorSpace()).copy(Bitmap.Config.ARGB_8888, false);
+      int sw = screen.getWidth(), sh = screen.getHeight();
+      int l = (int) Math.max(0, Math.min(Math.round(x * sw), sw - 1)), t = (int) Math.max(0, Math.min(Math.round(y * sh), sh - 1));
+      int cw = (int) Math.max(1, Math.min(Math.round(w * sw), sw - l)), ch = (int) Math.max(1, Math.min(Math.round(h * sh), sh - t));
+      File dir = new File(getCacheDir(), "snips");
+      dir.mkdirs();
+      // ponytail: a day of snips kept, for a clipboard history that still points at them; older ones go as the next is made
+      File[] old = dir.listFiles();
+      if (old != null) for (File f : old) if (f.lastModified() < System.currentTimeMillis() - 86_400_000L) f.delete();
+      File png = new File(dir, System.currentTimeMillis() + ".png");
+      try (FileOutputStream out = new FileOutputStream(png)) {
+        Bitmap.createBitmap(screen, l, t, cw, ch).compress(Bitmap.CompressFormat.PNG, 100, out);
+      }
+      getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newUri(getContentResolver(), "Snip", Snips.uri(png)));
+      root.post(() -> root.performHapticFeedback(HapticFeedbackConstants.CONFIRM));
+    } catch (Exception e) {
+      root.post(() -> Toast.makeText(this, "Couldn't copy the snip", Toast.LENGTH_SHORT).show());
+    }
+  }
 
   @Override public void onConfigurationChanged(Configuration c) {
     super.onConfigurationChanged(c);

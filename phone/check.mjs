@@ -372,6 +372,82 @@ try {
     if (await has('prefs')) fail(`${tag}: the panel will open on the settings next time`);
   }
 
+  // ---- snipping at every width. The scissors put the panel and the tab away under a dim and a cue; a drag
+  // marks a rectangle that goes to Bubble.java as fractions of the screen, and the click that ends the drag
+  // doesn't cancel it. A stand-in for Bubble.java records what the page asks of it.
+  const stub = (canSnip) => page.evaluate((can) => {
+    window.calls = [];
+    window.Android = new Proxy({}, { get: (_, k) => (...a) => (k === 'canSnip' ? can : calls.push([k, ...a])) });
+  }, canSnip);
+  const unstub = () => page.evaluate(() => delete window.Android);
+  for (const [width, height] of [[320, 700], [375, 812], [412, 915], [768, 1024], [1024, 768], [1280, 800]]) {
+    const tag = `snip ${width}x${height}`;
+    await open(width, height, 'right', 120);
+    await stub(true);
+    await page.click('#sn');
+    await settle();
+    const shown = await page.evaluate(() => ['#snip', '#cue', '#dock', '#tab', '#scrim'].map((s) => getComputedStyle(document.querySelector(s)).display).join());
+    if (shown !== 'block,grid,none,none,none') fail(`${tag}: snip, cue, panel, tab and scrim show as ${shown}`);
+    const cue = await rect(page, '#cue');
+    if (cue.l < 16 - 0.5 || cue.r > width - 16 + 0.5 || cue.t < 24) fail(`${tag}: the cue sits at ${[cue.l, cue.t, cue.r, cue.b].map(Math.round)}`);
+    if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) fail(`${tag}: scrolls sideways`);
+    if ([320, 1280].includes(width)) await page.screenshot({ path: path.join(shots, `snip-${width}.png`) });
+    await page.mouse.move(40, 100);
+    await page.mouse.down();
+    await page.mouse.move(width - 60, height / 2, { steps: 5 });
+    await settle(); // Chrome hands moves over once a frame
+    const s = await rect(page, '#sel');
+    if (!near(s.l, 40) || !near(s.t, 100) || !near(s.r, width - 60) || !near(s.b, height / 2)) fail(`${tag}: the rectangle is ${[s.l, s.t, s.r, s.b].map(Math.round)}`);
+    if ([320, 1280].includes(width)) await page.screenshot({ path: path.join(shots, `snip-${width}-drawing.png`) });
+    await page.mouse.up();
+    await settle();
+    const calls = await page.evaluate(() => calls);
+    const want = [40 / width, 100 / height, (width - 100) / width, (height / 2 - 100) / height];
+    const got = calls.find(([k]) => k === 'snipped');
+    if (!got || want.some((v, i) => Math.abs(got[i + 1] - v) > 1e-6)) fail(`${tag}: Bubble.java got ${JSON.stringify(calls)}, not snipped(${want})`);
+    if (calls.some(([k]) => k === 'collapse')) fail(`${tag}: the drag's own click cancelled the snip`);
+    if ((await page.$eval('#snip', (e) => getComputedStyle(e).visibility)) !== 'hidden') fail(`${tag}: the dim is still up for the screenshot`);
+    await unstub();
+    await resize(small);
+    if ((await has('snip')) || (await has('shot'))) fail(`${tag}: still snipping back in the small window`);
+  }
+  // A tap instead of a drag cancels: the window folds back and nothing is copied.
+  await open(412, 915, 'left', 120);
+  await stub(true);
+  await page.click('#sn');
+  await page.mouse.click(200, 400);
+  await settle();
+  const tapped = await page.evaluate(() => calls);
+  if (!tapped.some(([k]) => k === 'collapse') || tapped.some(([k]) => k === 'snipped')) fail(`snip: a tap sent ${JSON.stringify(tapped)}`);
+  await unstub();
+  await resize(small);
+  // With the accessibility service off, the scissors say where to turn it on instead, and both buttons go there.
+  for (const [width, height, side] of [[320, 700, 'right'], [412, 915, 'left'], [1280, 800, 'right']]) {
+    const tag = `snip off ${width}x${height} ${side}`;
+    await open(width, height, side, 120);
+    await stub(false);
+    await page.click('#sn');
+    await settle();
+    if (await has('snip')) fail(`${tag}: snipping started with the service off`);
+    const m = await page.evaluate(() => {
+      const n = document.querySelector('#needs');
+      return { shown: n.getBoundingClientRect().height, spill: [...n.querySelectorAll('p, button')].filter((e) => e.scrollWidth > e.clientWidth + 1).map((e) => e.textContent), small: [...n.querySelectorAll('button')].filter((e) => e.getBoundingClientRect().height < 34).length };
+    });
+    if (!m.shown) fail(`${tag}: the panel doesn't say where to turn it on`);
+    if (m.spill.length || m.small) fail(`${tag}: ${m.spill.join(' | ')} spills, ${m.small} buttons under 34px`);
+    const off = await outOfView();
+    if (off.length) fail(`${tag}: off screen: ${off.slice(0, 4).join(' | ')}`);
+    await page.screenshot({ path: path.join(shots, `snip-off-${width}-${side}.png`) });
+    await page.click('#needs [data-settings="app"]');
+    await page.click('#needs [data-settings="accessibility"]');
+    const asked = await page.evaluate(() => calls.filter(([k]) => k === 'settings').map(([, w]) => w).join());
+    if (asked !== 'app,accessibility') fail(`${tag}: the buttons asked for ${asked}`);
+    await unstub();
+    if (!(await closes(() => page.mouse.click(side === 'right' ? 20 : width - 20, height - 30)))) fail(`${tag}: a tap outside didn't close the panel`);
+    await resize(small);
+    if (await page.$eval('#needs', (n) => !n.hidden)) fail(`${tag}: the note is still there for next time`);
+  }
+
   // Each change goes to the PC as JSON and comes back as the PC's state.
   await open(412, 915, 'right', 120);
   await page.click('#mn');

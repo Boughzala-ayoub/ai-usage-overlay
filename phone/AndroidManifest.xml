@@ -14,5 +14,13 @@
     <service android:name=".Bubble" android:exported="false" android:foregroundServiceType="specialUse">
       <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="A floating bubble showing AI usage limits" />
     </service>
+    <!-- Takes the screenshot a snip is cut from; only the system can bind it. -->
+    <service android:name=".Snipper" android:exported="true" android:label="AI Usage snipping" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+      </intent-filter>
+      <meta-data android:name="android.accessibilityservice" android:resource="@xml/snipper" />
+    </service>
+    <provider android:name=".Snips" android:authorities="com.local.aiusage.snips" android:exported="false" android:grantUriPermissions="true" />
   </application>
 </manifest>

@@ -27,6 +27,7 @@ fs.rmSync(out, { recursive: true, force: true });
 for (const dir of ['assets', 'classes', 'res/drawable-xxxhdpi']) fs.mkdirSync(path.join(out, dir), { recursive: true });
 fs.copyFileSync(path.join(here, 'bubble.html'), path.join(out, 'assets', 'bubble.html'));
 fs.writeFileSync(path.join(out, 'assets', 'server.txt'), server);
+fs.cpSync(path.join(here, 'res'), path.join(out, 'res'), { recursive: true });
 fs.copyFileSync(path.join(here, '..', 'build', 'icon.png'), path.join(out, 'res', 'drawable-xxxhdpi', 'icon.png'));
 
 const unsigned = path.join(out, 'unsigned.apk');

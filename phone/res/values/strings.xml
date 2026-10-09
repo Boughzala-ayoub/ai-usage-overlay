@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="snipper">Lets the scissors in the AI Usage bubble take a screenshot when you snip, so the part you pick can be copied. It reads nothing else on screen and does nothing for you.</string>
+</resources>
