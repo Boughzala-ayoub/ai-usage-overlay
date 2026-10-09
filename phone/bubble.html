@@ -609,6 +609,7 @@
   addEventListener('resize', () => {
     if (wide()) return;
     body.classList.remove('closing', 'snip', 'drawing', 'shot');
+    from = null; // a finger still down as the snip went (Back mid-drag) never reaches #snip again
     needs.hidden = true;
     showPrefs(false); // it opens on the numbers next time
   });
@@ -633,19 +634,22 @@
     const b = e.target.closest('button');
     if (b) window.Android?.settings(b.dataset.settings);
   };
+  // The finger that starts a snip is the only one that moves or ends it: another finger's touches are ignored.
   let from = null;
+  const mine = (e) => from?.id === e.pointerId;
   const marked = (e) => ({ sx: Math.min(from.x, e.clientX), sy: Math.min(from.y, e.clientY), sw: Math.abs(e.clientX - from.x), sh: Math.abs(e.clientY - from.y) });
   snip.onpointerdown = (e) => {
-    from = { x: e.clientX, y: e.clientY };
+    if (from) return;
+    from = { id: e.pointerId, x: e.clientX, y: e.clientY };
     snip.setPointerCapture(e.pointerId);
   };
   snip.onpointermove = (e) => {
-    if (!from) return;
+    if (!mine(e)) return;
     for (const [k, v] of Object.entries(marked(e))) sel.style.setProperty('--' + k, v + 'px');
     body.classList.add('drawing');
   };
   snip.onpointerup = (e) => {
-    if (!from) return;
+    if (!mine(e)) return;
     const m = marked(e);
     from = null;
     if (m.sw < 12 || m.sh < 12) return shut(); // a tap, not a drag
@@ -654,7 +658,8 @@
     if (window.Android) Android.snipped(m.sx / innerWidth, m.sy / innerHeight, m.sw / innerWidth, m.sh / innerHeight);
     else shut();
   };
-  snip.onpointercancel = () => {
+  snip.onpointercancel = (e) => {
+    if (!mine(e)) return;
     from = null;
     body.classList.remove('drawing');
   };

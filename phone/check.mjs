@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const pageFile = process.env.BUBBLE_PAGE || path.join(here, 'bubble.html'); // BUBBLE_PAGE: the page as packed in the APK
 const require = createRequire(import.meta.url);
 const THEME_GROUPS = require('../themes.js');
 const css = (id) => THEME_GROUPS.flatMap(([, l]) => l).find(([t]) => t === id)[2];
@@ -68,7 +69,7 @@ const reopen = () => {
   waiting.splice(0).forEach(([req, res]) => openStream(req, res));
 };
 const server = http.createServer(async (req, res) => {
-  if (req.url === '/') return res.end(fs.readFileSync(path.join(here, 'bubble.html')));
+  if (req.url === '/') return res.end(fs.readFileSync(pageFile));
   if (req.url === '/fonts/geist.woff2') return res.end(fs.readFileSync(path.join(here, '..', 'fonts', 'geist.woff2')));
   if (answer === 'down') return res.writeHead(502).end();
   if (req.url === '/api/events') {
@@ -131,7 +132,7 @@ let cutReal = false;
 const realStreams = new Set();
 const realWaiting = [];
 const realServer = http.createServer((req, res) => {
-  if (req.url === '/') return res.end(fs.readFileSync(path.join(here, 'bubble.html')));
+  if (req.url === '/') return res.end(fs.readFileSync(pageFile));
   if (req.url === '/api/events') {
     if (cutReal) return void realWaiting.push([req, res]); // held, as the stand-in's are, so a reconnect can't hide anything
     realStreams.add(res);
@@ -391,14 +392,14 @@ try {
     const cue = await rect(page, '#cue');
     if (cue.l < 16 - 0.5 || cue.r > width - 16 + 0.5 || cue.t < 24) fail(`${tag}: the cue sits at ${[cue.l, cue.t, cue.r, cue.b].map(Math.round)}`);
     if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) fail(`${tag}: scrolls sideways`);
-    if ([320, 1280].includes(width)) await page.screenshot({ path: path.join(shots, `snip-${width}.png`) });
+    await page.screenshot({ path: path.join(shots, `snip-${width}.png`) });
     await page.mouse.move(40, 100);
     await page.mouse.down();
     await page.mouse.move(width - 60, height / 2, { steps: 5 });
     await settle(); // Chrome hands moves over once a frame
     const s = await rect(page, '#sel');
     if (!near(s.l, 40) || !near(s.t, 100) || !near(s.r, width - 60) || !near(s.b, height / 2)) fail(`${tag}: the rectangle is ${[s.l, s.t, s.r, s.b].map(Math.round)}`);
-    if ([320, 1280].includes(width)) await page.screenshot({ path: path.join(shots, `snip-${width}-drawing.png`) });
+    await page.screenshot({ path: path.join(shots, `snip-${width}-drawing.png`) });
     await page.mouse.up();
     await settle();
     const calls = await page.evaluate(() => calls);
@@ -419,6 +420,88 @@ try {
   await settle();
   const tapped = await page.evaluate(() => calls);
   if (!tapped.some(([k]) => k === 'collapse') || tapped.some(([k]) => k === 'snipped')) fail(`snip: a tap sent ${JSON.stringify(tapped)}`);
+  await unstub();
+  await resize(small);
+  // Only the finger that started a snip moves or ends it: another finger's down, move, release or cancel
+  // changes nothing. Real touches through CDP, each call putting down, moving or lifting the fingers it lists.
+  // CDP cancels only every finger at once, so the other finger's cancel goes to #snip with its own pointerId
+  // while that finger is really down.
+  const cdp = await page.createCDPSession();
+  const touch = (type, fingers) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: fingers.map(([id, x, y]) => ({ id, x, y })) });
+  const drawn = async (want, what) => {
+    await settle();
+    const s = await rect(page, '#sel');
+    const state = await page.evaluate(() => ({ calls, drawing: document.body.classList.contains('drawing') }));
+    if (![s.l, s.t, s.r, s.b].every((v, i) => near(v, want[i]))) fail(`snip, two fingers: after ${what} the rectangle is ${[s.l, s.t, s.r, s.b].map(Math.round)}, not ${want}`);
+    if (!state.drawing || state.calls.length) fail(`snip, two fingers: ${what} ended the snip: ${JSON.stringify(state)}`);
+  };
+  await open(375, 812, 'right', 120);
+  await stub(true);
+  await page.click('#sn');
+  await page.evaluate(() => {
+    window.ids = [];
+    document.querySelector('#snip').addEventListener('pointerdown', (e) => ids.push(e.pointerId));
+  });
+  await touch('touchStart', [[1, 40, 100]]);
+  await touch('touchMove', [[1, 150, 300]]);
+  await touch('touchStart', [[1, 150, 300], [2, 270, 500]]);
+  await drawn([40, 100, 150, 300], "a second finger's down");
+  await touch('touchMove', [[1, 150, 300], [2, 300, 600]]);
+  await drawn([40, 100, 150, 300], "the second finger's move");
+  await page.screenshot({ path: path.join(shots, 'snip-375-two-fingers.png') });
+  await touch('touchEnd', [[2, 300, 600]]);
+  await drawn([40, 100, 150, 300], "the second finger's release");
+  await touch('touchStart', [[1, 150, 300], [3, 200, 650]]);
+  await page.evaluate(() => document.querySelector('#snip').dispatchEvent(new PointerEvent('pointercancel', { pointerId: ids.at(-1), pointerType: 'touch', bubbles: true })));
+  await drawn([40, 100, 150, 300], "a third finger's cancel");
+  await touch('touchEnd', [[3, 200, 650]]);
+  await touch('touchMove', [[1, 250, 450]]);
+  await drawn([40, 100, 250, 450], 'the first finger moving on');
+  await touch('touchEnd', [[1, 250, 450]]);
+  await settle();
+  const fingers = await page.evaluate(() => calls);
+  const crop = [40 / 375, 100 / 812, 210 / 375, 350 / 812];
+  const cropped = fingers.find(([k]) => k === 'snipped');
+  if (!cropped || crop.some((v, i) => Math.abs(cropped[i + 1] - v) > 1e-6) || fingers.length !== 1) fail(`snip, two fingers: Bubble.java got ${JSON.stringify(fingers)}, not only snipped(${crop})`);
+  await unstub();
+  await resize(small);
+  // The first finger's own cancel still drops the rectangle, and the next drag snips as usual.
+  await open(375, 812, 'right', 120);
+  await stub(true);
+  await page.click('#sn');
+  await touch('touchStart', [[1, 60, 120]]);
+  await touch('touchMove', [[1, 200, 320]]);
+  await touch('touchCancel', []);
+  await settle();
+  const dropped = await page.evaluate(() => ({ calls, drawing: document.body.classList.contains('drawing'), snip: document.body.classList.contains('snip') }));
+  if (dropped.calls.length || dropped.drawing || !dropped.snip) fail(`snip: after a cancel ${JSON.stringify(dropped)}, not still snipping with nothing drawn`);
+  await touch('touchStart', [[1, 60, 120]]);
+  await touch('touchMove', [[1, 200, 320]]);
+  await touch('touchEnd', [[1, 200, 320]]);
+  await settle();
+  const after = await page.evaluate(() => calls.filter(([k]) => k === 'snipped'));
+  if (after.length !== 1 || Math.abs(after[0][3] - 140 / 375) > 1e-6) fail(`snip: the drag after a cancel sent ${JSON.stringify(after)}`);
+  await unstub();
+  await resize(small);
+  // Back mid-drag folds the window with the finger still down; that finger, lifted after, can't block the next snip.
+  await open(375, 812, 'right', 120);
+  await stub(true);
+  await page.click('#sn');
+  await touch('touchStart', [[1, 60, 120]]);
+  await touch('touchMove', [[1, 200, 320]]);
+  await page.evaluate(() => shut());
+  await resize(small);
+  await touch('touchEnd', [[1, 20, 20]]);
+  await unstub();
+  await open(375, 812, 'right', 120);
+  await stub(true);
+  await page.click('#sn');
+  await touch('touchStart', [[1, 60, 120]]);
+  await touch('touchMove', [[1, 200, 320]]);
+  await touch('touchEnd', [[1, 200, 320]]);
+  await settle();
+  const next = await page.evaluate(() => calls.filter(([k]) => k === 'snipped'));
+  if (next.length !== 1 || Math.abs(next[0][3] - 140 / 375) > 1e-6) fail(`snip: after Back mid-drag the next drag sent ${JSON.stringify(next)}`);
   await unstub();
   await resize(small);
   // With the accessibility service off, the scissors say where to turn it on instead, and both buttons go there.
