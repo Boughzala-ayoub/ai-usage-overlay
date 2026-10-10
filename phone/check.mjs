@@ -23,6 +23,7 @@ fs.mkdirSync(shots, { recursive: true });
 const h = 3600_000;
 const providers = (hot) => [
   { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: hot ? 96 : 34, bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
+    apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), ...(hot ? { error: 'API credit not refreshed (HTTP 503), showing the last reading.' } : {}) },
     rows: [{ label: 'Session', percent: hot ? 96 : 34, resets: 'in 3h 2m' }, { label: 'All models', percent: 56, resets: 'in 3h 42m' }, { label: 'Fable', percent: 0, resets: 'in 3h 42m' }] },
   { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: hot ? 100 : 3, bankedResets: 2, bankedResetExpiries: [Date.parse('2026-10-28T10:00:00Z'), Date.parse('2026-11-04T10:00:00Z')], updatedAt: Date.now() - (hot ? h : 0), waitMs: hot ? 90_000 : 0,
     rows: [{ label: 'Weekly', percent: hot ? 100 : 3, resets: 'in 6d 12h' }] },
@@ -505,7 +506,7 @@ try {
   await unstub();
   await resize(small);
   // With the accessibility service off, the scissors say where to turn it on instead, and both buttons go there.
-  for (const [width, height, side] of [[320, 700, 'right'], [412, 915, 'left'], [1280, 800, 'right']]) {
+  for (const [width, height, side] of [[320, 700], [375, 812], [412, 915], [768, 1024], [1024, 768], [1280, 800]].flatMap(([w, h]) => [[w, h, 'right'], [w, h, 'left']])) {
     const tag = `snip off ${width}x${height} ${side}`;
     await open(width, height, side, 120);
     await stub(false);
@@ -518,6 +519,7 @@ try {
     });
     if (!m.shown) fail(`${tag}: the panel doesn't say where to turn it on`);
     if (m.spill.length || m.small) fail(`${tag}: ${m.spill.join(' | ')} spills, ${m.small} buttons under 34px`);
+    if (await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)) fail(`${tag}: scrolls sideways`);
     const off = await outOfView();
     if (off.length) fail(`${tag}: off screen: ${off.slice(0, 4).join(' | ')}`);
     await page.screenshot({ path: path.join(shots, `snip-off-${width}-${side}.png`) });
@@ -709,6 +711,36 @@ try {
   pc.theme = 'molten';
   await page.reload({ waitUntil: 'load' });
   await until(() => data.theme === 'molten' && Number.isFinite(data.rev), 'unnumbered: a numbered snapshot replaces a saved unnumbered one');
+
+  // ---- out of reach, the page draws the reading it saved. A saved balance past its deadline isn't funds:
+  // from that moment the line says it expired, with no answer from the PC. Up to it, the balance shows.
+  const deadline = Date.parse('2099-10-27T00:00:00Z');
+  const saved = providers(false).map((p) => (p.id === 'claude' ? { ...p, apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: deadline } } : p));
+  await page.evaluate((list) => localStorage.setItem('usage', JSON.stringify({ css: '', theme: 'noir', enabled: list.map((p) => p.id), choices: {}, providers: list, run: 'saved', rev: 1, at: Date.now() })), saved);
+  answer = 'down';
+  await page.reload({ waitUntil: 'load' });
+  await until(() => document.body.classList.contains('away'), 'offline: the page knows the PC is out of reach');
+  const creditAt = (at) => page.evaluate((at) => {
+    window.realNow ??= Date.now;
+    Date.now = () => at;
+    draw();
+    return [...document.querySelectorAll('#sections .bank, #sections .status')].map((e) => e.textContent);
+  }, at);
+  const early = await creditAt(deadline - 1);
+  if (!early.includes('$91.95 of $100 API credit left, expires Oct 27')) fail(`offline: a saved balance before its deadline should show, the page shows ${JSON.stringify(early)}`);
+  const lapsed = await creditAt(deadline);
+  if (lapsed.some((t) => t.includes('$91.95')) || !lapsed.includes('API credit expired Oct 27, waiting for a fresh reading.')) fail(`offline: a saved balance at its deadline should be gone, the page shows ${JSON.stringify(lapsed)}`);
+  // The expired line at every width, the clock held at the deadline, at the size the open checks measure.
+  await page.evaluate(() => setSize(1));
+  for (const [width, height] of [[320, 700], [375, 812], [768, 1024], [1024, 768], [1280, 800]]) {
+    await open(width, height, 'right', 120);
+    await openCheck(`offline expired ${width}x${height}`, width, height, 'right');
+    if (width === 320) await page.screenshot({ path: path.join(shots, 'open-offline-expired-320.png') });
+    await closes(() => page.evaluate(() => shut()));
+    await resize(small);
+  }
+  await page.evaluate(() => (Date.now = window.realNow));
+  answer = 'ok';
 
   // ---- against main.js itself, the review's order: the page's first read waits on a slow provider; the
   // stream opens meanwhile on the cached 10% and then drops, its reconnections held; the read then answers

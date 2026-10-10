@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
+const { shapeApiCredit, creditExpired, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
 
 const now = Date.UTC(2026, 7, 29, 12, 0, 0);
 
@@ -106,6 +106,19 @@ const bankedClaude = shapeClaude({ cedar_ember: { eligible: true, grants: [
 ] } }, null);
 assert.strictEqual(bankedClaude.bankedResets, 4);
 assert.deepStrictEqual(bankedClaude.bankedResetExpiries, [Date.parse('2026-10-01T00:00:00Z'), Date.parse('2026-10-22T16:00:00Z'), Date.parse('2026-10-22T16:00:00Z'), null]);
+
+// The plan's API credit: its own program's unexpired tranches only, whatever else the Console lists.
+const tranche = (program, left, expires, currency = 'USD') => ({ program_id: program, currency, granted_amount_minor_units: 10000, remaining_amount_minor_units: left, expires_at: expires });
+assert.deepStrictEqual(shapeApiCredit([{ promo_tranches: [
+  tranche('subscription_api_credit', 9195, '2026-10-27T00:00:00Z'),
+  tranche('subscription_api_credit', 4000, '2026-09-27T00:00:00Z'),
+  tranche('startup_promo', 10000, '2026-12-31T00:00:00Z'),
+  tranche('subscription_api_credit', 10000, '2026-12-31T00:00:00Z', 'EUR'),
+] }, { type: 'error' }], Date.parse('2026-10-10T00:00:00Z')), { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2026-10-27T00:00:00Z') });
+assert.strictEqual(shapeApiCredit([{ promo_tranches: [tranche('startup_promo', 500, null)] }]), undefined, 'no plan credit is no credit line');
+const deadline = Date.parse('2026-10-27T00:00:00Z');
+assert.deepStrictEqual([deadline - 1, deadline].map((at) => creditExpired({ leftCents: 1, expiresAt: deadline }, at)), [false, true], 'a balance lapses at its deadline, as the Console counts');
+assert.deepStrictEqual([creditExpired({ leftCents: 1, expiresAt: null }, Infinity), creditExpired(undefined)], [false, false], 'nothing without a deadline lapses');
 
 // A reset is observed from provider data, not inferred from its estimated reset time.
 assert.deepStrictEqual(
@@ -289,6 +302,99 @@ configuredProvider.read()
     const skewed = await loadCodex(skew, skew).read();
     assert.strictEqual(skewed.rows[0].percent, 80, 'the newest event wins even when its file looks older');
   })
+  .then(async () => {
+    // The API credit rides on Claude's read: asked with the pasted session, kept through a blip, and a
+    // dead session says so without costing the usage numbers.
+    loadCodex(codexHome, codexHome);
+    const { PROVIDERS, setConsoleKey } = require('./providers');
+    const claude = PROVIDERS.find((p) => p.id === 'claude');
+    const originalFetch = global.fetch;
+    let mode = 'ok';
+    global.fetch = async (url, options) => {
+      if (!url.startsWith('https://platform.claude.com/')) return { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: 12 }] }) };
+      assert.strictEqual(options.headers.Cookie, 'sessionKey=sk-ant-sid01-test');
+      if (mode === 'offline') throw new TypeError('fetch failed');
+      if (mode === 'expired') return { ok: false, status: 403, headers: new Headers() };
+      if (url.endsWith('/organizations')) return { ok: true, json: async () => [{ uuid: 'chat-org', capabilities: ['chat'] }, { uuid: 'api-org', capabilities: ['api'] }] };
+      assert.strictEqual(url, 'https://platform.claude.com/api/organizations/api-org/prepaid/credits', 'only API organizations are asked');
+      return { ok: true, json: async () => ({ promo_tranches: [tranche('subscription_api_credit', 9195, '2099-10-27T00:00:00Z')] }) };
+    };
+    try {
+      assert.strictEqual((await claude.read()).apiCredit, undefined, 'no session key, no Console request and no line');
+      setConsoleKey('sk-ant-sid01-test');
+      assert.deepStrictEqual((await claude.read()).apiCredit, { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z') });
+      mode = 'offline';
+      assert.strictEqual((await claude.read()).apiCredit.leftCents, 9195, 'a network blip keeps the last credit');
+      mode = 'expired';
+      const expired = await claude.read();
+      assert.match(expired.apiCredit.error, /session expired/);
+      assert.strictEqual(expired.rows[0].percent, 12, 'a dead Console session leaves the usage numbers alone');
+
+      // A session replaced or forgotten mid-read publishes nothing and leaves nothing behind: the next
+      // session asks for its own organizations. Each cookie opens only its own, as the Console's would.
+      let releaseOrgs = null;
+      let releaseUsage = null;
+      global.fetch = async (url, options) => {
+        if (!url.startsWith('https://platform.claude.com/')) {
+          if (releaseUsage === false) await new Promise((r) => (releaseUsage = r));
+          return { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: 12 }] }) };
+        }
+        const who = options.headers.Cookie.slice(-1);
+        if (url.endsWith('/organizations')) {
+          if (who === 'a' && releaseOrgs === false) await new Promise((r) => (releaseOrgs = r));
+          return { ok: true, json: async () => [{ uuid: 'org-' + who, capabilities: ['api'] }] };
+        }
+        if (!url.includes('/org-' + who + '/')) return { ok: false, status: 403, headers: new Headers() };
+        return { ok: true, json: async () => ({ promo_tranches: [tranche('subscription_api_credit', who === 'a' ? 1111 : 2222, '2099-10-27T00:00:00Z')] }) };
+      };
+      const until = async (ready) => {
+        for (let i = 0; i < 100 && !ready(); i++) await new Promise((r) => setTimeout(r, 5));
+        assert.ok(ready(), 'the held request arrived');
+      };
+      setConsoleKey('sk-ant-sid01-a');
+      releaseOrgs = false;
+      const replaced = claude.read();
+      await until(() => releaseOrgs);
+      setConsoleKey('sk-ant-sid01-b');
+      releaseOrgs();
+      assert.strictEqual((await replaced).apiCredit, undefined, 'a replaced session publishes nothing');
+      assert.strictEqual((await claude.read()).apiCredit?.leftCents, 2222, 'the new session reads its own organizations');
+      setConsoleKey('sk-ant-sid01-a');
+      releaseUsage = false;
+      const forgotten = claude.read();
+      await until(() => releaseUsage);
+      await new Promise((r) => setTimeout(r, 20)); // the Console answers at once: its balance is in
+      setConsoleKey('');
+      releaseUsage();
+      assert.strictEqual((await forgotten).apiCredit, undefined, 'a session forgotten before usage answers publishes nothing');
+
+      // A failed refresh says so and keeps the balance it last read, but never past that balance's expiry.
+      setConsoleKey('sk-ant-sid01-c');
+      let status = 200;
+      global.fetch = async (url) => {
+        if (!url.startsWith('https://platform.claude.com/')) return { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: 12 }] }) };
+        if (status !== 200) return { ok: false, status, headers: new Headers() };
+        if (url.endsWith('/organizations')) return { ok: true, json: async () => [{ uuid: 'org-c', capabilities: ['api'] }] };
+        return { ok: true, json: async () => ({ promo_tranches: [tranche('subscription_api_credit', 9195, '2026-10-27T00:00:00Z')] }) };
+      };
+      const realNow = Date.now;
+      try {
+        Date.now = () => Date.parse('2026-10-10T12:00:00Z');
+        assert.strictEqual((await claude.read()).apiCredit.leftCents, 9195);
+        status = 503;
+        const failed = (await claude.read()).apiCredit;
+        assert.deepStrictEqual([failed.leftCents, failed.error], [9195, 'API credit not refreshed (HTTP 503), showing the last reading.']);
+        Date.now = () => Date.parse('2026-10-28T12:00:00Z');
+        const lapsed = await claude.read();
+        assert.deepStrictEqual(lapsed.apiCredit, { error: 'API credit not refreshed (HTTP 503).' }, 'expired funds are not shown as available');
+        assert.strictEqual(lapsed.rows[0].percent, 12, 'while usage keeps refreshing');
+      } finally {
+        Date.now = realNow;
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  })
   .then(mainChecks)
   .then(() => console.log('ok'))
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
@@ -301,6 +407,9 @@ async function mainChecks() {
     app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
     ipcMain: { on() {}, handle() {} },
     globalShortcut: { unregisterAll() {} },
+    Menu: { buildFromTemplate: (template) => template },
+    screen: { getAllDisplays: () => [{ id: 1 }], getPrimaryDisplay: () => ({ id: 1 }) },
+    safeStorage: { decryptString: (sealed) => sealed.toString() }, // synthetic keys only, sealed as plain base64
   };
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
@@ -309,9 +418,10 @@ async function mainChecks() {
   const held = { read: async () => ({ rows: [] }) };
   const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { readOne, saveState, gate, last, servePhone };';
+  // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
-  const { readOne, saveState, gate, last, servePhone } = mod.exports;
+  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -430,6 +540,60 @@ async function mainChecks() {
     assert.strictEqual(fresh.providers[0].rows[0].percent, 80, 'the read answered with the fresh one');
     assert.ok(typeof fresh.run === 'string' && fresh.run === cached.run, `both from one run of the overlay, not ${fresh.run} and ${cached.run}`);
     assert.ok(fresh.rev > cached.rev, `the fresh snapshot is numbered after the cached one, not ${fresh.rev} after ${cached.rev}`);
+
+    // Forgetting the Console session takes its credit off the screen, the phones and the saved cache at once,
+    // even while Claude's reads are gated, and keeps the usage rows.
+    const claude = providers.PROVIDERS[0];
+    held.read = async () => ({ rows: [{ label: 'Weekly', percent: 30 }], apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: null }, updatedAt: 3 });
+    await readOne(claude, true);
+    gate.set('claude', Date.now() + 3_600_000);
+    useConsoleKey('', undefined);
+    on['will-quit']();
+    assert.deepStrictEqual([last.get('claude').apiCredit, last.get('claude').rows[0].percent], [undefined, 30], 'the credit leaves the screen, the usage stays');
+    assert.deepStrictEqual([saved().cache.claude.apiCredit, saved().cache.claude.rows[0].percent], [undefined, 30], 'and the saved cache, so a restart does not bring it back');
+    const shown = JSON.parse((await ask('GET', '/api/usage')).body).providers[0];
+    assert.deepStrictEqual([shown.apiCredit, shown.rows[0].percent], [undefined, 30], 'and the phones');
+
+    // A read in flight began under the old session, so a session change reads again after it instead of joining it.
+    gate.delete('claude');
+    let reads = 0;
+    held.read = () => (reads++, new Promise((r) => (finish = r)));
+    const inFlight = readOne(claude, true);
+    useConsoleKey('', undefined);
+    finish({ rows: [{ label: 'Weekly', percent: 31 }], updatedAt: 4 });
+    await inFlight;
+    for (let i = 0; i < 50 && reads < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.strictEqual(reads, 2, 'a fresh read follows the one in flight');
+    finish({ rows: [{ label: 'Weekly', percent: 32 }], updatedAt: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // A balance past its deadline isn't funds, whatever kept the reading. Here the usage gate skips the read:
+    // up to the deadline the balance shows; from it on the snapshot says it expired, the usage stays, and
+    // nothing is asked to get round the gate.
+    const lapsing = { rows: [{ label: 'Weekly', percent: 40 }], apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: deadline }, updatedAt: 6 };
+    const shownClaude = () => snapshot().find((p) => p.id === 'claude');
+    Date.now = () => deadline - 60_000;
+    last.set('claude', lapsing);
+    gate.set('claude', deadline + 3_600_000);
+    reads = 0;
+    held.read = async () => (reads++, lapsing);
+    Date.now = () => deadline - 1;
+    assert.strictEqual(shownClaude().apiCredit.leftCents, 9195, 'up to its deadline the balance shows');
+    Date.now = () => deadline;
+    await readOne(claude, true);
+    assert.strictEqual(reads, 0, 'the gate still holds');
+    assert.deepStrictEqual([shownClaude().apiCredit, shownClaude().rows[0].percent], [{ expired: true, expiresAt: deadline }, 40], 'from its deadline the balance is gone, the usage stays');
+
+    // The same reading and gate restored at startup, with a Console session that decrypts.
+    saveState({ cache: { claude: lapsing }, gate: { claude: deadline + 3_600_000 }, consoleSession: Buffer.from('sk-ant-sid01-synthetic').toString('base64') });
+    on['will-quit']();
+    for (const [at, want] of [[deadline - 60_000, lapsing.apiCredit], [deadline + 60_000, { expired: true, expiresAt: deadline }]]) {
+      Date.now = () => at;
+      last.clear();
+      gate.clear();
+      loadState();
+      assert.deepStrictEqual([shownClaude().apiCredit, shownClaude().rows[0].percent, gate.get('claude')], [want, 40, deadline + 3_600_000], `restored at ${new Date(at).toISOString()}`);
+    }
   } finally {
     Date.now = realNow;
     on['will-quit']?.(); // flush before the folder goes, or a pending save recreates it

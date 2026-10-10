@@ -398,6 +398,20 @@
       (list ? (n === 1 ? ' expires ' : ' expire ') + esc(list) : '') + '</p>';
   }
 
+  function credit(p) {
+    const c = p.apiCredit;
+    if (!c) return '';
+    const usd = (cents) => '$' + (cents % 100 ? (cents / 100).toFixed(2) : cents / 100);
+    const day = (t) => new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    // Past its deadline the total isn't funds: the PC says so, and a reading saved here while the PC is out of
+    // reach is checked against this phone's clock at each draw.
+    if (c.expired || (Number.isFinite(c.expiresAt) && c.expiresAt <= Date.now())) return '<p class="status warn">API credit expired ' + esc(day(c.expiresAt)) + ', waiting for a fresh reading.</p>';
+    const when = Number.isFinite(c.expiresAt) ? ', expires ' + day(c.expiresAt) : '';
+    // A failed refresh keeps the balance it last read, with the warning under it.
+    return (Number.isFinite(c.leftCents) ? '<p class="bank"><b class="fig">' + usd(c.leftCents) + '</b> of ' + usd(c.grantedCents) + ' API credit left' + esc(when) + '</p>' : '') +
+      (c.error ? '<p class="status warn">' + esc(c.error).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>' : '');
+  }
+
   function section(p) {
     const rows = p.rows || [];
     const wait = p.waitMs > 0 ? Math.ceil(p.waitMs / 1000) : 0;
@@ -416,7 +430,7 @@
           '<span class="pc fig">' + pctText(r.percent) + '<small>%</small></span>' +
           '<span class="rs">' + esc(r.resets) + '</span>' +
         '</div>').join('') +
-      banked(p) +
+      banked(p) + credit(p) +
       lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
     '</section>';
   }

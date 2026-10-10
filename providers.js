@@ -10,6 +10,8 @@ const path = require('path');
 const HOME = os.homedir();
 const CLAUDE_CREDS = path.join(HOME, '.claude', '.credentials.json');
 const CLAUDE_API = 'https://api.anthropic.com/api/oauth';
+const CONSOLE_API = 'https://platform.claude.com/api';
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const CODEX_API = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_RESETS_API = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const OPENCODE_AUTH = path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.local', 'share'), 'opencode', 'auth.json');
@@ -103,6 +105,64 @@ function shapeClaude(usage, profile) {
 
 let claudeProfile = null; // plan tier can't change mid-process; fetched once, halves every later refresh
 
+// ---- Claude API credit: the monthly credit Max and Team plans pay into a linked Console organization.
+// No public API reports it. The Console's billing page reads it with the browser session, and so do we,
+// with the sessionKey cookie main hands over from its encrypted store.
+let consoleKey = '';
+let consoleSession = 0; // bumped on every key change: a read begun under an older key writes and publishes nothing
+let consoleOrgs = null; // the session's API organizations; they don't change while it lasts
+let lastApiCredit; // the session's last answer; a failed refresh shows its funds flagged, until they expire
+
+function setConsoleKey(key) {
+  consoleKey = key || '';
+  consoleSession++;
+  consoleOrgs = null;
+  lastApiCredit = undefined;
+}
+
+// Every unexpired tranche of the plan's credit, summed the way the Console's billing widget sums them.
+// Other promotional credits share the list, so the program id picks ours.
+function shapeApiCredit(balances, now = Date.now()) {
+  const tranches = balances.flatMap((b) => (Array.isArray(b?.promo_tranches) ? b.promo_tranches : [])).filter((t) =>
+    t?.program_id === 'subscription_api_credit' && (t.currency || 'USD').toUpperCase() === 'USD' &&
+    Number.isFinite(t.granted_amount_minor_units) && Number.isFinite(t.remaining_amount_minor_units) &&
+    !(Date.parse(t.expires_at) <= now));
+  if (!tranches.length) return undefined;
+  const ends = tranches.map((t) => Date.parse(t.expires_at)).filter(Number.isFinite);
+  return {
+    leftCents: tranches.reduce((sum, t) => sum + t.remaining_amount_minor_units, 0),
+    grantedCents: tranches.reduce((sum, t) => sum + t.granted_amount_minor_units, 0),
+    expiresAt: ends.length ? Math.min(...ends) : null,
+  };
+}
+
+// The total holds until its earliest tranche's deadline, and from that moment, as the Console counts, it isn't
+// funds. No deadline never lapses.
+const creditExpired = (credit, now = Date.now()) => Number.isFinite(credit?.expiresAt) && credit.expiresAt <= now;
+
+// Never throws: the credit line must not cost the usage numbers.
+async function readApiCredit() {
+  if (!consoleKey) return undefined;
+  const session = consoleSession;
+  const headers = { Cookie: `sessionKey=${consoleKey}`, 'User-Agent': BROWSER_UA };
+  try {
+    const orgs = consoleOrgs ?? (await fetchJson(`${CONSOLE_API}/organizations`, headers)).filter((o) => o?.capabilities?.includes('api')).map((o) => o.uuid);
+    if (session !== consoleSession) return undefined;
+    consoleOrgs = orgs;
+    const balances = await Promise.all(orgs.map((id) => fetchJson(`${CONSOLE_API}/organizations/${id}/prepaid/credits`, headers)));
+    if (session !== consoleSession) return undefined;
+    lastApiCredit = shapeApiCredit(balances) || { error: 'No plan API credit in your Console organization.' };
+  } catch (e) {
+    if (session !== consoleSession) return undefined;
+    if (e.status === 401 || e.status === 403) return (lastApiCredit = { error: 'Console session expired. Copy a new `sessionKey` and pick Paste Console session key in the tray.' });
+    if (lastApiCredit?.error) return lastApiCredit;
+    // Offline, throttled or a 5xx: the balance on hand is old news, and expired funds aren't funds.
+    const why = `API credit not refreshed (${e.message})`;
+    return lastApiCredit && !creditExpired(lastApiCredit) ? { ...lastApiCredit, error: why + ', showing the last reading.' } : { error: why + '.' };
+  }
+  return lastApiCredit;
+}
+
 async function readClaude() {
   let creds;
   try {
@@ -121,12 +181,16 @@ async function readClaude() {
     'User-Agent': 'claude-cli/2.1.280 (external, cli)',
   };
   const get = (p) => fetchJson(CLAUDE_API + p, headers);
+  const session = consoleSession;
   try {
-    const [usage] = await Promise.all([
+    const [usage, apiCredit] = await Promise.all([
       get('/usage?cedar_ember=1'),
+      readApiCredit(),
       claudeProfile ? null : get('/profile').then((p) => (claudeProfile = p)).catch(() => {}),
     ]);
-    return { ...shapeClaude(usage, claudeProfile), updatedAt: Date.now() };
+    // Usage can answer after the key changed under a credit that was already in.
+    const credit = session === consoleSession && apiCredit;
+    return { ...shapeClaude(usage, claudeProfile), ...(credit ? { apiCredit: credit } : {}), updatedAt: Date.now() };
   } catch (e) {
     // A 429 is a non-event: soft errors keep the last numbers on screen instead of blanking them.
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
@@ -345,4 +409,4 @@ const PROVIDERS = [
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
 ];
 
-module.exports = { PROVIDERS, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };
+module.exports = { PROVIDERS, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

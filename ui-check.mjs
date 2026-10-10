@@ -13,7 +13,7 @@ const chrome = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Applic
 const shots = path.join(os.tmpdir(), 'ai-usage-overlay-ui');
 const themes = process.env.UI_THEME ? THEMES.filter(([id]) => process.env.UI_THEME.split(',').includes(id)) : THEMES;
 const edges = ['left', 'right', 'top', 'bottom'];
-const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'warning', 'limited', 'limited-one', 'error', 'loading', 'long', 'refreshing'];
+const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
 // The native windows at Size = Large, each only on the edges main gives that shape.
@@ -69,6 +69,10 @@ for (const { width, height, edges: only } of viewports) {
     if (!process.env.UI_THEME && !['noir', 'paper'].includes(theme) && !shows.includes(state)) continue;
     await page.evaluate(({ data, edge, theme, css, state }) => {
       if (state === 'claude-banked') { data[0].bankedResets = 1; data[0].bankedResetExpiries = [Date.parse('2026-10-22T16:00:00Z')]; }
+      if (state === 'claude-credit') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z') };
+      if (state === 'claude-credit-stale') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), error: 'API credit not refreshed (HTTP 503), showing the last reading.' };
+      if (state === 'claude-credit-lapsed') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2026-09-27T00:00:00Z') };
+      if (state === 'claude-credit-expired') data[0].apiCredit = { error: 'Console session expired. Copy a new `sessionKey` and pick Paste Console session key in the tray.' };
       if (state === 'codex-zero') data[1].bankedResets = 0;
       if (state === 'codex-offline') delete data[1].bankedResets;
       if (state === 'codex-expiry-missing') delete data[1].bankedResetExpiries;
@@ -148,15 +152,21 @@ for (const { width, height, edges: only } of viewports) {
     if (!['error', 'loading', 'hidden'].includes(state) && result.chips[0] !== (state === 'warning' ? '96' : '37')) bad.push('chip number');
     if (!result.rects || !result.rects.island || !result.rects.lip) bad.push('rects not reported');
     if (panel) {
-      // One line per provider with banked resets; none at zero, every date, the month once per run.
+      // One line per provider with banked resets, plus Claude's API credit; none at zero, every date, the month once per run.
       const bank = {
         'codex-zero': [],
         'codex-offline': [],
         'codex-multiple': ['2 banked resets expire Oct 4 and 12'],
         'codex-expiry-missing': ['1 banked reset'],
         'claude-banked': ['1 banked reset expires Oct 22', '1 banked reset expires Oct 4'],
+        'claude-credit': ['$91.95 of $100 API credit left, expires Oct 27', '1 banked reset expires Oct 4'],
+        'claude-credit-stale': ['$91.95 of $100 API credit left, expires Oct 27', '1 banked reset expires Oct 4'],
       }[state] ?? ['1 banked reset expires Oct 4'];
       if (JSON.stringify(result.bank) !== JSON.stringify(bank)) bad.push('banked resets');
+      if ((state === 'claude-credit-stale') !== result.status.includes('API credit not refreshed (HTTP 503), showing the last reading.')) bad.push('stale credit line');
+      // A balance past its deadline isn't shown as funds, whatever data still carries it.
+      if ((state === 'claude-credit-lapsed') !== result.status.includes('API credit expired Sep 27, waiting for a fresh reading.')) bad.push('lapsed credit line');
+      if ((state === 'claude-credit-expired') !== result.status.includes('Console session expired. Copy a new sessionKey and pick Paste Console session key in the tray.')) bad.push('credit error line');
     }
     if (bad.length) throw new Error(`${theme}/${edge}/${state}/${width}x${height}: ${bad.join(', ')} ${JSON.stringify(result)}`);
     checked++;

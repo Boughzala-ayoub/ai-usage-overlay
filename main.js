@@ -1,9 +1,9 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog } = require('electron');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
-const { PROVIDERS, fmtReset, ringPercent, resetRows } = require('./providers');
+const { PROVIDERS, setConsoleKey, creditExpired, fmtReset, ringPercent, resetRows } = require('./providers');
 const THEME_GROUPS = require('./themes');
 
 // Sizes are CSS px at Size = Large. Size scales the pill; the panel never shrinks below Large, so its
@@ -70,6 +70,7 @@ let enabled = PROVIDERS.map((p) => p.id);
 let choices = {}; // provider id -> row label its summary chip reads
 let theme = 'noir';
 let scale = 1; // Size: the pill's zoom in the renderer, and the panel's once it is above 1
+let hasConsoleKey = false; // a Console session is saved, so the tray offers to forget it
 const panelScale = () => Math.max(1, scale);
 const last = new Map(); // id -> last good { plan, rows, updatedAt }
 const fetched = new Map(); // id -> ms of the last read attempt
@@ -137,6 +138,9 @@ function snapshot() {
       glyph: p.glyph,
       color: p.color,
       ...d,
+      // Past its deadline a balance isn't funds, whatever kept the reading: a gated or skipped read, a soft
+      // failure, the startup cache. Only the deadline goes out, and the panels say it expired.
+      ...(creditExpired(d.apiCredit, now) ? { apiCredit: { expired: true, expiresAt: d.apiCredit.expiresAt } } : {}),
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
       rows: (d.rows || []).map((r) => ({ ...r, resets: fmtReset(r.resetsAt, now) })),
@@ -439,6 +443,38 @@ function setChoice(id, row) {
   push();
 }
 
+// The Console's sessionKey cookie, for the Claude API credit line. It unlocks the whole Console account,
+// so it is checked before it can reach a request header, saved only encrypted to this Windows user, and
+// taken off the clipboard.
+function pasteConsoleKey() {
+  const key = clipboard.readText().trim();
+  if (!/^sk-ant-sid[\w-]+$/.test(key)) {
+    dialog.showErrorBox('No Console session key on the clipboard', 'In Chrome, open platform.claude.com, press F12, and under Application > Cookies copy the value of sessionKey. Then pick Paste Console session key again.');
+    return;
+  }
+  clipboard.clear();
+  useConsoleKey(key, safeStorage.encryptString(key).toString('base64'));
+}
+
+// An undefined consoleSession drops the key from state.json, since JSON.stringify leaves it out.
+function useConsoleKey(key, sealed) {
+  hasConsoleKey = !!key;
+  setConsoleKey(key);
+  dropCredit();
+  saveState({ consoleSession: sealed, cache });
+  tray.setContextMenu(menu());
+  push(); // now, whatever the gate, visibility or provider list: the old session's balance is gone
+  // A read in flight began under the old session, and providers drops its credit; read again after it.
+  Promise.resolve(inflight.get('claude')).then(() => tick(true));
+}
+
+// The credit belongs to one Console session. Usage rows stay; only the balance goes, shown and saved.
+function dropCredit() {
+  const without = ({ apiCredit, ...reading }) => reading;
+  if (last.get('claude')?.apiCredit) last.set('claude', without(last.get('claude')));
+  if (cache.claude?.apiCredit) cache.claude = without(cache.claude);
+}
+
 function menu() {
   const rebuild = () => tray.setContextMenu(menu());
   const numberMenus = on().filter((p) => NUMBER_CHOICES[p.id]).map((p) => ({
@@ -518,6 +554,8 @@ function menu() {
       label: 'Open usage page',
       submenu: PROVIDERS.map((p) => ({ label: p.name, click: () => shell.openExternal(USAGE_PAGES[p.id]) })),
     },
+    { label: 'Paste Console session key', click: pasteConsoleKey },
+    ...(hasConsoleKey ? [{ label: 'Forget Console session key', click: () => useConsoleKey('', undefined) }] : []),
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() },
   ]);
@@ -554,6 +592,13 @@ function loadState() {
   if (st.cache && typeof st.cache === 'object') cache = st.cache;
   for (const [id, v] of Object.entries(cache)) last.set(id, v);
   for (const [id, v] of Object.entries(st.gate || {})) if (v > Date.now()) gate.set(id, v);
+  try {
+    if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')));
+    hasConsoleKey = !!st.consoleSession;
+  } catch {
+    /* sealed for another Windows user or machine: the line stays off until the key is pasted again */
+  }
+  if (!hasConsoleKey) dropCredit(); // a saved balance with no session to stand behind it
 }
 
 function createWindow() {
