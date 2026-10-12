@@ -659,7 +659,7 @@ async function linkChecks() {
 }
 
 // A made-up `tailscale` that answers as told and records what it was asked. Its backend stops on down and runs
-// again on an up that works, as the real one's does.
+// again on an up that works, as the real one's does. A ping's answer can be a function, called as it's asked.
 const tailnetPhone = { OS: 'android', Online: true, UserID: 1, TailscaleIPs: ['100.1.1.1'] };
 function fakeTailscale({ peers = [tailnetPhone], failedUps = 0, ...o } = {}) {
   o = { backend: 'Running', tsmp: false, relay: true, ...o };
@@ -667,7 +667,10 @@ function fakeTailscale({ peers = [tailnetPhone], failedUps = 0, ...o } = {}) {
   const run = async (args) => {
     asked.push(args[0]);
     if (args[0] === 'status') return JSON.stringify({ BackendState: o.backend, Self: { UserID: 1 }, Peer: { ...peers } });
-    if (args[0] === 'ping') return (args[1] === '--tsmp' ? o.tsmp : o.relay) ? 'pong' : null;
+    if (args[0] === 'ping') {
+      const answer = args[1] === '--tsmp' ? o.tsmp : o.relay;
+      return (await (typeof answer === 'function' ? answer() : answer)) ? 'pong' : null;
+    }
     if (args[0] === 'up' && failedUps-- > 0) return null;
     if (args[0] === 'down' || args[0] === 'up') o.backend = args[0] === 'down' ? 'Stopped' : 'Running';
     return '';
@@ -709,6 +712,17 @@ async function healChecks() {
   lost.o.backend = 'Stopped'; // the user turns it off
   for (const dt of [135_000, 700_000]) await heal(lw, lost.run, t + dt);
   assert.strictEqual(lost.reconnects().length, 5, 'turned off by the user after that: left alone');
+  let relays = 0;
+  const off = tailscale({ relay: () => (++relays === 2 && (off.o.backend = 'Stopped'), true) });
+  assert.deepStrictEqual(await looks(off, 0, 90_000), ['frozen', 'frozen'], 'the second look saw it frozen');
+  assert.deepStrictEqual(off.reconnects(), [], 'turned off by the user while that look pinged: left off');
+  const back = tailscale();
+  const bw = { frozenAt: 0, fixedAt: 0 };
+  await heal(bw, back.run, t);
+  let statuses = 0;
+  const proofDuringRecheck = (args) => (args[0] === 'status' && ++statuses === 2 && (bw.frozenAt = 0), back.run(args));
+  await heal(bw, proofDuringRecheck, t + 90_000);
+  assert.deepStrictEqual(back.reconnects(), [], 'back on the hotspot while it read the status again: no reconnect');
   const blip = tailscale();
   const w = { frozenAt: 0, fixedAt: 0 };
   await heal(w, blip.run, t);
@@ -810,6 +824,17 @@ async function startChecks() {
       await join();
       await watch();
       assert.strictEqual(ts.o.backend, 'Running', 'its own down is undone on the hotspot too');
+    });
+    await watched({}, async () => {
+      clock += 90_000;
+      let release;
+      const asked = new Promise((r) => (ts.o.tsmp = () => (r(), new Promise((go) => (release = go)))));
+      const look = watch();
+      await asked;
+      await join(); // back on the hotspot while the look's ping is still out
+      release(false);
+      await look;
+      assert.deepStrictEqual(ts.reconnects(), [], 'back on the hotspot during a look: no reconnect');
     });
   } finally {
     Date.now = real.now;

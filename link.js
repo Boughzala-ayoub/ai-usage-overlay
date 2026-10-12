@@ -114,6 +114,14 @@ function connect(gw, name, port, key, freed) {
 const tailscale = (args) =>
   new Promise((resolve) => execFile('tailscale', args, { windowsHide: true, timeout: 15_000 }, (err, out) => resolve(err ? null : String(out))));
 
+async function statusOf(run) {
+  try {
+    return JSON.parse((await run(['status', '--json'])) ?? 'null');
+  } catch {
+    return null;
+  }
+}
+
 /**
  * One look at Tailscale's tunnel to the phone, once this PC has left the phone's hotspot. Coming back from it,
  * Tailscale here can keep a frozen session: the phone answers Tailscale's own ping through a relay, and nothing
@@ -124,10 +132,7 @@ const tailscale = (args) =>
  * saw: 'ok', 'frozen', or 'away' (no phone answers at all, which a reconnect here can't help).
  */
 async function heal(w, run = tailscale, now = Date.now()) {
-  let status = null;
-  try {
-    status = JSON.parse((await run(['status', '--json'])) ?? 'null');
-  } catch {}
+  const status = await statusOf(run);
   // Its own down that no up has undone yet: up on every look until one does. Stopped once that's done, it's the
   // user's doing, and left alone.
   if (w.down && (!status || status.BackendState === 'Stopped')) {
@@ -149,6 +154,10 @@ async function heal(w, run = tailscale, now = Date.now()) {
   if (state !== 'frozen') w.frozenAt = 0;
   else if (!w.frozenAt) w.frozenAt = now;
   else if (now - w.frozenAt >= 90_000 && now - w.fixedAt >= 600_000) {
+    // The pings took seconds. Tailscale turned off since, or the PC back on the hotspot (which clears frozenAt):
+    // left as it is.
+    const since = w.frozenAt;
+    if ((await statusOf(run))?.BackendState !== 'Running' || w.frozenAt !== since) return state;
     w.fixedAt = now;
     w.down = true;
     await run(['down']);
@@ -184,8 +193,9 @@ function start(name, port) {
       // Every missing one at once: a page that just used several wants them back before it asks again.
       const n = POOL - waiting;
       waiting += n;
+      // Each one proven means the PC is on the hotspot again: a look still out at the watcher loses its frozen time.
       const proved = await Promise.all(Array.from({ length: n }, () =>
-        connect(gw, name, port, key, () => (waiting--, proven--)).then((ok) => (ok && (proven++, (left = true)), ok))));
+        connect(gw, name, port, key, () => (waiting--, proven--)).then((ok) => (ok && (proven++, (left = true), (w.frozenAt = 0)), ok))));
       const failed = proved.filter((ok) => !ok).length;
       waiting -= failed;
       if (failed === n) {
