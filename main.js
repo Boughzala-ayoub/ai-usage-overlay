@@ -52,6 +52,7 @@ app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 let win = null;
 let tray = null;
 let timer = null;
+let stopLink = null;
 let cursorTimer = null;
 let snapTimer = null;
 let visible = true;
@@ -679,7 +680,7 @@ app.whenReady().then(() => {
   cursorTimer = setInterval(pollCursor, CURSOR_MS);
   if (!SHOT) {
     servePhone();
-    link.start('overlay', PHONE_PORT); // the bubble over the phone's hotspot, where Tailscale can't reach it
+    stopLink = link.start('overlay', PHONE_PORT); // the bubble over the phone's hotspot, where Tailscale can't reach it
   }
 });
 
@@ -726,10 +727,16 @@ ipcMain.on('drag-end', () => {
 });
 
 app.on('window-all-closed', () => app.quit());
-app.on('will-quit', () => {
+app.on('will-quit', (e) => {
   clearInterval(timer);
   clearInterval(cursorTimer);
   clearInterval(snapTimer);
   globalShortcut.unregisterAll();
   flushState(); // a setting or 429 gate from the last 400ms would otherwise die with the debounce
+  // A quit between the link's own `tailscale down` and its up waits for that up, or Tailscale stays off (link.js).
+  const last = stopLink?.();
+  if (last) {
+    e.preventDefault();
+    last.catch(() => {}).finally(() => app.exit(0));
+  }
 });

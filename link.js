@@ -15,6 +15,8 @@ const PORT = 7499;
 const POOL = 6; // waiting connections: a page opens a few at once
 // One secret for every app on this PC that speaks the link (Loom too), so the phone needs only one.
 const SECRET_FILE = path.join(process.env.LOCALAPPDATA || require('os').homedir(), 'phone-link', 'secret');
+// There while a `tailscale down` of heal()'s own hasn't been undone by an up.
+const DOWN_FILE = path.join(path.dirname(SECRET_FILE), 'tailscale-down');
 
 const hmac = (secret, message) => crypto.createHmac('sha256', secret).update(message).digest('hex');
 
@@ -128,14 +130,14 @@ async function statusOf(run) {
  * gets through the tunnel, for the bubble, Loom's phone app or Taildrop alike, until Tailscale reconnects on this
  * PC (seen 2026-10-12, after three switches of network in two minutes). Frozen for 90 s, it reconnects: down,
  * then up with no flags, which keeps its settings. Once per 10 minutes at most, and never while Tailscale is off
- * here, unless it was this that turned it off. `w` keeps { frozenAt, fixedAt, down } between looks. Returns what it
- * saw: 'ok', 'frozen', or 'away' (no phone answers at all, which a reconnect here can't help).
+ * here, unless it was this that turned it off. `w` keeps { frozenAt, fixedAt, down, downing } between looks.
+ * Returns what it saw: 'ok', 'frozen', or 'away' (no phone answers at all, which a reconnect here can't help).
  */
 async function heal(w, run = tailscale, now = Date.now()) {
   const status = await statusOf(run);
   // Its own down that no up has undone yet: up on every look until one does. Stopped once that's done, it's the
-  // user's doing, and left alone.
-  if (w.down && (!status || status.BackendState === 'Stopped')) {
+  // user's doing, and left alone. NoState is tailscaled still starting, as at boot: no sign of what the user wants.
+  if (w.down && (!status || status.BackendState === 'Stopped' || status.BackendState === 'NoState')) {
     if ((await run(['up'])) !== null) w.down = false;
     return 'away';
   }
@@ -160,7 +162,7 @@ async function heal(w, run = tailscale, now = Date.now()) {
     if ((await statusOf(run))?.BackendState !== 'Running' || w.frozenAt !== since) return state;
     w.fixedAt = now;
     w.down = true;
-    await run(['down']);
+    await (w.downing = run(['down']));
     await new Promise((r) => setTimeout(r, 3000));
     // Up whatever down answered, and again if the first doesn't take: left down, nothing reaches the tailnet.
     if ((await run(['up'])) !== null || (await run(['up'])) !== null) w.down = false;
@@ -174,7 +176,22 @@ function start(name, port) {
   let proven = 0; // of those, the ones the phone has taken: the PC is on its hotspot
   let left = false; // the PC has been on the hotspot, and Tailscale to the phone hasn't been seen working since
   let looking = false;
-  const w = { frozenAt: 0, fixedAt: 0, down: false };
+  // Its own down that no up has undone yet is kept on disk until one does. A quit or a crash in between would
+  // otherwise leave Tailscale off on the whole PC, with nothing here knowing to bring it back at the next start.
+  let down = fs.existsSync(DOWN_FILE);
+  const w = {
+    frozenAt: 0,
+    fixedAt: 0,
+    get down() {
+      return down;
+    },
+    set down(v) {
+      if (v === down) return;
+      if (v) fs.writeFileSync(DOWN_FILE, new Date().toISOString()); // throws before the down, which then never runs
+      else fs.rmSync(DOWN_FILE, { force: true });
+      down = v;
+    },
+  };
   let busy = false;
   let retryAt = 0;
   let key = null;
@@ -222,7 +239,18 @@ function start(name, port) {
       .catch(() => {})
       .finally(() => (looking = false));
   }, 15_000);
-  return () => (clearInterval(timer), clearInterval(watcher));
+  // Stopped with its own down not undone, as when the overlay quits between down and up: one more up, once the down
+  // has answered, so the two can't land the wrong way round. The promise is for the quit to wait on. Should that up
+  // fail as well, the file has the next start bring Tailscale back.
+  return () => {
+    clearInterval(timer);
+    clearInterval(watcher);
+    w.frozenAt = 0; // a look still out decides nothing more
+    if (!w.down) return null;
+    return Promise.resolve(w.downing)
+      .then(() => tailscale(['up']))
+      .then((out) => out !== null && (w.down = false));
+  };
 }
 
 module.exports = { PORT, SECRET_FILE, hmac, secret, gateways, gateway, connect, heal, start };

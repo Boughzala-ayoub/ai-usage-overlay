@@ -170,7 +170,10 @@ After the PC has been on the phone's hotspot, the overlay watches Tailscale's tu
 phone answers `tailscale ping` through a relay, but `tailscale ping --tsmp` gets nothing, and the
 bubble, Loom's phone app and Taildrop all stop. Frozen for 90 s, the overlay runs `tailscale down`
 and then `tailscale up` with no flags, which keeps Tailscale's settings. It does this once per 10
-minutes at most, never while the PC is still on the hotspot, and never while Tailscale is off.
+minutes at most, never while the PC is still on the hotspot, and never while Tailscale is off,
+unless the overlay turned it off itself. Until one of its ups works, it tries another every 15 s,
+and quitting waits for one. `%LOCALAPPDATA%\phone-link\tailscale-down` stays until then, so after a
+crash, a kill or a shutdown in between, the overlay's next start brings Tailscale back up.
 
 ```
 node phone/build.mjs                       # phone\out\ai-usage-bubble.apk

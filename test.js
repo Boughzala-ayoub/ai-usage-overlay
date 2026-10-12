@@ -659,7 +659,8 @@ async function linkChecks() {
 }
 
 // A made-up `tailscale` that answers as told and records what it was asked. Its backend stops on down and runs
-// again on an up that works, as the real one's does. A ping's answer can be a function, called as it's asked.
+// again on an up that works, as the real one's does. A ping's answer can be a function, called as it's asked, and
+// `o.downHeld` a promise its down waits on.
 const tailnetPhone = { OS: 'android', Online: true, UserID: 1, TailscaleIPs: ['100.1.1.1'] };
 function fakeTailscale({ peers = [tailnetPhone], failedUps = 0, ...o } = {}) {
   o = { backend: 'Running', tsmp: false, relay: true, ...o };
@@ -671,6 +672,7 @@ function fakeTailscale({ peers = [tailnetPhone], failedUps = 0, ...o } = {}) {
       const answer = args[1] === '--tsmp' ? o.tsmp : o.relay;
       return (await (typeof answer === 'function' ? answer() : answer)) ? 'pong' : null;
     }
+    if (args[0] === 'down') await o.downHeld;
     if (args[0] === 'up' && failedUps-- > 0) return null;
     if (args[0] === 'down' || args[0] === 'up') o.backend = args[0] === 'down' ? 'Stopped' : 'Running';
     return '';
@@ -716,6 +718,9 @@ async function healChecks() {
   const off = tailscale({ relay: () => (++relays === 2 && (off.o.backend = 'Stopped'), true) });
   assert.deepStrictEqual(await looks(off, 0, 90_000), ['frozen', 'frozen'], 'the second look saw it frozen');
   assert.deepStrictEqual(off.reconnects(), [], 'turned off by the user while that look pinged: left off');
+  const booting = tailscale({ backend: 'NoState' });
+  await heal({ frozenAt: 0, fixedAt: 0, down: true }, booting.run, t);
+  assert.deepStrictEqual(booting.reconnects(), ['up'], 'its own down, and tailscaled still starting: up all the same');
   const back = tailscale();
   const bw = { frozenAt: 0, fixedAt: 0 };
   await heal(bw, back.run, t);
@@ -744,8 +749,8 @@ async function healChecks() {
 }
 
 // --- link.js start(): the watcher as the overlay runs it, with a stand-in phone on loopback, a made-up `tailscale`
-// and a clock the check moves. The check fires the 15 s look itself. A fresh copy of link.js keeps its secret in a
-// folder of the check's own, so the real one is never read or written.
+// and a clock the check moves. The check fires the 15 s look itself. A fresh copy of link.js keeps its secret, and
+// anything else it keeps on disk, in a folder of the check's own, so the real ones are never read or written.
 async function startChecks() {
   const cp = require('child_process');
   const net = require('net');
@@ -764,10 +769,17 @@ async function startChecks() {
   };
   process.env.LOCALAPPDATA = dir;
   process.env.LINK_GATEWAY = '127.0.0.1';
-  cp.execFile = (cmd, args, opts, cb) => void ts.run(args).then((out) => cb(out === null ? new Error('exit 1') : null, out ?? ''));
-  delete require.cache[require.resolve('./link')];
-  const link = require('./link'); // takes the made-up execFile and the check's folder
-  cp.execFile = real.execFile;
+  // A copy of link.js as a new process would load it, taking the made-up execFile and the check's folder.
+  const fresh = () => {
+    cp.execFile = (cmd, args, opts, cb) => void ts.run(args).then((out) => cb(out === null ? new Error('exit 1') : null, out ?? ''));
+    delete require.cache[require.resolve('./link')];
+    try {
+      return require('./link');
+    } finally {
+      cp.execFile = real.execFile;
+    }
+  };
+  const link = fresh();
   const key = link.secret();
   net.connect = (opts, ...rest) => real.connect({ ...opts, port: opts.port === link.PORT ? to : opts.port }, ...rest);
   Date.now = () => clock;
@@ -836,6 +848,121 @@ async function startChecks() {
       await look;
       assert.deepStrictEqual(ts.reconnects(), [], 'back on the hotspot during a look: no reconnect');
     });
+
+    // The overlay as Electron runs it, each launch a new process: main.js with its own fresh link.js, and an Electron
+    // whose window, tray and screen take any call. main.js's own timers stand still; the link's run.
+    const anything = new Proxy(function () {}, {
+      get: (_, k) => (k === Symbol.toPrimitive ? () => 0 : k === 'then' ? undefined : anything),
+      apply: () => anything,
+      construct: () => anything,
+    });
+    const launch = async () => {
+      const own = fresh();
+      const on = {};
+      let exited;
+      const exit = new Promise((r) => (exited = r));
+      const app = { commandLine: anything, whenReady: () => Promise.resolve(), on: (e, fn) => (on[e] = fn), getPath: () => dir, quit() {}, exit: exited };
+      const electron = new Proxy({ app }, { get: (t, k) => t[k] ?? anything });
+      const start = (...args) => {
+        global.setInterval = (fn, ms) => real.setInterval(ms === 15_000 ? ((watch = fn), () => {}) : fn, ms);
+        try {
+          return own.start(...args);
+        } finally {
+          global.setInterval = still;
+        }
+      };
+      const still = (fn, ms) => real.setInterval(() => {}, ms);
+      global.setInterval = still;
+      watch = null;
+      try {
+        const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+        const deps = { electron, http: { createServer: () => anything }, './link': { ...own, start } };
+        new Function('require', 'module', '__dirname', src)((id) => deps[id] ?? require(id), { exports: {} }, __dirname);
+        await until(() => watch, 'the link started on ready');
+      } finally {
+        global.setInterval = real.setInterval;
+      }
+      // Electron's quit: true when main.js held it back.
+      const quit = () => {
+        let held = false;
+        on['will-quit']({ preventDefault: () => (held = true) });
+        return held;
+      };
+      return { quit, exit };
+    };
+    // On the hotspot, off it, frozen for 90 s, and the look that reconnects run as far as its down.
+    const toDown = async () => {
+      await joined();
+      leave();
+      await until(() => watch(), 'the first look off the hotspot');
+      clock += 90_000;
+      const look = watch();
+      await until(() => ts.reconnects().includes('down'), 'the down');
+      await new Promise((r) => setImmediate(r)); // and its answer, unless it's held
+      return { look }; // not the look itself, which an await would wait out
+    };
+
+    ts = fakeTailscale();
+    await hotspot();
+    let overlay = await launch();
+    let { look } = await toDown();
+    assert.strictEqual(ts.o.backend, 'Stopped', 'its down done, its up 3 s off');
+    assert.strictEqual(overlay.quit(), true, 'quitting then waits');
+    await overlay.exit;
+    assert.strictEqual(ts.o.backend, 'Running', 'for an up, before the overlay exits');
+    await look; // its own up, 3 s on, from a process that would be gone
+    leave();
+
+    let downs;
+    ts = fakeTailscale({ downHeld: new Promise((r) => (downs = r)) });
+    await hotspot();
+    overlay = await launch();
+    ({ look } = await toDown());
+    assert.strictEqual(overlay.quit(), true, 'quitting while its down is still out waits too');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepStrictEqual(ts.reconnects(), ['down'], 'with no up before the down has answered');
+    downs();
+    await overlay.exit;
+    assert.strictEqual(ts.o.backend, 'Running', 'and the up after it');
+    await look;
+    leave();
+
+    ts = fakeTailscale({ failedUps: 3 });
+    await hotspot();
+    overlay = await launch();
+    ({ look } = await toDown());
+    assert.strictEqual(overlay.quit(), true, 'its down done');
+    await overlay.exit; // the quit's up fails, and the quit still ends
+    await look; // as do the look's own two
+    assert.strictEqual(ts.o.backend, 'Stopped', 'every up failed: Tailscale is off');
+    leave();
+    overlay = await launch(); // the next start, after a quit or a crash between down and up alike
+    await until(() => watch(), 'its first look');
+    assert.strictEqual(ts.o.backend, 'Running', 'brings Tailscale back');
+    assert.strictEqual(overlay.quit(), false, 'and quits at once after that');
+
+    ts = fakeTailscale();
+    await hotspot();
+    overlay = await launch();
+    await joined();
+    leave();
+    await until(() => watch(), 'the first look off the hotspot');
+    clock += 90_000;
+    let release;
+    const asked = new Promise((r) => (ts.o.tsmp = () => (r(), new Promise((go) => (release = go)))));
+    look = watch();
+    await asked;
+    assert.strictEqual(overlay.quit(), false, 'quitting while a look pings, with no down of its own yet: at once');
+    release(false);
+    await look;
+    assert.deepStrictEqual(ts.reconnects(), [], 'and that look reconnects nothing after it');
+    leave();
+
+    ts = fakeTailscale({ backend: 'Stopped' });
+    overlay = await launch();
+    assert.strictEqual(watch(), undefined, 'Tailscale the user turned off, and no down of its own: no look');
+    assert.strictEqual(overlay.quit(), false, 'quit at once');
+    assert.deepStrictEqual(ts.reconnects(), [], 'and no up');
   } finally {
     Date.now = real.now;
     net.connect = real.connect;
