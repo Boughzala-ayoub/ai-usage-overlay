@@ -60,12 +60,14 @@ function connect(gw, name, port, key, freed) {
     let buf = '';
     const end = () => {
       if (stage === 'done') return;
+      clearTimeout(deadline);
       if (stage === 'waiting') freed();
       if (stage === 'connecting' || stage === 'proving') resolve(false);
       stage = 'done';
       s.destroy();
     };
-    s.setTimeout(3000); // to connect and prove itself; waiting, the phone pings every 10 s
+    // To connect and prove itself, however the gateway paces its bytes; waiting, the phone pings every 10 s.
+    const deadline = setTimeout(end, 3000);
     s.setNoDelay(true);
     s.on('timeout', end).on('error', end).on('close', () => stage !== 'piping' && end());
     s.on('connect', () => (stage = 'proving'));
@@ -82,6 +84,7 @@ function connect(gw, name, port, key, freed) {
         } else if (stage === 'proving') {
           if (line !== hmac(key, `phone|${name}|${theirs}|${mine}`)) return end();
           stage = 'waiting';
+          clearTimeout(deadline);
           s.setTimeout(30_000);
           resolve(true);
         } else if (stage === 'waiting' && line === 'P') {
@@ -102,6 +105,7 @@ function connect(gw, name, port, key, freed) {
           return;
         } else return end();
       }
+      if (buf.length > 300) end(); // no line of the link's is this long: a peer that never ends one is cut off
     };
     s.on('data', onData);
   });

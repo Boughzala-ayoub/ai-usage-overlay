@@ -396,6 +396,7 @@ configuredProvider.read()
     }
   })
   .then(mainChecks)
+  .then(linkChecks)
   .then(() => console.log('ok'))
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
 
@@ -598,5 +599,59 @@ async function mainChecks() {
     Date.now = realNow;
     on['will-quit']?.(); // flush before the folder goes, or a pending save recreates it
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- link.js: a gateway that answers the PC's link but never finishes a line of the handshake is cut off,
+// whether it floods or trickles, while a phone that proves itself waits on past that deadline. Stand-ins on
+// loopback ports of their own, since the link's 7499 may be taken.
+async function linkChecks() {
+  const net = require('net');
+  const link = require('./link');
+  const key = 'f'.repeat(64); // made up: the real shared secret never enters a check
+  const servers = [];
+  const listen = (onConnection) => new Promise((resolve) => {
+    const server = net.createServer((s) => onConnection(s.on('error', () => {})));
+    servers.push(server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+  });
+  const settle = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r('pending'), ms))]);
+  const gateway = async (bytes, everyMs) => {
+    let closed;
+    const port = await listen((s) => {
+      const timer = setInterval(() => s.write(bytes), everyMs);
+      closed = new Promise((r) => s.on('close', () => r(clearInterval(timer))));
+    });
+    return { port, closed: () => closed };
+  };
+  const flood = await gateway('x'.repeat(1024), 1);
+  const trickle = await gateway('x', 100);
+  let proven;
+  const phone = await listen((s) => {
+    proven = s;
+    const nonce = 'a'.repeat(32);
+    s.write(`LINK1 ${nonce}\n`);
+    s.once('data', (hello) => {
+      const [name, theirs] = String(hello).trim().split(' ');
+      s.write(`${link.hmac(key, `phone|${name}|${nonce}|${theirs}`)}\n`);
+    });
+  });
+  const realConnect = net.connect;
+  let to;
+  net.connect = (opts, ...rest) => realConnect({ ...opts, port: opts.port === link.PORT ? to : opts.port }, ...rest);
+  const connect = (port) => ((to = port), link.connect('127.0.0.1', 'overlay', 1, key, () => {}));
+  try {
+    const [flooded, trickled, proved] = [connect(flood.port), connect(trickle.port), connect(phone)];
+    assert.strictEqual(await settle(proved, 1000), true, 'a phone that proves itself is taken');
+    assert.strictEqual(await settle(flooded, 1000), false, 'a flood with no line is refused before it piles up');
+    assert.notStrictEqual(await settle(flood.closed(), 1000), 'pending', 'and its connection closed');
+    assert.strictEqual(await settle(trickled, 4500), false, 'a trickle that never proves itself is refused at the deadline');
+    assert.notStrictEqual(await settle(trickle.closed(), 1000), 'pending', 'and its connection closed');
+    const pong = new Promise((r) => proven.once('data', (d) => r(String(d))));
+    proven.write('P\n');
+    assert.strictEqual(await settle(pong, 1000), 'P\n', 'the proven connection still waits past that deadline');
+  } finally {
+    net.connect = realConnect;
+    proven?.destroy();
+    for (const server of servers) server.close();
   }
 }
