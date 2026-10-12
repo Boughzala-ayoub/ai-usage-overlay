@@ -72,6 +72,7 @@ public final class Link {
   final Set<String> tailnetDown = ConcurrentHashMap.newKeySet(); // apps whose Tailscale check failed while the PC was here
   final Map<String, Set<Socket>> overTailnet = new ConcurrentHashMap<>(); // app -> its page connections on Tailscale now
   final List<ServerSocket> servers = new CopyOnWriteArrayList<>();
+  final Set<Socket> accepted = ConcurrentHashMap.newKeySet(); // the pages' and the PC's connections, for stop()
   final SecureRandom random = new SecureRandom();
   volatile boolean stopped;
 
@@ -115,7 +116,8 @@ public final class Link {
   void stop() {
     stopped = true;
     for (ServerSocket s : servers) close(s);
-    for (LinkedBlockingDeque<Socket> q : idle.values()) for (Socket s; (s = q.poll()) != null;) close(s);
+    // The PC's waiting connections, and both ends of every pipe: a page's Tailscale end closes with the page's.
+    for (Socket s : accepted) close(s);
   }
 
   /** The PC proved itself on this hotspot within the last minute (pings come every 10 s). */
@@ -150,6 +152,9 @@ public final class Link {
         while (!stopped) {
           try {
             Socket s = ss.accept();
+            accepted.removeIf(Socket::isClosed); // ponytail: pruned as new ones come, so it holds the few still open
+            accepted.add(s);
+            if (stopped) close(s); // taken while stop() went by
             thread(() -> serve.serve(s));
           } catch (IOException e) {
             if (stopped || ss.isClosed()) return;

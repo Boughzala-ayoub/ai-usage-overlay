@@ -44,7 +44,10 @@ public class Main extends Activity {
     });
     Button stop = new Button(this);
     stop.setText("Remove bubble");
-    stop.setOnClickListener(v -> stopService(new Intent(this, Bubble.class)));
+    stop.setOnClickListener(v -> {
+      stopService(new Intent(this, Bubble.class));
+      showLink(null); // the link goes with the bubble
+    });
     col.addView(title);
     col.addView(hint);
     col.addView(server);
@@ -66,10 +69,14 @@ public class Main extends Activity {
     moveTaskToBack(true); // out of the way, so the bubble is what you see
   }
 
+  /** The bubble runs the link, so with no bubble there is none. */
+  void showLink(Link running) {
+    link.setText("Link: " + (running == null ? "off until the bubble shows." : running.status()));
+  }
+
   @Override protected void onResume() {
     super.onResume();
-    Bubble.link(this);
-    link.setText("Link: " + Link.running.status());
+    showLink(Link.running);
     if (asked && Settings.canDrawOverlays(this)) {
       asked = false;
       start();

@@ -42,12 +42,47 @@ public class LinkMain {
 // The checks that need no PC: Link.start and Link.end as the bubble calls them, with stand-ins for the PC.
 const checks = path.join(classes, 'LinkChecks.java');
 fs.writeFileSync(checks, `package com.local.aiusage;
+import java.io.IOException;
 import java.net.*;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 public class LinkChecks {
+  static final String SECRET = "ab".repeat(32);
   static void check(boolean ok, String what) {
     if (!ok) throw new AssertionError(what);
+  }
+  /** The PC on this hotspot, as link.js is: it proves itself on the link's PC port, then waits for a page. */
+  static Socket pc(int port) throws Exception {
+    Socket s = new Socket(InetAddress.getLoopbackAddress(), port);
+    s.setSoTimeout(5000);
+    String nonce = Link.line(s).substring("LINK1 ".length()), mine = "cd".repeat(16);
+    Link.write(s, "overlay " + mine + " " + Link.hmac(SECRET, "pc|overlay|" + nonce + "|" + mine));
+    check(Link.line(s).equals(Link.hmac(SECRET, "phone|overlay|" + nonce + "|" + mine)), "the link proves itself to the PC");
+    return s;
+  }
+  /** A page's connection piped over the hotspot, once a byte has crossed each way: the page's end and the PC's. */
+  static Socket[] piped(Link link, int page, int pcPort) throws Exception {
+    Socket pc = pc(pcPort);
+    for (int i = 0; i < 500 && link.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
+    Socket p = new Socket(InetAddress.getLoopbackAddress(), page);
+    p.setSoTimeout(5000);
+    check("GO".equals(Link.line(pc)), "a page's connection takes the PC's waiting one");
+    Link.write(pc, "OK");
+    p.getOutputStream().write('x');
+    check(pc.getInputStream().read() == 'x', "the page reaches the PC");
+    pc.getOutputStream().write('y');
+    check(p.getInputStream().read() == 'y', "the PC reaches the page");
+    return new Socket[] { p, pc };
+  }
+  /** The link let go of this connection: EOF or a reset, not a read that waits. */
+  static boolean ended(Socket s) {
+    try {
+      return s.getInputStream().read() == -1;
+    } catch (SocketTimeoutException e) {
+      return false;
+    } catch (IOException e) {
+      return true;
+    }
   }
   static int free() throws Exception {
     try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) { return s.getLocalPort(); }
@@ -60,7 +95,7 @@ public class LinkChecks {
   }
   public static void main(String[] a) throws Exception {
     if (System.getenv("LINK_LOG") != null) Link.log = System.err::println;
-    Map<String, String> m = new ConcurrentHashMap<>(Map.of("secret", "ab".repeat(32)));
+    Map<String, String> m = new ConcurrentHashMap<>(Map.of("secret", SECRET));
     Link.Store store = new Link.Store() {
       public String get(String k) { return m.get(k); }
       public void put(String k, String v) { m.put(k, v); }
@@ -70,13 +105,19 @@ public class LinkChecks {
     Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, first.getLocalPort()) }, pc);
     Link one = Link.running;
     first.accept().close(); // its secret's fetch: the address's own port, whatever it is
+    first.close(); // Tailscale refuses from here on, so pages go over the hotspot
     Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, first.getLocalPort()) }, pc);
     check(Link.running == one, "the same address keeps its link");
+    Socket[] old = piped(one, page, pc);
     Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, second.getLocalPort()) }, pc);
     check(Link.running != one && one.stopped, "a new port alone starts the link over");
+    check(ended(old[0]) && ended(old[1]), "the old link's live page and PC connections end with it");
     second.accept().close();
+    second.close();
+    Socket[] live = piped(Link.running, page, pc);
     Link.end();
     check(Link.running == null, "Link.end leaves no link");
+    check(ended(live[0]) && ended(live[1]), "Link.end ends the live page and PC connections too");
   }
 }`);
 execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main, checks], { stdio: 'inherit' });

@@ -453,6 +453,7 @@ public class Bubble extends Service {
   }
 
   @Override public void onDestroy() {
+    Link.end();
     if (gliding != null) gliding.cancel();
     if (root != null) {
       root.removeCallbacks(hide);
