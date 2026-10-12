@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The bubble's page reads the PC through the phone link on localhost (Link.java), in plain HTTP since it
+     never leaves the phone. Everything else stays HTTPS only. -->
+<network-security-config>
+  <domain-config cleartextTrafficPermitted="true">
+    <domain>localhost</domain>
+    <domain>127.0.0.1</domain>
+  </domain-config>
+</network-security-config>

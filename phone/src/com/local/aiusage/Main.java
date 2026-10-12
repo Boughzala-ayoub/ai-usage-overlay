@@ -16,6 +16,7 @@ import android.widget.TextView;
 public class Main extends Activity {
   SharedPreferences prefs;
   EditText server;
+  TextView link; // the phone link's state (Link.java)
   boolean asked; // sent to the overlay permission screen; start once it comes back granted
 
   @Override protected void onCreate(Bundle state) {
@@ -49,6 +50,9 @@ public class Main extends Activity {
     col.addView(server);
     col.addView(show);
     col.addView(stop);
+    link = new TextView(this);
+    link.setPadding(0, pad / 2, 0, 0);
+    col.addView(link);
     setContentView(col);
   }
 
@@ -64,6 +68,8 @@ public class Main extends Activity {
 
   @Override protected void onResume() {
     super.onResume();
+    Bubble.link(this);
+    link.setText("Link: " + Link.running.status());
     if (asked && Settings.canDrawOverlays(this)) {
       asked = false;
       start();

@@ -20,6 +20,7 @@
       "index.html",
       "providers.js",
       "themes.js",
+      "link.js",
       "fonts/**",
       "assets/**"
     ],

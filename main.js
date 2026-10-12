@@ -5,6 +5,7 @@ const http = require('http');
 const path = require('path');
 const { PROVIDERS, setConsoleKey, creditExpired, fmtReset, ringPercent, resetRows } = require('./providers');
 const THEME_GROUPS = require('./themes');
+const link = require('./link');
 
 // Sizes are CSS px at Size = Large. Size scales the pill; the panel never shrinks below Large, so its
 // small print stays readable (see panelScale). The renderer reports the real rects.
@@ -266,6 +267,11 @@ function servePhone() {
       res.write('data: ' + phonePayload() + '\n\n');
       phones.add(res);
       return req.on('close', () => phones.delete(res));
+    }
+    if (url === '/api/link') {
+      // The phone link's secret (link.js), for the phone over Tailscale only: the tailnet is what vouches for it.
+      if (!/\.ts\.net(:\d+)?$/.test(req.headers.host)) return res.writeHead(403).end();
+      return json(res, { secret: link.secret() });
     }
     if (url === '/api/options') {
       return json(res, { themes: THEME_GROUPS, providers: PROVIDERS.map(({ id, name, glyph, color }) => ({ id, name, glyph, color })), choices: NUMBER_CHOICES, pages: USAGE_PAGES });
@@ -668,7 +674,10 @@ app.whenReady().then(() => {
   globalShortcut.register(HOTKEY, toggle); // false when another copy already holds it; the menu still works
   timer = setInterval(tick, TICK_MS);
   cursorTimer = setInterval(pollCursor, CURSOR_MS);
-  if (!SHOT) servePhone();
+  if (!SHOT) {
+    servePhone();
+    link.start('overlay', PHONE_PORT); // the bubble over the phone's hotspot, where Tailscale can't reach it
+  }
 });
 
 ipcMain.on('rects', (_e, r) => {
