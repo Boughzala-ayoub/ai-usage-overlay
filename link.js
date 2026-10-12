@@ -120,14 +120,21 @@ const tailscale = (args) =>
  * gets through the tunnel, for the bubble, Loom's phone app or Taildrop alike, until Tailscale reconnects on this
  * PC (seen 2026-10-12, after three switches of network in two minutes). Frozen for 90 s, it reconnects: down,
  * then up with no flags, which keeps its settings. Once per 10 minutes at most, and never while Tailscale is off
- * here. `w` keeps { frozenAt, fixedAt } between looks. Returns what it saw: 'ok', 'frozen', or 'away' (no phone
- * answers at all, which a reconnect here can't help).
+ * here, unless it was this that turned it off. `w` keeps { frozenAt, fixedAt, down } between looks. Returns what it
+ * saw: 'ok', 'frozen', or 'away' (no phone answers at all, which a reconnect here can't help).
  */
 async function heal(w, run = tailscale, now = Date.now()) {
   let status = null;
   try {
     status = JSON.parse((await run(['status', '--json'])) ?? 'null');
   } catch {}
+  // Its own down that no up has undone yet: up on every look until one does. Stopped once that's done, it's the
+  // user's doing, and left alone.
+  if (w.down && (!status || status.BackendState === 'Stopped')) {
+    if ((await run(['up'])) !== null) w.down = false;
+    return 'away';
+  }
+  w.down = false;
   const seen = [];
   if (status?.BackendState === 'Running') {
     // ponytail: every Android device of this PC's owner that's online counts as the phone; name it if that's ever wrong
@@ -143,10 +150,11 @@ async function heal(w, run = tailscale, now = Date.now()) {
   else if (!w.frozenAt) w.frozenAt = now;
   else if (now - w.frozenAt >= 90_000 && now - w.fixedAt >= 600_000) {
     w.fixedAt = now;
+    w.down = true;
     await run(['down']);
     await new Promise((r) => setTimeout(r, 3000));
     // Up whatever down answered, and again if the first doesn't take: left down, nothing reaches the tailnet.
-    if ((await run(['up'])) === null) await run(['up']);
+    if ((await run(['up'])) !== null || (await run(['up'])) !== null) w.down = false;
   }
   return state;
 }
@@ -157,7 +165,7 @@ function start(name, port) {
   let proven = 0; // of those, the ones the phone has taken: the PC is on its hotspot
   let left = false; // the PC has been on the hotspot, and Tailscale to the phone hasn't been seen working since
   let looking = false;
-  const w = { frozenAt: 0, fixedAt: 0 };
+  const w = { frozenAt: 0, fixedAt: 0, down: false };
   let busy = false;
   let retryAt = 0;
   let key = null;
@@ -193,12 +201,13 @@ function start(name, port) {
   const timer = setInterval(() => tick().catch(() => {}), 100);
   // Off the hotspot, Tailscale to the phone is watched until it's seen working. Not on it: the link carries the
   // pages there, and a reconnect would only bring the hotspot's own Tailscale bug back within minutes.
+  // A down of its own that no up has undone is looked at on the hotspot too: those looks only bring Tailscale back.
   // ponytail: a phone that stays away keeps this asking `tailscale status` every 15 s until it's back
   const watcher = setInterval(() => {
     if (proven > 0) w.frozenAt = 0;
-    if (!left || proven > 0 || looking) return;
+    if (looking || (!w.down && (!left || proven > 0))) return;
     looking = true;
-    heal(w)
+    return heal(w) // for a check to wait on
       .then((state) => state === 'ok' && (left = false))
       .catch(() => {})
       .finally(() => (looking = false));

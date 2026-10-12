@@ -398,6 +398,7 @@ configuredProvider.read()
   .then(mainChecks)
   .then(linkChecks)
   .then(healChecks)
+  .then(startChecks)
   .then(() => console.log('ok'))
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
 
@@ -657,23 +658,29 @@ async function linkChecks() {
   }
 }
 
+// A made-up `tailscale` that answers as told and records what it was asked. Its backend stops on down and runs
+// again on an up that works, as the real one's does.
+const tailnetPhone = { OS: 'android', Online: true, UserID: 1, TailscaleIPs: ['100.1.1.1'] };
+function fakeTailscale({ peers = [tailnetPhone], failedUps = 0, ...o } = {}) {
+  o = { backend: 'Running', tsmp: false, relay: true, ...o };
+  const asked = [];
+  const run = async (args) => {
+    asked.push(args[0]);
+    if (args[0] === 'status') return JSON.stringify({ BackendState: o.backend, Self: { UserID: 1 }, Peer: { ...peers } });
+    if (args[0] === 'ping') return (args[1] === '--tsmp' ? o.tsmp : o.relay) ? 'pong' : null;
+    if (args[0] === 'up' && failedUps-- > 0) return null;
+    if (args[0] === 'down' || args[0] === 'up') o.backend = args[0] === 'down' ? 'Stopped' : 'Running';
+    return '';
+  };
+  return { o, run, reconnects: () => asked.filter((a) => a === 'down' || a === 'up') };
+}
+
 // --- link.js heal(): Tailscale reconnects on this PC only for a tunnel frozen 90 s while the phone still answers
 // through the relay, once per 10 minutes at most, and never while it works, the phone is away or Tailscale is off.
-// A made-up `tailscale` that answers as told and records what it was asked.
 async function healChecks() {
   const { heal } = require('./link');
-  const phone = { OS: 'android', Online: true, UserID: 1, TailscaleIPs: ['100.1.1.1'] };
-  const tailscale = ({ backend = 'Running', tsmp = false, relay = true, peers = [phone], failedUps = 0 } = {}) => {
-    const asked = [];
-    const run = async (args) => {
-      asked.push(args[0]);
-      if (args[0] === 'status') return JSON.stringify({ BackendState: backend, Self: { UserID: 1 }, Peer: { ...peers } });
-      if (args[0] === 'ping') return (args[1] === '--tsmp' ? tsmp : relay) ? 'pong' : null;
-      if (args[0] === 'up' && failedUps-- > 0) return null;
-      return '';
-    };
-    return { run, reconnects: () => asked.filter((a) => a === 'down' || a === 'up') };
-  };
+  const phone = tailnetPhone;
+  const tailscale = fakeTailscale;
   const t = 1_000_000_000;
   const looks = async (ts, ...at) => {
     const w = { frozenAt: 0, fixedAt: 0 };
@@ -694,6 +701,14 @@ async function healChecks() {
   const stubborn = tailscale({ failedUps: 1 });
   await looks(stubborn, 0, 90_000);
   assert.deepStrictEqual(stubborn.reconnects(), ['down', 'up', 'up'], 'an up that fails is tried again');
+  const lost = tailscale({ failedUps: 3 });
+  const lw = { frozenAt: 0, fixedAt: 0 };
+  for (const dt of [0, 90_000, 105_000, 120_000]) await heal(lw, lost.run, t + dt);
+  assert.deepStrictEqual(lost.reconnects(), ['down', 'up', 'up', 'up', 'up'], 'its own down, both ups failed: up on every look until one works');
+  assert.strictEqual(lost.o.backend, 'Running', 'and Tailscale runs again');
+  lost.o.backend = 'Stopped'; // the user turns it off
+  for (const dt of [135_000, 700_000]) await heal(lw, lost.run, t + dt);
+  assert.strictEqual(lost.reconnects().length, 5, 'turned off by the user after that: left alone');
   const blip = tailscale();
   const w = { frozenAt: 0, fixedAt: 0 };
   await heal(w, blip.run, t);
@@ -711,5 +726,97 @@ async function healChecks() {
   ]) {
     assert.deepStrictEqual(await looks(ts, 0, 90_000, 700_000), [state, state, state], `${what}: seen as ${state}`);
     assert.deepStrictEqual(ts.reconnects(), [], `${what}: no reconnect`);
+  }
+}
+
+// --- link.js start(): the watcher as the overlay runs it, with a stand-in phone on loopback, a made-up `tailscale`
+// and a clock the check moves. The check fires the 15 s look itself. A fresh copy of link.js keeps its secret in a
+// folder of the check's own, so the real one is never read or written.
+async function startChecks() {
+  const cp = require('child_process');
+  const net = require('net');
+  const real = { setInterval, now: Date.now, execFile: cp.execFile, connect: net.connect, local: process.env.LOCALAPPDATA, gw: process.env.LINK_GATEWAY };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-link-'));
+  let ts, watch, to, server;
+  let clock = Date.now();
+  let sockets = [];
+  let pongs = 0;
+  const until = async (fn, what) => {
+    for (const end = real.now() + 5000; ; await new Promise((r) => setTimeout(r, 10))) {
+      const v = fn();
+      if (v) return v;
+      if (real.now() > end) throw new Error(`timed out waiting for ${what}`);
+    }
+  };
+  process.env.LOCALAPPDATA = dir;
+  process.env.LINK_GATEWAY = '127.0.0.1';
+  cp.execFile = (cmd, args, opts, cb) => void ts.run(args).then((out) => cb(out === null ? new Error('exit 1') : null, out ?? ''));
+  delete require.cache[require.resolve('./link')];
+  const link = require('./link'); // takes the made-up execFile and the check's folder
+  cp.execFile = real.execFile;
+  const key = link.secret();
+  net.connect = (opts, ...rest) => real.connect({ ...opts, port: opts.port === link.PORT ? to : opts.port }, ...rest);
+  Date.now = () => clock;
+  // The phone's hotspot. The PC on it: six connections proven, each one's P answered, so the PC has counted it.
+  const hotspot = async () => {
+    server = net.createServer((s) => {
+      sockets.push(s.on('error', () => {}));
+      const nonce = 'b'.repeat(32);
+      s.write(`LINK1 ${nonce}\n`);
+      s.once('data', (hello) => {
+        const [name, theirs] = String(hello).trim().split(' ');
+        s.write(`${link.hmac(key, `phone|${name}|${nonce}|${theirs}`)}\nP\n`);
+        s.once('data', () => pongs++);
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    [to, pongs] = [server.address().port, 0];
+  };
+  // A round that failed while the clock stood still waits 5 s on it: the clock moves on while the phone comes back.
+  const joined = () => until(() => ((clock += 1000), pongs === 6), 'six proven connections');
+  const join = () => hotspot().then(joined);
+  // Off it: nothing listens any more, and what waited is gone.
+  const leave = () => {
+    server?.close();
+    sockets.forEach((s) => s.destroy());
+    sockets = [];
+  };
+  const watched = async (fake, steps) => {
+    ts = fakeTailscale(fake);
+    await hotspot();
+    global.setInterval = (fn, ms) => real.setInterval(ms === 15_000 ? ((watch = fn), () => {}) : fn, ms);
+    let stop;
+    try {
+      stop = link.start('overlay', 1);
+    } finally {
+      global.setInterval = real.setInterval;
+    }
+    try {
+      await joined();
+      leave();
+      await until(() => watch(), 'the first look off the hotspot'); // frozen from here
+      await steps();
+    } finally {
+      stop();
+      leave();
+    }
+  };
+  const restore = (name, value) => (value === undefined ? delete process.env[name] : (process.env[name] = value));
+  try {
+    await watched({ failedUps: 2 }, async () => {
+      clock += 90_000;
+      await watch(); // down, and both ups fail
+      assert.strictEqual(ts.o.backend, 'Stopped', 'both ups failed');
+      await join();
+      await watch();
+      assert.strictEqual(ts.o.backend, 'Running', 'its own down is undone on the hotspot too');
+    });
+  } finally {
+    Date.now = real.now;
+    net.connect = real.connect;
+    restore('LOCALAPPDATA', real.local);
+    restore('LINK_GATEWAY', real.gw);
+    delete require.cache[require.resolve('./link')];
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
