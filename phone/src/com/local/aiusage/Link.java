@@ -113,7 +113,7 @@ public final class Link {
     thread(this::fetchSecret);
   }
 
-  void stop() {
+  synchronized void stop() {
     stopped = true;
     for (ServerSocket s : servers) close(s);
     // The PC's waiting connections, and both ends of every pipe: a page's Tailscale end closes with the page's.
@@ -353,7 +353,10 @@ public final class Link {
       for (App a : apps) {
         if (got == null && a.tailnet != 0 && !host.isEmpty()) got = secretFrom("https://" + host + (a.tailnet == 443 ? "" : ":" + a.tailnet) + "/api/link");
       }
-      if (got != null) store.put("secret", got);
+      // Under stop()'s lock: a link stopped while its PC answered never writes over its replacement's secret.
+      synchronized (this) {
+        if (got != null && !stopped) store.put("secret", got);
+      }
       sleep(got != null ? 600_000 : 30_000);
     }
   }

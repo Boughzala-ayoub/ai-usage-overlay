@@ -42,10 +42,10 @@ public class LinkMain {
 // The checks that need no PC: Link.start and Link.end as the bubble calls them, with stand-ins for the PC.
 const checks = path.join(classes, 'LinkChecks.java');
 fs.writeFileSync(checks, `package com.local.aiusage;
-import java.io.IOException;
+import java.io.*;
 import java.net.*;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 public class LinkChecks {
   static final String SECRET = "ab".repeat(32);
   static void check(boolean ok, String what) {
@@ -87,6 +87,43 @@ public class LinkChecks {
   static int free() throws Exception {
     try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) { return s.getLocalPort(); }
   }
+  // Each PC's GET /api/link as the link's HttpURLConnection sees it: x.test's secret is "x" 64 times. a.test, a
+  // slow PC, holds its answer until let go.
+  static CountDownLatch asked, let, answered, bKept, writing, hold; // hold: a.test's secret waits in Store.put
+  static Thread asking;
+  static void answers() {
+    URL.setURLStreamHandlerFactory(protocol -> !protocol.equals("https") ? null : new URLStreamHandler() {
+      protected URLConnection openConnection(URL u) {
+        return new HttpURLConnection(u) {
+          public void connect() {}
+          public void disconnect() {}
+          public boolean usingProxy() { return false; }
+          public int getResponseCode() { return 200; }
+          public InputStream getInputStream() throws IOException {
+            if (u.getHost().equals("a.test")) {
+              asking = Thread.currentThread();
+              asked.countDown();
+              try {
+                let.await();
+              } catch (InterruptedException e) {
+                throw new IOException(e);
+              }
+              answered.countDown();
+            }
+            return new ByteArrayInputStream(("{\\"secret\\":\\"" + u.getHost().substring(0, 1).repeat(64) + "\\"}").getBytes());
+          }
+        };
+      }
+    });
+  }
+  /** Lets a.test answer, then waits until the stopped link that asked is done with that answer. */
+  static void lateAnswer() throws Exception {
+    let.countDown();
+    check(answered.await(5, TimeUnit.SECONDS), "a.test answers");
+    asking.interrupt(); // out of its sleep, a stopped link's fetch loop ends
+    asking.join(5000);
+    check(!asking.isAlive(), "the stopped link's fetch ends");
+  }
   /** A stand-in for tailscale serve on a port of its own: accept() returns once the link dials it. */
   static ServerSocket serve() throws Exception {
     ServerSocket s = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
@@ -118,6 +155,61 @@ public class LinkChecks {
     Link.end();
     check(Link.running == null, "Link.end leaves no link");
     check(ended(live[0]) && ended(live[1]), "Link.end ends the live page and PC connections too");
+
+    // A link stopped while its PC was still answering never keeps that answer.
+    answers();
+    Map<String, String> keys = new ConcurrentHashMap<>();
+    Link.Store kept = new Link.Store() {
+      public String get(String k) { return keys.get(k); }
+      public void put(String k, String v) {
+        if (hold != null && v.startsWith("a")) {
+          writing.countDown();
+          try {
+            hold.await();
+          } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+          }
+        }
+        keys.put(k, v);
+        if (v.startsWith("b")) bKept.countDown();
+      }
+    };
+    Link.App[] apps = { new Link.App("overlay", page, 8443) };
+    String b = "b".repeat(64);
+    asked = new CountDownLatch(1);
+    let = new CountDownLatch(1);
+    answered = new CountDownLatch(1);
+    bKept = new CountDownLatch(1);
+    Link.start("a.test", kept, apps, pc);
+    check(asked.await(5, TimeUnit.SECONDS), "a.test is asked for its secret");
+    Link.start("b.test", kept, apps, pc);
+    check(bKept.await(5, TimeUnit.SECONDS), "the replacement keeps b.test's secret");
+    lateAnswer();
+    check(b.equals(keys.get("secret")), "a replaced link's late answer leaves its replacement's secret");
+    asked = new CountDownLatch(1);
+    let = new CountDownLatch(1);
+    answered = new CountDownLatch(1);
+    Link.start("a.test", kept, apps, pc);
+    check(asked.await(5, TimeUnit.SECONDS), "a.test is asked again");
+    Link.end();
+    lateAnswer();
+    check(b.equals(keys.get("secret")), "a removed link's late answer leaves the secret it found");
+    // A write already under way when the link is replaced: the replacement waits, so its own secret lands last.
+    let = new CountDownLatch(0);
+    bKept = new CountDownLatch(1);
+    writing = new CountDownLatch(1);
+    hold = new CountDownLatch(1);
+    Link.start("a.test", kept, apps, pc);
+    check(writing.await(5, TimeUnit.SECONDS), "a.test's secret is being written");
+    Thread replace = new Thread(() -> Link.start("b.test", kept, apps, pc));
+    replace.start();
+    while (replace.isAlive() && replace.getState() != Thread.State.BLOCKED) Thread.onSpinWait();
+    check(replace.getState() == Thread.State.BLOCKED, "the replacement waits for that write");
+    hold.countDown();
+    check(bKept.await(5, TimeUnit.SECONDS), "then keeps b.test's secret");
+    replace.join(5000);
+    check(b.equals(keys.get("secret")), "and that secret stays");
+    Link.end();
   }
 }`);
 execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main, checks], { stdio: 'inherit' });
