@@ -210,6 +210,22 @@ public class LinkChecks {
     replace.join(5000);
     check(b.equals(keys.get("secret")), "and that secret stays");
     Link.end();
+
+    // The PC left the hotspot while Tailscale was down there: its waiting connection never answers GO. The
+    // page's connection tries Tailscale next (the stand-in is dialled) instead of ending with nothing.
+    ServerSocket back = serve();
+    Link left = new Link("localhost", store, new Link.App[] { new Link.App("overlay", free(), back.getLocalPort()) }, free(), 0);
+    left.open();
+    Socket gone = pc(left.pcPort);
+    for (int i = 0; i < 500 && left.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
+    left.tailnetDown.add("overlay");
+    Socket p = new Socket(InetAddress.getLoopbackAddress(), left.apps[0].port());
+    check("GO".equals(Link.line(gone)), "the hotspot first, while Tailscale is down there");
+    long t0 = System.currentTimeMillis();
+    back.accept().close(); // throws past 5 s: the link gave up on the hotspot and never tried Tailscale
+    check(System.currentTimeMillis() - t0 < 3500, "Tailscale within the GO's 2 s");
+    p.close();
+    left.stop();
   }
 }`);
 execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main, checks], { stdio: 'inherit' });

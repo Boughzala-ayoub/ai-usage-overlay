@@ -111,9 +111,53 @@ function connect(gw, name, port, key, freed) {
   });
 }
 
+const tailscale = (args) =>
+  new Promise((resolve) => execFile('tailscale', args, { windowsHide: true, timeout: 15_000 }, (err, out) => resolve(err ? null : String(out))));
+
+/**
+ * One look at Tailscale's tunnel to the phone, once this PC has left the phone's hotspot. Coming back from it,
+ * Tailscale here can keep a frozen session: the phone answers Tailscale's own ping through a relay, and nothing
+ * gets through the tunnel, for the bubble, Loom's phone app or Taildrop alike, until Tailscale reconnects on this
+ * PC (seen 2026-10-12, after three switches of network in two minutes). Frozen for 90 s, it reconnects: down,
+ * then up with no flags, which keeps its settings. Once per 10 minutes at most, and never while Tailscale is off
+ * here. `w` keeps { frozenAt, fixedAt } between looks. Returns what it saw: 'ok', 'frozen', or 'away' (no phone
+ * answers at all, which a reconnect here can't help).
+ */
+async function heal(w, run = tailscale, now = Date.now()) {
+  let status = null;
+  try {
+    status = JSON.parse((await run(['status', '--json'])) ?? 'null');
+  } catch {}
+  const seen = [];
+  if (status?.BackendState === 'Running') {
+    // ponytail: every Android device of this PC's owner that's online counts as the phone; name it if that's ever wrong
+    for (const p of Object.values(status.Peer || {})) {
+      if (p.OS !== 'android' || !p.Online || p.UserID !== status.Self?.UserID || !p.TailscaleIPs?.[0]) continue;
+      const ip = p.TailscaleIPs[0];
+      if ((await run(['ping', '--tsmp', '--c', '1', '--timeout', '4s', ip])) !== null) seen.push('ok');
+      else if ((await run(['ping', '--until-direct=false', '--c', '1', '--timeout', '4s', ip])) !== null) seen.push('frozen');
+    }
+  }
+  const state = seen.includes('frozen') ? 'frozen' : seen.includes('ok') ? 'ok' : 'away';
+  if (state !== 'frozen') w.frozenAt = 0;
+  else if (!w.frozenAt) w.frozenAt = now;
+  else if (now - w.frozenAt >= 90_000 && now - w.fixedAt >= 600_000) {
+    w.fixedAt = now;
+    await run(['down']);
+    await new Promise((r) => setTimeout(r, 3000));
+    // Up whatever down answered, and again if the first doesn't take: left down, nothing reaches the tailnet.
+    if ((await run(['up'])) === null) await run(['up']);
+  }
+  return state;
+}
+
 /** Keeps POOL connections waiting at the phone whenever this PC's gateway is the phone's link. */
 function start(name, port) {
   let waiting = 0;
+  let proven = 0; // of those, the ones the phone has taken: the PC is on its hotspot
+  let left = false; // the PC has been on the hotspot, and Tailscale to the phone hasn't been seen working since
+  let looking = false;
+  const w = { frozenAt: 0, fixedAt: 0 };
   let busy = false;
   let retryAt = 0;
   let key = null;
@@ -132,7 +176,8 @@ function start(name, port) {
       // Every missing one at once: a page that just used several wants them back before it asks again.
       const n = POOL - waiting;
       waiting += n;
-      const proved = await Promise.all(Array.from({ length: n }, () => connect(gw, name, port, key, () => waiting--)));
+      const proved = await Promise.all(Array.from({ length: n }, () =>
+        connect(gw, name, port, key, () => (waiting--, proven--)).then((ok) => (ok && (proven++, (left = true)), ok))));
       const failed = proved.filter((ok) => !ok).length;
       waiting -= failed;
       if (failed === n) {
@@ -146,7 +191,19 @@ function start(name, port) {
     }
   };
   const timer = setInterval(() => tick().catch(() => {}), 100);
-  return () => clearInterval(timer);
+  // Off the hotspot, Tailscale to the phone is watched until it's seen working. Not on it: the link carries the
+  // pages there, and a reconnect would only bring the hotspot's own Tailscale bug back within minutes.
+  // ponytail: a phone that stays away keeps this asking `tailscale status` every 15 s until it's back
+  const watcher = setInterval(() => {
+    if (proven > 0) w.frozenAt = 0;
+    if (!left || proven > 0 || looking) return;
+    looking = true;
+    heal(w)
+      .then((state) => state === 'ok' && (left = false))
+      .catch(() => {})
+      .finally(() => (looking = false));
+  }, 15_000);
+  return () => (clearInterval(timer), clearInterval(watcher));
 }
 
-module.exports = { PORT, SECRET_FILE, hmac, secret, gateways, gateway, connect, start };
+module.exports = { PORT, SECRET_FILE, hmac, secret, gateways, gateway, connect, heal, start };

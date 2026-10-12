@@ -305,6 +305,9 @@ function servePhone() {
       }))
     .on('error', () => {}) // the port is taken (a second copy): that copy just has no phone
     .listen(PHONE_PORT, '127.0.0.1');
+  // A switch of network (the PC asleep, off the phone's hotspot, Tailscale stuck) leaves a stream open on the
+  // phone with nothing coming: its pings are how the page tells that from a quiet PC.
+  setInterval(() => phones.forEach((res) => res.write('event: ping\ndata: 1\n\n')), 20_000).unref();
 }
 
 // ---- geometry

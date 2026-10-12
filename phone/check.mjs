@@ -43,6 +43,8 @@ let holdUsage = false; // the next /api/usage answer waits for release(), as a s
 let holdSettings = false; // the same for the next /api/settings answer
 let release = null;
 let holdStreams = false; // a cut stream's reconnections wait, so a reconnect's fresh state can't hide a rollback
+let dropUsage = false; // the next /api/usage connection ends unanswered, as the link ends it switching ways
+let opened = 0; // streams the page has opened
 const waiting = [];
 const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go'], choices: {} };
 const posts = [];
@@ -53,6 +55,7 @@ let revs = 0;
 const payload = () => JSON.stringify({ css: pc.theme === 'noir' ? '' : css(pc.theme), ...pc, providers: providers(answer === 'hot').filter((p) => pc.enabled.includes(p.id)), run, rev: ++revs });
 const tell = () => streams.forEach((res) => res.write('data: ' + payload() + '\n\n'));
 const openStream = (req, res) => {
+  opened++;
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   res.write('retry: 300\n'); // once let through, reconnect fast: the check shouldn't sit out Chrome's 3 s default
   res.write('data: ' + payload() + '\n\n');
@@ -94,6 +97,7 @@ const server = http.createServer(async (req, res) => {
     release = () => res.end(state);
     return;
   }
+  if (dropUsage) return void ((dropUsage = false), res.destroy());
   res.setHeader('content-type', 'application/json');
   const body = payload(); // the PC's state as the request arrives, however late the answer lands
   if (!holdUsage) return res.end(body);
@@ -711,6 +715,27 @@ try {
   pc.theme = 'molten';
   await page.reload({ waitUntil: 'load' });
   await until(() => data.theme === 'molten' && Number.isFinite(data.rev), 'unnumbered: a numbered snapshot replaces a saved unnumbered one');
+
+  // ---- switching networks. A read the link ends as it changes ways: one more read, and the PC is still there.
+  dropUsage = true;
+  server.closeIdleConnections(); // on a reused keep-alive connection Chrome would retry by itself, hiding the page's own
+  await page.evaluate(() => load());
+  if (dropUsage || !(await page.evaluate(() => reached))) fail(`switch: one ended read ${dropUsage ? 'never happened' : 'says the PC is out of reach'}`);
+  // A ping keeps the stream; 45 s with nothing at all (a connection that died without a word) and the page opens
+  // another. The page's clock jumps instead of the check waiting it out.
+  await until(() => es.readyState === EventSource.OPEN, 'silent: the stream is open');
+  const pinged = await page.evaluate(() => (window.before = heard));
+  await new Promise((r) => setTimeout(r, 20));
+  streams.forEach((res) => res.write('event: ping\ndata: 1\n\n'));
+  await until(() => heard > window.before, 'silent: a ping counts as hearing from the PC');
+  const streamsBefore = opened;
+  await page.evaluate((t) => {
+    window.realNow ??= Date.now;
+    Date.now = () => t;
+  }, pinged + 46_000);
+  for (let i = 0; i < 70 && opened === streamsBefore; i++) await new Promise((r) => setTimeout(r, 100));
+  await page.evaluate(() => (Date.now = window.realNow));
+  if (opened === streamsBefore) fail('silent: a stream quiet for 45 s was kept, never replaced');
 
   // ---- out of reach, the page draws the reading it saved. A saved balance past its deadline isn't funds:
   // from that moment the line says it expired, with no answer from the PC. Up to it, the balance shows.

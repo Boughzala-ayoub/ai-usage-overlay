@@ -155,7 +155,7 @@ tailscale serve --bg --https=8443 http://127.0.0.1:7430
 | Route | What it does |
 |---|---|
 | `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. `POST` is the panel's Refresh. |
-| `GET /api/events` | The same, as a stream: once on connecting, then on every change. Countdowns move once a minute, so a phone hears at most that often when nothing else changes. |
+| `GET /api/events` | The same, as a stream: once on connecting, then on every change. Countdowns move once a minute, so a phone hears at most that often when nothing else changes. A `ping` event every 20 s lets the page replace a stream that died without closing. |
 | `GET /api/options` | The tray menu's choices: themes, providers, summary limits, usage pages. |
 | `POST /api/settings` | `{ theme, enabled, choices }`, any of them, applied as the tray menu applies them. JSON only. |
 
@@ -164,6 +164,13 @@ its own domain at 127.0.0.1 from reading anything. Settings take `application/js
 form or a no-cors fetch from another page can't send without a CORS preflight that this server never
 answers. There is no pairing token, unlike Loom's phone remote: anyone on your tailnet can read the
 percentages and change the theme, and nothing more.
+
+After the PC has been on the phone's hotspot, the overlay watches Tailscale's tunnel to the phone
+(`heal` in `link.js`). Tailscale on the PC can come back from the hotspot with a frozen session: the
+phone answers `tailscale ping` through a relay, but `tailscale ping --tsmp` gets nothing, and the
+bubble, Loom's phone app and Taildrop all stop. Frozen for 90 s, the overlay runs `tailscale down`
+and then `tailscale up` with no flags, which keeps Tailscale's settings. It does this once per 10
+minutes at most, never while the PC is still on the hotspot, and never while Tailscale is off.
 
 ```
 node phone/build.mjs                       # phone\out\ai-usage-bubble.apk

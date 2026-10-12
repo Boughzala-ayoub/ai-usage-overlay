@@ -324,25 +324,37 @@
     return true;
   }
   let es = null;
-  async function load(refresh) {
+  let heard = 0; // when the stream last said anything, a ping included
+  async function load(refresh, again) {
     try {
       const r = await fetch('/api/usage', { method: refresh ? 'POST' : 'GET', signal: AbortSignal.timeout(refresh ? 60000 : 20000) });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const state = await r.json();
       reached = true;
       if (!take(state)) draw(); // newer state is already here; this answer still says the PC is there
-      // A stream that got a 502 while the PC's overlay was down has given up for good: start another.
-      if (es?.readyState === EventSource.CLOSED) listen();
     } catch {
+      // The link ends the connections on the old way when it switches between Tailscale and the hotspot: one
+      // more read, which goes the new way, before the page says the PC is out of reach.
+      if (!refresh && !again) return load(false, true);
       reached = false;
       draw();
     }
   }
   function listen() {
+    es?.close();
     es = new EventSource('/api/events');
-    es.onmessage = (e) => take(JSON.parse(e.data));
+    heard = Date.now();
+    es.onmessage = (e) => {
+      heard = Date.now();
+      take(JSON.parse(e.data));
+    };
+    es.addEventListener('ping', () => (heard = Date.now()));
     // A dropped connection it retries by itself; whether the PC is reachable is the minute's read to say.
   }
+  // The PC pings every 20 s. Silent for 45, the stream sits on a connection that died without a word (the PC
+  // slept, or left the phone's hotspot); closed, it got a 502 while the overlay was down and won't retry.
+  // Either way, a new one.
+  setInterval(() => (es.readyState === EventSource.CLOSED || Date.now() - heard > 45000) && listen(), 5000);
   async function post(settings) {
     const r = await fetch('/api/settings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings), signal: AbortSignal.timeout(15000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);

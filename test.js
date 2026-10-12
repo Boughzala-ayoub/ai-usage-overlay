@@ -397,6 +397,7 @@ configuredProvider.read()
   })
   .then(mainChecks)
   .then(linkChecks)
+  .then(healChecks)
   .then(() => console.log('ok'))
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
 
@@ -653,5 +654,62 @@ async function linkChecks() {
     net.connect = realConnect;
     proven?.destroy();
     for (const server of servers) server.close();
+  }
+}
+
+// --- link.js heal(): Tailscale reconnects on this PC only for a tunnel frozen 90 s while the phone still answers
+// through the relay, once per 10 minutes at most, and never while it works, the phone is away or Tailscale is off.
+// A made-up `tailscale` that answers as told and records what it was asked.
+async function healChecks() {
+  const { heal } = require('./link');
+  const phone = { OS: 'android', Online: true, UserID: 1, TailscaleIPs: ['100.1.1.1'] };
+  const tailscale = ({ backend = 'Running', tsmp = false, relay = true, peers = [phone], failedUps = 0 } = {}) => {
+    const asked = [];
+    const run = async (args) => {
+      asked.push(args[0]);
+      if (args[0] === 'status') return JSON.stringify({ BackendState: backend, Self: { UserID: 1 }, Peer: { ...peers } });
+      if (args[0] === 'ping') return (args[1] === '--tsmp' ? tsmp : relay) ? 'pong' : null;
+      if (args[0] === 'up' && failedUps-- > 0) return null;
+      return '';
+    };
+    return { run, reconnects: () => asked.filter((a) => a === 'down' || a === 'up') };
+  };
+  const t = 1_000_000_000;
+  const looks = async (ts, ...at) => {
+    const w = { frozenAt: 0, fixedAt: 0 };
+    const seen = [];
+    for (const dt of at) seen.push(await heal(w, ts.run, t + dt));
+    return seen;
+  };
+
+  const frozen = tailscale();
+  assert.deepStrictEqual(await looks(frozen, 0, 89_000), ['frozen', 'frozen'], 'the phone answers the relay, not the tunnel');
+  assert.deepStrictEqual(frozen.reconnects(), [], 'frozen under 90 s: left alone');
+  const fixed = tailscale();
+  await looks(fixed, 0, 90_000, 200_000, 600_000);
+  assert.deepStrictEqual(fixed.reconnects(), ['down', 'up'], 'frozen 90 s: down and up, then nothing for 10 minutes');
+  const again = tailscale();
+  await looks(again, 0, 90_000, 690_000);
+  assert.deepStrictEqual(again.reconnects(), ['down', 'up', 'down', 'up'], 'still frozen 10 minutes on: once more');
+  const stubborn = tailscale({ failedUps: 1 });
+  await looks(stubborn, 0, 90_000);
+  assert.deepStrictEqual(stubborn.reconnects(), ['down', 'up', 'up'], 'an up that fails is tried again');
+  const blip = tailscale();
+  const w = { frozenAt: 0, fixedAt: 0 };
+  await heal(w, blip.run, t);
+  await heal(w, tailscale({ tsmp: true }).run, t + 60_000);
+  await heal(w, blip.run, t + 100_000);
+  await heal(w, blip.run, t + 180_000);
+  assert.deepStrictEqual(blip.reconnects(), [], 'a look that gets through starts the 90 s over');
+  for (const [what, ts, state] of [
+    ['working', tailscale({ tsmp: true }), 'ok'],
+    ['the phone away', tailscale({ relay: false }), 'away'],
+    ['Tailscale off on this PC', tailscale({ backend: 'Stopped' }), 'away'],
+    ['the phone offline', tailscale({ peers: [{ ...phone, Online: false }] }), 'away'],
+    ["someone else's phone", tailscale({ peers: [{ ...phone, UserID: 2 }] }), 'away'],
+    ['no tailscale', { run: async () => null, reconnects: () => [] }, 'away'],
+  ]) {
+    assert.deepStrictEqual(await looks(ts, 0, 90_000, 700_000), [state, state, state], `${what}: seen as ${state}`);
+    assert.deepStrictEqual(ts.reconnects(), [], `${what}: no reconnect`);
   }
 }
