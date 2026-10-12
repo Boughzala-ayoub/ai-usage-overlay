@@ -78,18 +78,20 @@ public class Bubble extends Service {
     }
   }
 
-  /** The overlay, as the phone link carries it: its port here and on the PC, and `tailscale serve`'s for it. */
-  static final Link.App[] APPS = { new Link.App("overlay", 7430, 8443) };
+  /** The overlay's port, on this phone for the page and on the PC. */
+  static final int PORT = 7430;
 
   /** Starts the phone link (Link.java) for the PC the bubble reads; its secret is kept with the app's settings. */
   static void link(Context c) {
     SharedPreferences store = c.getSharedPreferences("link", MODE_PRIVATE);
-    String host = Uri.parse(server(c)).getHost();
-    Link.start(host == null ? "" : host, new Link.Store() {
+    Uri server = Uri.parse(server(c));
+    // The overlay, as the link carries it. `tailscale serve`'s port for it is the address's own, 443 if it has none.
+    Link.App overlay = new Link.App("overlay", PORT, server.getPort() == -1 ? 443 : server.getPort());
+    Link.start(server.getHost() == null ? "" : server.getHost(), new Link.Store() {
       @Override public String get(String key) { return store.getString(key, null); }
 
       @Override public void put(String key, String value) { store.edit().putString(key, value).apply(); }
-    }, APPS, 7499); // the PC finds the bubble's link on 7499; Loom's own phone app has its own port
+    }, new Link.App[] { overlay }, 7499); // the PC finds the bubble's link on 7499; Loom's own phone app has its own port
   }
 
   @Override public IBinder onBind(Intent i) { return null; }
@@ -119,7 +121,7 @@ public class Bubble extends Service {
     // through the link on this phone: over Tailscale, or the hotspot while Tailscale can't reach the PC there.
     link(this);
     try (InputStream in = getAssets().open("bubble.html")) {
-      web.loadDataWithBaseURL("http://localhost:" + APPS[0].port + "/", new String(in.readAllBytes(), StandardCharsets.UTF_8), "text/html", "utf-8", null);
+      web.loadDataWithBaseURL("http://localhost:" + PORT + "/", new String(in.readAllBytes(), StandardCharsets.UTF_8), "text/html", "utf-8", null);
     } catch (IOException e) {
       throw new IllegalStateException("bubble.html missing from the APK", e);
     }

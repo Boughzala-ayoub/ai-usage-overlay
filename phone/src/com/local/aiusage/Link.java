@@ -12,6 +12,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -54,16 +55,7 @@ public final class Link {
   }
 
   /** An app the link carries: its name in the PC's hello, its port here and on the PC, its `tailscale serve` port (0: none). */
-  public static final class App {
-    final String name;
-    final int port, tailnet;
-
-    public App(String name, int port, int tailnet) {
-      this.name = name;
-      this.port = port;
-      this.tailnet = tailnet;
-    }
-  }
+  public record App(String name, int port, int tailnet) {}
 
   static final Pattern SECRET = Pattern.compile("\"secret\"\\s*:\\s*\"([0-9a-f]{64})\"");
   static Link running;
@@ -83,9 +75,9 @@ public final class Link {
   final SecureRandom random = new SecureRandom();
   volatile boolean stopped;
 
-  /** Runs one link for the process; a new tailnet name starts it over. */
+  /** Runs one link for the process; a new tailnet name or port starts it over. */
   static synchronized void start(String host, Store store, App[] apps, int pcPort) {
-    if (running != null && running.host.equals(host)) return;
+    if (running != null && running.host.equals(host) && Arrays.equals(running.apps, apps)) return;
     if (running != null) running.stop();
     running = new Link(host, store, apps, pcPort, 0);
     running.open();

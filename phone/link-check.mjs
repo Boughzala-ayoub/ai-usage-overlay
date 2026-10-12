@@ -1,7 +1,9 @@
 // Checks the phone link end to end on this PC: Link.java (the phone's half, on a desktop JVM, its page ports
 // moved up by OFFSET since this PC's own apps hold 7430) against link.js (the PC's half, told the gateway is
 // 127.0.0.1). Needs a JDK on PATH, Tailscale up, and port 7499 free. LINK_LOG=1 prints the link's log.
-// Usage: node phone/link-check.mjs
+// "offline" runs only the first checks, which need neither Tailscale nor the shared secret: they run
+// Link.start on ports of their own with a made-up secret.
+// Usage: node phone/link-check.mjs [offline]
 import assert from 'node:assert';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -37,7 +39,54 @@ public class LinkMain {
     Thread.sleep(Long.MAX_VALUE);
   }
 }`);
-execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main], { stdio: 'inherit' });
+// The checks that need no PC: Link.start and Link.end as the bubble calls them, with stand-ins for the PC.
+const checks = path.join(classes, 'LinkChecks.java');
+fs.writeFileSync(checks, `package com.local.aiusage;
+import java.net.*;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+public class LinkChecks {
+  static void check(boolean ok, String what) {
+    if (!ok) throw new AssertionError(what);
+  }
+  static int free() throws Exception {
+    try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) { return s.getLocalPort(); }
+  }
+  /** A stand-in for tailscale serve on a port of its own: accept() returns once the link dials it. */
+  static ServerSocket serve() throws Exception {
+    ServerSocket s = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+    s.setSoTimeout(5000);
+    return s;
+  }
+  public static void main(String[] a) throws Exception {
+    if (System.getenv("LINK_LOG") != null) Link.log = System.err::println;
+    Map<String, String> m = new ConcurrentHashMap<>(Map.of("secret", "ab".repeat(32)));
+    Link.Store store = new Link.Store() {
+      public String get(String k) { return m.get(k); }
+      public void put(String k, String v) { m.put(k, v); }
+    };
+    int page = free(), pc = free();
+    ServerSocket first = serve(), second = serve();
+    Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, first.getLocalPort()) }, pc);
+    Link one = Link.running;
+    first.accept().close(); // its secret's fetch: the address's own port, whatever it is
+    Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, first.getLocalPort()) }, pc);
+    check(Link.running == one, "the same address keeps its link");
+    Link.start("localhost", store, new Link.App[] { new Link.App("overlay", page, second.getLocalPort()) }, pc);
+    check(Link.running != one && one.stopped, "a new port alone starts the link over");
+    second.accept().close();
+    Link.end();
+    check(Link.running == null, "Link.end leaves no link");
+  }
+}`);
+execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main, checks], { stdio: 'inherit' });
+const offline = process.argv[2] === 'offline';
+try {
+  execFileSync('java', ['-cp', classes, 'com.local.aiusage.LinkChecks'], { stdio: 'inherit' });
+} finally {
+  if (offline) fs.rmSync(classes, { recursive: true, force: true });
+}
+if (offline) process.exit(console.log('link-check: offline checks passed'));
 let phone = null;
 // `java` on PATH may be Oracle's launcher, which runs the JVM as its child: end the whole tree.
 const kill = (p) => p && p.exitCode === null && execFileSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
