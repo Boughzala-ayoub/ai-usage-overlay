@@ -446,6 +446,10 @@ async function readXai() {
     const wait = (e) => e.retryAfter || 60;
     const fatal = failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
     if (fatal) throw fatal;
+    // One lookup failed beside one that answered: the line that answered lands, and the note says which didn't.
+    // A soft error here would make readFresh keep the old lines instead.
+    const [lost] = failed;
+    if (lost) shaped.note = `${lost === answers[0] ? 'Monthly' : 'Weekly'} usage not refreshed (${lost.message}).`;
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };

@@ -313,7 +313,9 @@ configuredProvider.read()
       assert.deepStrictEqual((await xai.read()).rows.map((r) => r.label), ['Weekly', 'Monthly']);
       assert.deepStrictEqual(sent, ['Bearer test-token', 'Bearer test-token'], 'both lookups carry the token grok keeps');
       weeklyDown = true;
-      assert.deepStrictEqual((await xai.read()).rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
+      const weeklyLost = await xai.read();
+      assert.deepStrictEqual(weeklyLost.rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
+      assert.strictEqual(weeklyLost.note, 'Weekly usage not refreshed (HTTP 500).', 'and says the weekly one did not refresh');
       // And the other way round, on the unified pool too: a monthly outage costs only the monthly line, a 429 still gates.
       const week96 = { config: { ...xaiWeekly.config, creditUsagePercent: 96 } };
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 503, headers: new Headers() });
@@ -322,8 +324,11 @@ configuredProvider.read()
       assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled monthly lookup gates xAI');
       global.fetch = async (url) => ({ ok: false, status: 429, headers: new Headers(url.endsWith('format=credits') ? {} : { 'retry-after': '30' }) });
       assert.strictEqual((await xai.read()).retryAfter, 60, 'a 429 with no Retry-After counts as its 60s fallback against the other');
-      // The unified weekly pool: no monthly limit, so the weekly lookup failing is the read failing.
+      // The unified weekly pool: no monthly limit, which is no outage, so the weekly lookup failing is the read failing.
       const pooled = { config: { monthlyLimit: { val: 0 }, used: { val: 0 }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
+      global.fetch = async (url) => ({ ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : pooled) });
+      const pool = await xai.read();
+      assert.deepStrictEqual([pool.rows.map((r) => r.label), pool.note], [['Weekly'], undefined], 'a zero monthly limit is no outage');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => pooled });
       const outage = await xai.read();
       assert.ok(outage.soft && !outage.rows, 'an outage keeps the last reading on screen');
@@ -567,6 +572,21 @@ async function mainChecks() {
       clock += 510_000;
       await readOne(xai, true);
       assert.strictEqual(xaiAsked, 2, 'and a refresh past it asks again');
+      // One lookup failing beside one that answers: the good line lands with a note naming what didn't refresh,
+      // and the note goes once both answer again.
+      gate.delete('xai');
+      Date.now = realNow;
+      const weekly = (percent) => () => ({ ok: true, json: async () => ({ config: { ...xaiWeekly.config, creditUsagePercent: percent } }) });
+      const monthly = (used) => () => ({ ok: true, json: async () => ({ config: { monthlyLimit: { val: 100 }, used: { val: used } } }) });
+      [weeklyAnswer, monthlyAnswer] = [weekly(4), monthly(99)];
+      await readOne(xai, true);
+      [weeklyAnswer, monthlyAnswer] = [weekly(5), () => ({ ok: false, status: 503, headers: new Headers() })];
+      await readOne(xai, true);
+      assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 5]], 'the weekly line lands');
+      assert.strictEqual(last.get('xai').note, 'Monthly usage not refreshed (HTTP 503).', 'with a note saying the monthly one did not');
+      monthlyAnswer = monthly(99);
+      await readOne(xai, true);
+      assert.deepStrictEqual([last.get('xai').rows.length, last.get('xai').note], [2, undefined], 'both back, the note goes');
     } finally {
       Date.now = realNow;
       global.fetch = originalFetch;
