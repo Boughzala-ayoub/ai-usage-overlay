@@ -314,6 +314,12 @@ configuredProvider.read()
       assert.deepStrictEqual(sent, ['Bearer test-token', 'Bearer test-token'], 'both lookups carry the token grok keeps');
       weeklyDown = true;
       assert.deepStrictEqual((await xai.read()).rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
+      // And the other way round, on the unified pool too: a monthly outage costs only the monthly line, a 429 still gates.
+      const week96 = { config: { ...xaiWeekly.config, creditUsagePercent: 96 } };
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 503, headers: new Headers() });
+      assert.deepStrictEqual((await xai.read()).rows?.map((r) => [r.label, r.percent]), [['Weekly', 96]], 'a failed monthly lookup keeps the weekly line');
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
+      assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled monthly lookup gates xAI');
       // The unified weekly pool: no monthly limit, so the weekly lookup failing is the read failing.
       const pooled = { config: { monthlyLimit: { val: 0 }, used: { val: 0 }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => pooled });
