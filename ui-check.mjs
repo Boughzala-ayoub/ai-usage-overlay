@@ -16,8 +16,11 @@ const edges = ['left', 'right', 'top', 'bottom'];
 const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
-// The native windows at Size = Large, each only on the edges main gives that shape.
-viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 332, height: 684, edges: ['top', 'bottom'] });
+// The native windows at Size = Large for the four providers below, each only on the edges main gives that shape.
+// From main.js's windowSize(): beside the pill 8 + 86 + 300 + 16 by max(4 × 56, 600) + 32, above or below it
+// max(4 × 88, 300) + 32 by 8 + 60 + 600 + 16.
+const NATIVE = { left: 410, right: 410, top: 384, bottom: 384 };
+viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 384, height: 684, edges: ['top', 'bottom'] });
 const data = [
   {
     id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: 37,
@@ -33,6 +36,15 @@ const data = [
     bankedResets: 1,
     bankedResetExpiries: [Date.parse('2026-10-04T05:36:14Z')],
     rows: [{ label: 'Weekly', percent: 4, resets: 'in 6d 2h' }],
+    updatedAt: Date.now(),
+  },
+  {
+    id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', plan: 'Go', ringPercent: 33,
+    rows: [
+      { label: '5h limit', percent: 18, resets: 'in 3h 5m' },
+      { label: 'Weekly', percent: 33, resets: 'in 4d 1h' },
+      { label: 'Monthly', percent: 9, resets: 'in 21d 3h' },
+    ],
     updatedAt: Date.now(),
   },
   {
@@ -67,6 +79,7 @@ await page.goto(base, { waitUntil: 'load' });
 await page.addStyleTag({ content: 'html{background:linear-gradient(125deg,#08111f 0%,#823f5e 48%,#d7efff 100%)!important}*,*::before,*::after{animation:none!important;transition:none!important}' });
 
 let checked = 0;
+const clipped = new Set();
 for (const { width, height, edges: only } of viewports) {
   await page.setViewport({ width, height, deviceScaleFactor: 1 });
   for (const [theme, , css] of themes) for (const edge of only || edges) for (const state of states) {
@@ -84,10 +97,10 @@ for (const { width, height, edges: only } of viewports) {
       if (state === 'codex-expiry-missing') delete data[1].bankedResetExpiries;
       if (state === 'codex-multiple') { data[1].bankedResets = 2; data[1].bankedResetExpiries.push(Date.parse('2026-10-12T18:15:00Z')); }
       if (state === 'warning') data[0].rows[0].percent = data[0].ringPercent = 96;
-      if (state === 'limited') data[0].waitMs = data[1].waitMs = data[2].waitMs = 90000;
+      if (state === 'limited') data[0].waitMs = data[1].waitMs = data[2].waitMs = data[3].waitMs = 90000;
       if (state === 'limited-one') data[0].waitMs = 90000;
       if (state === 'error') { data[0].rows = []; data[0].error = 'No Claude credentials — run `claude` to sign in.'; }
-      if (state === 'xai-unavailable') { data[2].rows = []; data[2].error = 'Grok sign-in expired — run `grok` to renew it.'; }
+      if (state === 'xai-unavailable') { data[3].rows = []; data[3].error = 'Grok sign-in expired — run `grok` to renew it.'; }
       if (state === 'loading') { data[0].rows = []; data[0].updatedAt = null; }
       if (state === 'long') {
         data[0].plan = 'Enterprise subscription with an extended plan name';
@@ -115,10 +128,10 @@ for (const { width, height, edges: only } of viewports) {
       const exposed = vertical
         ? Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0))
         : Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
-      const visible = state === 'hidden' ? [lip] : [island, ...(panel && state !== 'reset' ? [document.querySelector('#rf'), document.querySelector('#mn')] : [])];
+      const visible = state === 'hidden' ? [lip] : [island, ...document.querySelectorAll('.chip'), ...(panel && state !== 'reset' ? [document.querySelector('#rf'), document.querySelector('#mn')] : [])];
       const outside = visible.map((el) => {
         const b = el.getBoundingClientRect();
-        return { id: el.id, left: b.left, right: b.right, top: b.top, bottom: b.bottom };
+        return { id: el.id || el.getAttribute('aria-label'), left: b.left, right: b.right, top: b.top, bottom: b.bottom };
       }).filter((b) => b.left < -1 || b.right > innerWidth + 1 || b.top < -1 || b.bottom > innerHeight + 1);
       const lipRect = lip.getBoundingClientRect();
       return {
@@ -135,8 +148,8 @@ for (const { width, height, edges: only } of viewports) {
         rows: document.querySelectorAll('#sections .row[data-k]').length,
         disabled: document.querySelector('#rf').disabled,
         chips: [...document.querySelectorAll('.chip b')].map((b) => b.textContent),
-        xaiInk: getComputedStyle(document.querySelectorAll('.chip .g')[2]).color === getComputedStyle(document.body).color,
-        xaiLabel: document.querySelectorAll('.chip')[2].getAttribute('aria-label'),
+        xaiInk: getComputedStyle(document.querySelectorAll('.chip .g')[3]).color === getComputedStyle(document.body).color,
+        xaiLabel: document.querySelectorAll('.chip')[3].getAttribute('aria-label'),
         status: [...document.querySelectorAll('.status')].map((el) => el.textContent),
         bank: [...document.querySelectorAll('.bank')].map((el) => el.textContent),
         rects: window.__rects,
@@ -145,15 +158,19 @@ for (const { width, height, edges: only } of viewports) {
     const bad = [];
     const panel = !['hidden', 'rest', 'reset'].includes(state);
     if (result.scrollWidth > result.clientWidth) bad.push('horizontal scroll');
-    if (result.outside.length) bad.push('outside the window');
+    // main sizes each window to hold its capsule. Narrower than NATIVE, as top or bottom at 320px, a page the overlay
+    // never opens, the four-chip capsule is wider than the page: centred, both its ends clip. Its chips and buttons may not.
+    const clip = result.outside.filter((b) => b.id === 'island' && width < NATIVE[edge] && b.top >= -1 && b.bottom <= height + 1 && Math.abs(b.left + b.right - width) <= 2);
+    if (result.outside.length > clip.length) bad.push('outside the window');
+    if (clip.length) clipped.add(`${edge} at ${width}px`);
     if (result.contentOverflow) bad.push('content overflows the panel');
-    if (state === 'hidden' && (result.exposed !== 0 || result.lipThickness !== 5 || result.lipLevels !== 3)) bad.push('lip');
+    if (state === 'hidden' && (result.exposed !== 0 || result.lipThickness !== 5 || result.lipLevels !== 4)) bad.push('lip');
     if (state === 'rest' && result.detailsW !== 0) bad.push('panel open at rest');
     if ((panel || state === 'reset') && result.detailsW < 200) bad.push('panel did not open');
     if (result.islandW > 300 + 86) bad.push('panel too wide');
     if (state === 'reset' && !result.noticing) bad.push('reset notice');
-    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 6) bad.push('one row per limit');
-    if (state === 'long' && result.rows !== 11) bad.push('long rows');
+    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 9) bad.push('one row per limit');
+    if (state === 'long' && result.rows !== 14) bad.push('long rows');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
     if (state === 'limited-one' && !result.status.some((s) => s.startsWith('Rate limited, retry in 2 min'))) bad.push('rate-limit line');
     if (['error', 'loading'].includes(state) && result.chips[0] !== '—') bad.push('empty chip');
@@ -161,7 +178,7 @@ for (const { width, height, edges: only } of viewports) {
     if (!result.xaiInk) bad.push("xAI mark not in the theme's ink");
     // Unavailable, xAI's chip is a dash and its section says how to get it back; the others carry on.
     const xaiOut = state === 'xai-unavailable';
-    if (xaiOut !== (result.chips[2] === '—') || xaiOut !== (result.xaiLabel === 'xAI: usage unavailable')) bad.push('xAI chip');
+    if (xaiOut !== (result.chips[3] === '—') || xaiOut !== (result.xaiLabel === 'xAI: usage unavailable')) bad.push('xAI chip');
     if (panel && xaiOut !== result.status.includes('Grok sign-in expired — run grok to renew it.')) bad.push('xAI line');
     if (!['error', 'loading', 'hidden'].includes(state) && result.chips[0] !== (state === 'warning' ? '96' : '37')) bad.push('chip number');
     if (!result.rects || !result.rects.island || !result.rects.lip) bad.push('rects not reported');
@@ -205,7 +222,7 @@ await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'no-pr
 await page.reload({ waitUntil: 'load' });
 for (const edge of edges) {
   const vertical = edge === 'left' || edge === 'right';
-  await page.setViewport(vertical ? { width: 410, height: 632 } : { width: 332, height: 684 });
+  await page.setViewport(vertical ? { width: 410, height: 632 } : { width: NATIVE.top, height: 684 });
   await page.evaluate(async ({ data, edge }) => {
     const check = (ok, message) => { if (!ok) throw new Error(edge + ': ' + message); };
     const settle = async () => {
@@ -290,6 +307,7 @@ await page.evaluate(async () => {
 });
 
 console.log(`PASS: ${checked} theme, edge, state and width combinations; screenshots: ${shots}`);
+if (clipped.size) console.log(`LIMIT: the capsule's ends clip, every control in view, ${[...clipped].join(', ')}: narrower than main ever opens that window`);
 console.log('PASS: reveal sweep, morph with fixed chips, notice, refresh and reduced-motion checks');
 } finally {
   await browser.close();

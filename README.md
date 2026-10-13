@@ -244,9 +244,13 @@ Put `hover` in the filename and it opens the panel before the capture.
 `npm run test:ui` loads `index.html` in headless Chrome with a fake `window.api` and runs every state
 (loading, error, rate limited, banked resets, a reset notice, a long panel) on all four edges. It
 covers widths from 320 to 1280 plus the two native window sizes, and every theme hidden, at rest,
-open and mid-notice. It fails on horizontal scroll, anything outside the window, or text overflowing
-the panel. A second pass runs the real animations and fails if the chips move while the capsule
-grows or shrinks, or if Small shrinks anything but the pill. Screenshots land in `%TEMP%\ai-usage-overlay-ui`.
+open and mid-notice, with all four providers. It fails on horizontal scroll, anything outside the
+window, or text overflowing the panel. The one exception is a top or bottom capsule at 320px. Four
+chips make it 332px wide, so its ends clip, though every chip and button stays in view. main sizes
+that window to hold the capsule and never under 332px, so the run prints the case as a LIMIT line
+instead of failing. A second pass runs the real animations and fails if the chips move while the
+capsule grows or shrinks, or if Small shrinks anything but the pill. Screenshots land in
+`%TEMP%\ai-usage-overlay-ui`.
 
 ```
 node_modules\electron\dist\electron.exe . --shot=%TEMP%\hover.png
