@@ -440,9 +440,11 @@ async function readXai() {
     const answers = await Promise.all([GROK_BILLING_API, `${GROK_BILLING_API}?format=credits`].map((url) => fetchJson(url, headers).catch((e) => e)));
     const failed = answers.filter((a) => a instanceof Error);
     const shaped = shapeXai(...answers.map((a) => (a instanceof Error ? null : a)));
-    // A 429 gates xAI as a whole, whichever lookup drew it. With no line left a failure is the read's, the
-    // monthly lookup's first. On the unified weekly pool the monthly limit is 0, so that's any weekly failure.
-    const fatal = failed.find((e) => e.status === 429) || (shaped.error && failed[0]);
+    // A 429 gates xAI as a whole, whichever lookup drew it, for the longer wait if both did. With no line left a
+    // failure is the read's, the monthly lookup's first. On the unified weekly pool the monthly limit is 0, so
+    // that's any weekly failure.
+    const wait = (e) => e.retryAfter || 60;
+    const fatal = failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
     if (fatal) throw fatal;
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {

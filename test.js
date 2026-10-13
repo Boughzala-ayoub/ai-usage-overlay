@@ -320,6 +320,8 @@ configuredProvider.read()
       assert.deepStrictEqual((await xai.read()).rows?.map((r) => [r.label, r.percent]), [['Weekly', 96]], 'a failed monthly lookup keeps the weekly line');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
       assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled monthly lookup gates xAI');
+      global.fetch = async (url) => ({ ok: false, status: 429, headers: new Headers(url.endsWith('format=credits') ? {} : { 'retry-after': '30' }) });
+      assert.strictEqual((await xai.read()).retryAfter, 60, 'a 429 with no Retry-After counts as its 60s fallback against the other');
       // The unified weekly pool: no monthly limit, so the weekly lookup failing is the read failing.
       const pooled = { config: { monthlyLimit: { val: 0 }, used: { val: 0 }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => pooled });
@@ -534,9 +536,10 @@ async function mainChecks() {
     const originalFetch = global.fetch;
     let xaiAsked = 0;
     let weeklyAnswer = () => ({ ok: true, json: async () => ({ config: { ...xaiWeekly.config, creditUsagePercent: 96 } }) });
+    let monthlyAnswer = () => ({ ok: true, json: async () => ({ config: { monthlyLimit: { val: 400 }, used: { val: 100 } } }) });
     global.fetch = async (url) => {
       xaiAsked++;
-      return url.endsWith('format=credits') ? weeklyAnswer() : { ok: true, json: async () => ({ config: { monthlyLimit: { val: 400 }, used: { val: 100 } } }) };
+      return url.endsWith('format=credits') ? weeklyAnswer() : monthlyAnswer();
     };
     fs.writeFileSync(path.join(codexHome, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::client': { key: 'test-token' } }));
     try {
@@ -550,7 +553,22 @@ async function mainChecks() {
       await readOne(xai, true);
       await readOne(xai, true);
       assert.strictEqual(xaiAsked, 0, 'refreshes by hand wait out the gate');
+      // Both throttled: the longer Retry-After holds, whichever lookup drew it.
+      gate.delete('xai');
+      clock = realNow();
+      Date.now = () => clock;
+      monthlyAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
+      weeklyAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': '600' }) });
+      await readOne(xai, true);
+      clock += 91_000;
+      xaiAsked = 0;
+      await readOne(xai, true);
+      assert.strictEqual(xaiAsked, 0, 'the longer of two Retry-Afters holds');
+      clock += 510_000;
+      await readOne(xai, true);
+      assert.strictEqual(xaiAsked, 2, 'and a refresh past it asks again');
     } finally {
+      Date.now = realNow;
       global.fetch = originalFetch;
       gate.delete('xai');
       last.delete('xai');
