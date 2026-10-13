@@ -13,7 +13,7 @@ const chrome = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Applic
 const shots = path.join(os.tmpdir(), 'ai-usage-overlay-ui');
 const themes = process.env.UI_THEME ? THEMES.filter(([id]) => process.env.UI_THEME.split(',').includes(id)) : THEMES;
 const edges = ['left', 'right', 'top', 'bottom'];
-const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'loading', 'long', 'refreshing'];
+const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
 // The native windows at Size = Large, each only on the edges main gives that shape.
@@ -33,6 +33,12 @@ const data = [
     bankedResets: 1,
     bankedResetExpiries: [Date.parse('2026-10-04T05:36:14Z')],
     rows: [{ label: 'Weekly', percent: 4, resets: 'in 6d 2h' }],
+    updatedAt: Date.now(),
+  },
+  {
+    // xAI's mark is monochrome, so it takes the theme's ink, in every theme.
+    id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: 42.5,
+    rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }],
     updatedAt: Date.now(),
   },
 ];
@@ -78,9 +84,10 @@ for (const { width, height, edges: only } of viewports) {
       if (state === 'codex-expiry-missing') delete data[1].bankedResetExpiries;
       if (state === 'codex-multiple') { data[1].bankedResets = 2; data[1].bankedResetExpiries.push(Date.parse('2026-10-12T18:15:00Z')); }
       if (state === 'warning') data[0].rows[0].percent = data[0].ringPercent = 96;
-      if (state === 'limited') data[0].waitMs = data[1].waitMs = 90000;
+      if (state === 'limited') data[0].waitMs = data[1].waitMs = data[2].waitMs = 90000;
       if (state === 'limited-one') data[0].waitMs = 90000;
       if (state === 'error') { data[0].rows = []; data[0].error = 'No Claude credentials — run `claude` to sign in.'; }
+      if (state === 'xai-unavailable') { data[2].rows = []; data[2].error = 'Grok sign-in expired — run `grok` to renew it.'; }
       if (state === 'loading') { data[0].rows = []; data[0].updatedAt = null; }
       if (state === 'long') {
         data[0].plan = 'Enterprise subscription with an extended plan name';
@@ -128,6 +135,8 @@ for (const { width, height, edges: only } of viewports) {
         rows: document.querySelectorAll('#sections .row[data-k]').length,
         disabled: document.querySelector('#rf').disabled,
         chips: [...document.querySelectorAll('.chip b')].map((b) => b.textContent),
+        xaiInk: getComputedStyle(document.querySelectorAll('.chip .g')[2]).color === getComputedStyle(document.body).color,
+        xaiLabel: document.querySelectorAll('.chip')[2].getAttribute('aria-label'),
         status: [...document.querySelectorAll('.status')].map((el) => el.textContent),
         bank: [...document.querySelectorAll('.bank')].map((el) => el.textContent),
         rects: window.__rects,
@@ -138,17 +147,22 @@ for (const { width, height, edges: only } of viewports) {
     if (result.scrollWidth > result.clientWidth) bad.push('horizontal scroll');
     if (result.outside.length) bad.push('outside the window');
     if (result.contentOverflow) bad.push('content overflows the panel');
-    if (state === 'hidden' && (result.exposed !== 0 || result.lipThickness !== 5 || result.lipLevels !== 2)) bad.push('lip');
+    if (state === 'hidden' && (result.exposed !== 0 || result.lipThickness !== 5 || result.lipLevels !== 3)) bad.push('lip');
     if (state === 'rest' && result.detailsW !== 0) bad.push('panel open at rest');
     if ((panel || state === 'reset') && result.detailsW < 200) bad.push('panel did not open');
     if (result.islandW > 300 + 86) bad.push('panel too wide');
     if (state === 'reset' && !result.noticing) bad.push('reset notice');
-    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 4) bad.push('one row per limit');
-    if (state === 'long' && result.rows !== 9) bad.push('long rows');
+    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 6) bad.push('one row per limit');
+    if (state === 'long' && result.rows !== 11) bad.push('long rows');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
     if (state === 'limited-one' && !result.status.some((s) => s.startsWith('Rate limited, retry in 2 min'))) bad.push('rate-limit line');
     if (['error', 'loading'].includes(state) && result.chips[0] !== '—') bad.push('empty chip');
     if (state === 'error' && !result.status.includes('No Claude credentials — run claude to sign in.')) bad.push('error line');
+    if (!result.xaiInk) bad.push("xAI mark not in the theme's ink");
+    // Unavailable, xAI's chip is a dash and its section says how to get it back; the others carry on.
+    const xaiOut = state === 'xai-unavailable';
+    if (xaiOut !== (result.chips[2] === '—') || xaiOut !== (result.xaiLabel === 'xAI: usage unavailable')) bad.push('xAI chip');
+    if (panel && xaiOut !== result.status.includes('Grok sign-in expired — run grok to renew it.')) bad.push('xAI line');
     if (!['error', 'loading', 'hidden'].includes(state) && result.chips[0] !== (state === 'warning' ? '96' : '37')) bad.push('chip number');
     if (!result.rects || !result.rects.island || !result.rects.lip) bad.push('rects not reported');
     if (panel) {

@@ -35,6 +35,7 @@ const USAGE_PAGES = {
   claude: 'https://claude.ai/settings/usage',
   codex: 'https://chatgpt.com/codex/settings/usage',
   'opencode-go': 'https://opencode.ai/workspace/wrk_01M26JF7B3TC3JG56RDM1940Q5/go',
+  xai: 'https://grok.com/?_s=usage',
 };
 const THEMES = THEME_GROUPS.flatMap(([, list]) => list); // [id, label, css]
 const SIZES = [

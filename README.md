@@ -34,6 +34,7 @@ icon is three level rows, so you can tell the two apart.
 | Claude | `~/.claude/.credentials.json` then `api.anthropic.com/api/oauth/usage` | 5 min |
 | Codex | `~/.codex/auth.json` then the ChatGPT usage endpoint | 5 min |
 | OpenCode Go | `~/.local/share/opencode/auth.json` (or `OPENCODE_API_KEY`) then `opencode.ai/zen/go/v1/usage` | 5 min |
+| xAI | `~/.grok/auth.json` then `cli-chat-proxy.grok.com/v1/billing` | 5 min |
 
 Codex uses only `~/.codex/auth.json` for login and re-reads it on every refresh. If the request
 fails, the overlay reads the rollouts across `CODEX_HOME`, Orca's runtime home, and `~/.codex`, and
@@ -48,7 +49,16 @@ Code rotates it in place.
 OpenCode Go reports three rolling windows, 5-hour, weekly and monthly, as percentages of the plan's
 dollar caps. The key is the same one `opencode` sends with every Go request.
 
-Adding a fourth provider is one entry in `PROVIDERS` at the bottom of `providers.js` plus its `read()`.
+xAI is the SuperGrok allowance that Grok Build's `/usage` shows. The token is the one `grok` keeps in
+`~/.grok/auth.json`, re-read on every refresh. `/billing?format=credits` gives the weekly percentage
+and when it resets. `/billing` gives monthly credits, and the panel adds a Monthly line only when the
+plan has a monthly limit. On xAI's unified weekly pool that limit is 0, so there is one line. `grok`
+renews its token only while it runs, so after a while away the xAI section says to run `grok`, and
+the chip shows a dash. The endpoint is the CLI's own, not a public API. If its answer changes shape,
+the section says no usage windows were reported. xAI's mark is monochrome, so on both screens it
+takes the theme's text colour.
+
+Adding a provider is one entry in `PROVIDERS` at the bottom of `providers.js` plus its `read()`.
 Return `{ plan, rows: [{ label, percent, resetsAt }], error }` and its chip, its section in the
 panel, the tray checkbox and the window size all follow. Give it a usage page in `USAGE_PAGES` in
 `main.js` if it has one.
@@ -120,11 +130,12 @@ puts the capsule back on the right of the primary display.
 `phone/` is an Android app that floats a slim tab above every other app, docked on the screen's
 edge. Per provider the tab shows its logo inside a ring that fills clockwise to the same number as
 its chip on the PC, with the number under it. A ring turns amber at 75% and red at 90%, and pulses
-when red. The logos are Claude's and OpenAI's from Simple Icons and OpenCode's from its favicon; a
-provider without one keeps the PC's glyph. Drag the tab anywhere: it lifts as a whole capsule, and
-on release it glides to the nearer side and the corners on that edge square off as it docks, with a
-tick of the phone's vibration. Tap it and the panel pulls out of its inner side, level with it, with
-every limit and reset. Tap anywhere outside the panel, or press Back, to close it.
+when red. The logos are Claude's and OpenAI's from Simple Icons, OpenCode's from its favicon and
+xAI's from LobeHub's icons. A provider without one keeps the PC's glyph. Drag the tab anywhere: it
+lifts as a whole capsule, and on release it glides to the nearer side and the corners on that edge
+square off as it docks, with a tick of the phone's vibration. Tap it and the panel pulls out of its
+inner side, level with it, with every limit and reset. Tap anywhere outside the panel, or press
+Back, to close it.
 
 The `⋯` in the panel's footer opens the settings. The theme (all 96), which providers show, and which
 limit each summary number reads are the PC's tray menu, shared both ways: change one on the phone
@@ -250,4 +261,5 @@ Drag to reorder the chips, more than one account per provider, and any provider 
 already on disk. On the phone: drag-to-dismiss (use the notification's Remove), starting the bubble at
 boot, an iPhone version (iOS lets no app draw over others), reset notices, and sending a snip
 anywhere but the phone's clipboard (the share sheet, the Gallery, the PC's clipboard). Copilot's quota needs a live call to `api.github.com/copilot_internal/user`, and
-Cursor's needs a pasted session cookie.
+Cursor's needs a pasted session cookie. xAI's weekly pool also comes split by product (`productUsage`
+in `/billing?format=credits`); the panel shows only the total, which is the limit that stops you.

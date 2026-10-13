@@ -16,6 +16,8 @@ const CODEX_API = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_RESETS_API = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const OPENCODE_AUTH = path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.local', 'share'), 'opencode', 'auth.json');
 const OPENCODE_GO_API = 'https://opencode.ai/zen/go/v1/usage';
+const GROK_AUTH = path.join(HOME, '.grok', 'auth.json');
+const GROK_BILLING_API = 'https://cli-chat-proxy.grok.com/v1/billing';
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -403,10 +405,61 @@ async function readOpenCodeGo() {
   }
 }
 
+// ---- xAI: the SuperGrok allowance that `grok` (Grok Build) shows under /usage. Its OAuth token sits in
+// ~/.grok/auth.json, which `grok` refreshes while it runs, so it is re-read every call. The endpoint is the
+// CLI's own, not a public API; pi-grok-cli and pi-xai read it the same way.
+// Monthly credits come from /billing, the weekly percentage from /billing?format=credits. The weekly answer
+// leaves out creditUsagePercent at the start of a period, before anything is used.
+function shapeXai(monthly, weekly) {
+  const rows = [];
+  const w = weekly?.config;
+  if (w?.currentPeriod?.type === 'USAGE_PERIOD_TYPE_WEEKLY') {
+    rows.push({ label: 'Weekly', percent: clamp(w.creditUsagePercent), resetsAt: w.currentPeriod.end || w.billingPeriodEnd || null });
+  }
+  const m = monthly?.config;
+  const val = (v) => Number(v?.val ?? v); // credits come as { val }, maybe as a string
+  const [limit, used] = [val(m?.monthlyLimit), val(m?.used)];
+  if (limit > 0 && Number.isFinite(used)) rows.push({ label: 'Monthly', percent: clamp((used / limit) * 100), resetsAt: m.billingPeriodEnd || null });
+  return rows.length ? { plan: '', rows } : { error: 'No usage windows reported.' };
+}
+
+async function readXai() {
+  let token;
+  try {
+    // Keyed by issuer and client ("https://auth.x.ai::<client>"); older builds keyed it by the sign-in page.
+    const auth = Object.entries(JSON.parse(fs.readFileSync(GROK_AUTH, 'utf8')));
+    token = auth.filter(([k]) => k.startsWith('https://auth.x.ai') || k === 'https://accounts.x.ai/sign-in')
+      .map(([, v]) => v?.key || v?.access_token).find((t) => typeof t === 'string' && t);
+  } catch {
+    /* falls through to the sign-in hint */
+  }
+  if (!token) return { error: 'No Grok sign-in — run `grok` to sign in.' };
+  const headers = { Authorization: `Bearer ${token}`, 'x-xai-token-auth': 'xai-grok-cli', Accept: 'application/json' };
+  try {
+    const [monthly, weekly] = await Promise.all([
+      fetchJson(GROK_BILLING_API, headers),
+      fetchJson(`${GROK_BILLING_API}?format=credits`, headers).catch((e) => e), // the weekly line must not cost the monthly one
+    ]);
+    const shaped = shapeXai(monthly, weekly instanceof Error ? null : weekly);
+    // On the unified weekly pool the monthly limit is 0 and the weekly lookup is all there is: its failure is the read's.
+    if (shaped.error && weekly instanceof Error) throw weekly;
+    return { ...shaped, updatedAt: Date.now() };
+  } catch (e) {
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
+    // `grok` renews the token only while it runs, so after a while away this is the usual answer.
+    if (e.status === 401 || e.status === 403) return { error: 'Grok sign-in expired — run `grok` to renew it.' };
+    // The billing endpoint answers 503 now and then: soft, so the last numbers stay up with this note until it recovers.
+    if (e.status >= 500) return { error: `xAI usage not refreshed (${e.message}).`, soft: true };
+    return { error: e.message || 'Request failed', soft: !!e.soft };
+  }
+}
+
 const PROVIDERS = [
   { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000, read: readClaude },
   { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', everyMs: 5 * 60_000, read: readCodex },
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
+  // xAI's mark is monochrome, so it wears the theme's own ink.
+  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', everyMs: 5 * 60_000, read: readXai },
 ];
 
-module.exports = { PROVIDERS, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };
+module.exports = { PROVIDERS, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { shapeApiCredit, creditExpired, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
+const { shapeApiCredit, creditExpired, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, shapeXai, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
 
 const now = Date.UTC(2026, 7, 29, 12, 0, 0);
 
@@ -72,6 +72,18 @@ assert.deepStrictEqual(go.rows.map((r) => [r.label, r.percent, r.resetsAt]), [
 assert.deepStrictEqual(shapeOpenCodeGo({ usage: { weekly: { percent: 7 } } }).rows.map((r) => r.label), ['Weekly']);
 assert.ok(shapeOpenCodeGo({ usage: {} }).error, 'no windows is an error, not a zero reading');
 assert.ok(shapeOpenCodeGo({ type: 'error' }).error, 'an error body is an error');
+
+// --- xAI: monthly credits from /billing, the weekly percentage from /billing?format=credits.
+const xaiMonthly = { config: { monthlyLimit: { val: 20000 }, used: { val: 5000 }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
+const xaiWeekly = { config: { creditUsagePercent: 42.5, currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', end: '2026-10-19T00:00:00Z' }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
+assert.deepStrictEqual(shapeXai(xaiMonthly, xaiWeekly).rows.map((r) => [r.label, r.percent, r.resetsAt]), [
+  ['Weekly', 42.5, '2026-10-19T00:00:00Z'], ['Monthly', 25, '2026-11-01T00:00:00Z'],
+], 'the weekly window resets at its own period end, not the billing month');
+assert.strictEqual(shapeXai({ config: { monthlyLimit: { val: '400' }, used: { val: '100' } } }, null).rows[0].percent, 25, 'credits sent as strings still count');
+assert.strictEqual(shapeXai(xaiMonthly, { config: { currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY' } } }).rows[0].percent, 0, 'a fresh week leaves the percentage out');
+assert.deepStrictEqual(shapeXai(xaiMonthly, { config: { currentPeriod: { type: 'USAGE_PERIOD_TYPE_MONTHLY' } } }).rows.map((r) => r.label), ['Monthly'], 'only a weekly period is the weekly line');
+assert.ok(shapeXai({ config: { monthlyLimit: { val: 0 }, used: { val: 0 } } }, null).error, 'no allowance is an error, not a zero reading');
+assert.ok(shapeXai({}, null).error, 'an answer of another shape is an error');
 
 // --- Claude: percent clamped, unknown kinds fall back to a model display name.
 const claude = shapeClaude(
@@ -234,6 +246,8 @@ configuredProvider.read()
   .then(async () => {
     fs.mkdirSync(path.join(codexHome, '.claude'));
     fs.writeFileSync(path.join(codexHome, '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token' } }));
+    fs.mkdirSync(path.join(codexHome, '.grok'));
+    fs.writeFileSync(path.join(codexHome, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::client': { key: 'test-token' } }));
     const originalFetch = global.fetch;
     const originalKey = process.env.OPENCODE_API_KEY;
     process.env.OPENCODE_API_KEY = 'test-key';
@@ -244,7 +258,7 @@ configuredProvider.read()
         let mode = 'recover';
         global.fetch = async (url, options) => {
           assert.ok(options.signal instanceof AbortSignal, 'every provider request has a deadline');
-          if (url.endsWith('/profile')) return { ok: true, json: async () => ({}) };
+          if (url.endsWith('/profile') || url.endsWith('format=credits')) return { ok: true, json: async () => ({}) };
           calls++;
           if (mode === 'offline' || (mode === 'recover' && calls === 1)) throw networkError();
           if (mode === 'timeout') return { ok: true, json: async () => { throw new DOMException('deadline', 'TimeoutError'); } };
@@ -253,6 +267,7 @@ configuredProvider.read()
             limits: [{ kind: 'session', percent: 12 }],
             rate_limit: { primary_window: { used_percent: 12, limit_window_seconds: 18000 } },
             usage: { rolling: { percent: 12 } },
+            config: { monthlyLimit: { val: 100 }, used: { val: 12 } },
           }) };
         };
         const recovered = await provider.read();
@@ -278,6 +293,52 @@ configuredProvider.read()
       global.fetch = originalFetch;
       if (originalKey === undefined) delete process.env.OPENCODE_API_KEY;
       else process.env.OPENCODE_API_KEY = originalKey;
+    }
+  })
+  .then(async () => {
+    // xAI: the token `grok` keeps reaches the request, the weekly line can fail on its own, and no sign-in
+    // says how to get one without asking anything.
+    const xai = require('./providers').PROVIDERS.find((p) => p.id === 'xai');
+    const grokAuth = path.join(codexHome, '.grok', 'auth.json');
+    const originalFetch = global.fetch;
+    const sent = [];
+    let weeklyDown = false;
+    global.fetch = async (url, options) => {
+      sent.push(options.headers.Authorization);
+      if (!url.endsWith('format=credits')) return { ok: true, json: async () => xaiMonthly };
+      if (weeklyDown) return { ok: false, status: 500, headers: new Headers() };
+      return { ok: true, json: async () => xaiWeekly };
+    };
+    try {
+      assert.deepStrictEqual((await xai.read()).rows.map((r) => r.label), ['Weekly', 'Monthly']);
+      assert.deepStrictEqual(sent, ['Bearer test-token', 'Bearer test-token'], 'both lookups carry the token grok keeps');
+      weeklyDown = true;
+      assert.deepStrictEqual((await xai.read()).rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
+      // The unified weekly pool: no monthly limit, so the weekly lookup failing is the read failing.
+      const pooled = { config: { monthlyLimit: { val: 0 }, used: { val: 0 }, billingPeriodEnd: '2026-11-01T00:00:00Z' } };
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => pooled });
+      const outage = await xai.read();
+      assert.ok(outage.soft && !outage.rows, 'an outage keeps the last reading on screen');
+      assert.strictEqual(outage.error, 'xAI usage not refreshed (HTTP 503).', 'and says why it did not move');
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) } : { ok: true, json: async () => pooled });
+      assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled weekly lookup gates xAI like any 429');
+      global.fetch = async (url, options) => {
+        sent.push(options.headers.Authorization);
+        return { ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : xaiMonthly) };
+      };
+      fs.writeFileSync(grokAuth, JSON.stringify({ 'https://accounts.x.ai/sign-in': { access_token: 'legacy-token' } }));
+      sent.length = 0;
+      await xai.read();
+      assert.strictEqual(sent[0], 'Bearer legacy-token', 'an older auth.json still signs in');
+      for (const body of [JSON.stringify({ 'https://auth.x.ai::client': {} }), 'null', null]) {
+        if (body === null) fs.rmSync(grokAuth);
+        else fs.writeFileSync(grokAuth, body);
+        sent.length = 0;
+        assert.match((await xai.read()).error, /run `grok` to sign in/, 'no sign-in says how to get one');
+        assert.strictEqual(sent.length, 0, 'and asks nothing');
+      }
+    } finally {
+      global.fetch = originalFetch;
     }
   })
   .then(async () => {

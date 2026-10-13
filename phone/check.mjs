@@ -29,12 +29,15 @@ const providers = (hot) => [
     rows: [{ label: 'Weekly', percent: hot ? 100 : 3, resets: 'in 6d 12h' }] },
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', plan: 'Go', ringPercent: hot ? 78 : 61, updatedAt: Date.now(), waitMs: 0,
     rows: [{ label: '5h limit', percent: 0, resets: 'in 5h' }, { label: 'Weekly', percent: 1, resets: 'in 4d 2h' }, { label: 'Monthly', percent: hot ? 78 : 61, resets: 'in 2d 23h' }] },
+  // Hot, xAI is the provider whose usage is unavailable: signed out, no numbers at all.
+  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: hot ? 0 : 42.5, updatedAt: Date.now(), waitMs: 0,
+    ...(hot ? { rows: [], error: 'Grok sign-in expired — run `grok` to renew it.' } : { rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }] }) },
 ];
 const options = {
   themes: THEME_GROUPS,
   providers: providers(false).map(({ id, name, glyph, color }) => ({ id, name, glyph, color })),
   choices: { claude: [['Highest limit', ''], ['Session', 'Session'], ['Weekly', 'All models'], ['Fable', 'Fable']], 'opencode-go': [['Highest limit', ''], ['5-hour', '5h limit'], ['Weekly', 'Weekly'], ['Monthly', 'Monthly']] },
-  pages: { claude: 'https://claude.ai/settings/usage', codex: 'https://chatgpt.com/codex/settings/usage' },
+  pages: { claude: 'https://claude.ai/settings/usage', codex: 'https://chatgpt.com/codex/settings/usage', xai: 'https://grok.com/?_s=usage' },
 };
 
 // ---- the stand-in PC: the same routes and answers as main.js's servePhone
@@ -46,7 +49,10 @@ let holdStreams = false; // a cut stream's reconnections wait, so a reconnect's 
 let dropUsage = false; // the next /api/usage connection ends unanswered, as the link ends it switching ways
 let opened = 0; // streams the page has opened
 const waiting = [];
-const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go'], choices: {} };
+const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai'], choices: {} };
+// Every provider on: the tallest tab. Its height is 6px above and below, 40.5px per provider, as fit() draws it.
+const COUNT = pc.enabled.length;
+const TAB = 8.5 + 40.5 * COUNT;
 const posts = [];
 const streams = new Set();
 // Numbered as main.js numbers them: the run of the overlay, and one more for each snapshot made.
@@ -160,7 +166,7 @@ const failures = [];
 const fail = (what) => failures.push(what) && console.log('FAIL ' + what);
 const rect = (page, sel) => page.$eval(sel, (e) => { const r = e.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom }; });
 const near = (a, b) => Math.abs(a - b) < 0.6;
-const windowFor = (z) => ({ width: Math.ceil(38 * z) + 12, height: Math.ceil(130 * z) + 24, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
+const windowFor = (z) => ({ width: Math.ceil(38 * z) + 12, height: Math.ceil(TAB * z) + 24, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
 const small = windowFor(1);
 try {
   const page = await browser.newPage();
@@ -221,16 +227,19 @@ try {
     await settle();
   };
   // Every control on screen lies inside the viewport: a page that hides its overflow passes a scrollWidth
-  // check with them cut off. Rows scrolled out of their list are not on screen, so they don't count.
+  // check with them cut off. Rows scrolled out of their list are not on screen, so they don't count, and of a
+  // row scrolled partly out only the part the list shows does.
   const outOfView = () => page.evaluate(() => {
     const W = innerWidth, H = innerHeight;
     return [...document.querySelectorAll('#tab, #tab .dial, #tab b, #card, #card button, #card input, #card header, #card .row, #card p')].flatMap((e) => {
-      const r = e.getBoundingClientRect();
-      if (!r.width || !r.height) return [];
+      const b = e.getBoundingClientRect();
+      if (!b.width || !b.height) return [];
+      const r = { left: b.left, top: b.top, right: b.right, bottom: b.bottom };
       const list = e.closest('#usage, #prefs');
       if (list && list !== e) {
         const c = list.getBoundingClientRect();
         if (r.bottom <= c.top || r.top >= c.bottom) return [];
+        [r.top, r.bottom] = [Math.max(r.top, c.top), Math.min(r.bottom, c.bottom)];
       }
       return r.left < -0.5 || r.top < -0.5 || r.right > W + 0.5 || r.bottom > H + 0.5 ? [(e.id || e.className || e.tagName) + ' at ' + [r.left, r.top, r.right, r.bottom].map(Math.round)] : [];
     });
@@ -241,7 +250,7 @@ try {
     const t = await rect(page, '#tab');
     const c = await rect(page, '#card');
     if (side === 'right' ? Math.abs(t.r - width) > 1 : Math.abs(t.l) > 1) fail(`${tag}: the tab isn't flush with the ${side} edge: ${t.l.toFixed(1)} to ${t.r.toFixed(1)}`);
-    if (!near(t.r - t.l, 38 * z) || !near(t.b - t.t, 130 * z)) fail(`${tag}: the tab is ${(t.r - t.l).toFixed(1)}x${(t.b - t.t).toFixed(1)}`);
+    if (!near(t.r - t.l, 38 * z) || !near(t.b - t.t, TAB * z)) fail(`${tag}: the tab is ${(t.r - t.l).toFixed(1)}x${(t.b - t.t).toFixed(1)}`);
     if (t.t < 36 - 0.5 || t.b > height - 60 + 0.5) fail(`${tag}: the tab is outside the bars, ${t.t.toFixed(1)} to ${t.b.toFixed(1)}`);
     if (side === 'right' ? c.r > t.l - 8 + 0.5 : c.l < t.r + 8 - 0.5) fail(`${tag}: panel over the tab, panel ${c.l.toFixed(1)} to ${c.r.toFixed(1)}, tab ${t.l.toFixed(1)} to ${t.r.toFixed(1)}`);
     const spilt = await page.evaluate(({ l, t, r, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.left < l + 1 || x.right > r - 1 || x.top < t || x.bottom > b; }).length, t);
@@ -255,7 +264,16 @@ try {
     answer = state === 'down' ? 'ok' : state; // down: it has seen the PC once, then loses it
     await page.setViewport(small); // before the page: a blank one has no viewport tag, so its width is 980
     await page.goto(url, { waitUntil: 'load' });
-    await page.waitForFunction(() => document.querySelectorAll('#cells .cell .dial').length === 3);
+    await page.waitForFunction((n) => document.querySelectorAll('#cells .cell .dial').length === n, {}, COUNT);
+    // xAI wears the theme's ink. Signed out (hot), its ring shows a dash and its section says how to sign in.
+    const xai = await page.evaluate(() => {
+      const cell = document.querySelectorAll('#cells .cell')[3];
+      return { fill: getComputedStyle(cell.querySelector('.logo')).fill, ink: getComputedStyle(document.body).color, num: cell.querySelector('b').textContent, off: cell.classList.contains('off'), status: [...document.querySelectorAll('#sections .status')].map((e) => e.textContent) };
+    });
+    if (xai.fill !== xai.ink) fail(`${state}: the xAI mark is ${xai.fill}, not the theme's ink ${xai.ink}`);
+    const signedOut = state === 'hot';
+    if (signedOut !== xai.off || xai.num !== (signedOut ? '—' : '43%')) fail(`${state}: the xAI ring reads ${xai.num}${xai.off ? ', off' : ''}`);
+    if (signedOut !== xai.status.includes('Grok sign-in expired — run grok to renew it.')) fail(`${state}: the xAI section says ${JSON.stringify(xai.status)}`);
     if (state === 'down') {
       answer = 'down';
       await page.evaluate(() => load());
@@ -273,7 +291,7 @@ try {
       await page.screenshot({ path: path.join(shots, `tab-${state}-${pose}.png`), omitBackground: true });
       const t = await rect(page, '#tab');
       const home = { right: 12, left: 0, lifted: 6, peek: 12 }[pose];
-      if (!near(t.l, home) || !near(t.t, 12) || !near(t.r - t.l, 38) || !near(t.b - t.t, 130)) fail(`${state} ${pose}: tab at ${t.l},${t.t} ${t.r - t.l}x${t.b - t.t}`);
+      if (!near(t.l, home) || !near(t.t, 12) || !near(t.r - t.l, 38) || !near(t.b - t.t, TAB)) fail(`${state} ${pose}: tab at ${t.l},${t.t} ${t.r - t.l}x${t.b - t.t}`);
       const out = await page.evaluate(({ l, t, r, b }) =>
         [...document.querySelectorAll('#tab .dial, #tab b, #lip i')].filter((e) => {
           const x = e.getBoundingClientRect();
@@ -343,7 +361,7 @@ try {
   answer = 'ok';
   await page.setViewport(small);
   await page.goto(url, { waitUntil: 'load' });
-  await page.waitForFunction(() => document.querySelectorAll('#cells .cell .dial').length === 3);
+  await page.waitForFunction((n) => document.querySelectorAll('#cells .cell .dial').length === n, {}, COUNT);
   for (const [width, height, side] of [[320, 700], [375, 812], [412, 915], [768, 1024], [1024, 768], [1280, 800]].flatMap(([w, h]) => [[w, h, 'right'], [w, h, 'left']])) {
     const tag = `settings ${width}x${height} ${side}`;
     await open(width, height, side, 120);
@@ -550,16 +568,16 @@ try {
   if (!painted.includes('--bg:') || pc.theme !== 'paper') fail(`theme: the page wears "${painted.slice(0, 40)}", the PC "${pc.theme}"`);
   await page.screenshot({ path: path.join(shots, 'settings-412-paper.png') });
   await page.click('#prefs [data-provider="codex"]');
-  await until(() => document.querySelectorAll('#cells .cell').length === 2, 'providers: Codex off the tab');
-  // The tab shrinks to the two left, and they still fit inside it.
+  await until((n) => document.querySelectorAll('#cells .cell').length === n, 'providers: Codex off the tab', COUNT - 1);
+  // The tab shrinks to the ones left, and they still fit inside it.
   await settle();
-  const two = await rect(page, '#tab');
-  if (!near(two.b - two.t, 89.5)) fail(`providers: with two the tab is ${(two.b - two.t).toFixed(1)} tall`);
-  const tight = await page.evaluate(({ t, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.top < t + 4 || x.bottom > b - 4; }).length, two);
-  if (tight) fail(`providers: with two, ${tight} rings or numbers crowd the tab's ends`);
-  if (!posts.some((p) => p.body.enabled && !p.body.enabled.includes('codex') && p.body.enabled.length === 2)) fail(`providers: the PC got ${JSON.stringify(posts.at(-1))}`);
+  const fewer = await rect(page, '#tab');
+  if (!near(fewer.b - fewer.t, TAB - 40.5)) fail(`providers: with one fewer the tab is ${(fewer.b - fewer.t).toFixed(1)} tall`);
+  const tight = await page.evaluate(({ t, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.top < t + 4 || x.bottom > b - 4; }).length, fewer);
+  if (tight) fail(`providers: with one fewer, ${tight} rings or numbers crowd the tab's ends`);
+  if (!posts.some((p) => p.body.enabled && !p.body.enabled.includes('codex') && p.body.enabled.length === COUNT - 1)) fail(`providers: the PC got ${JSON.stringify(posts.at(-1))}`);
   await page.click('#prefs [data-provider="codex"]');
-  await until(() => document.querySelectorAll('#cells .cell').length === 3, 'providers: Codex back on the tab');
+  await until((n) => document.querySelectorAll('#cells .cell').length === n, 'providers: Codex back on the tab', COUNT);
   await page.click('#prefs [data-choice="claude"][data-row="Session"]');
   await until(() => document.querySelector('[data-choice="claude"][data-row="Session"]').getAttribute('aria-pressed') === 'true', 'summary: Session marked chosen');
   if (pc.choices.claude !== 'Session') fail(`summary: the PC has ${JSON.stringify(pc.choices)}`);
@@ -687,7 +705,7 @@ try {
     await settle();
     const t = await rect(page, '#tab');
     const win = windowFor(z);
-    if (t.r > win.width + 0.5 || t.b > win.height || !near(t.r - t.l, 38 * z) || !near(t.b - t.t, 130 * z)) fail(`size ${z}: tab ${t.l},${t.t} to ${t.r},${t.b} in a ${win.width}x${win.height} window`);
+    if (t.r > win.width + 0.5 || t.b > win.height || !near(t.r - t.l, 38 * z) || !near(t.b - t.t, TAB * z)) fail(`size ${z}: tab ${t.l},${t.t} to ${t.r},${t.b} in a ${win.width}x${win.height} window`);
     const out = await page.evaluate(({ l, t, r, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.left < l + 1 || x.right > r - 1 || x.top < t || x.bottom > b; }).length, t);
     if (out) fail(`size ${z}: ${out} rings or numbers outside the tab`);
     await page.screenshot({ path: path.join(shots, `tab-size-${z}.png`), omitBackground: true });
