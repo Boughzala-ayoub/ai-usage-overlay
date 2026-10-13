@@ -522,6 +522,34 @@ async function mainChecks() {
     assert.strictEqual(gate.get('claude'), clock + 60_000, 'gate counts from receipt');
     Date.now = realNow;
 
+    // xAI asks twice per read. A throttled weekly lookup gates xAI though the monthly one answered: the
+    // reading on screen stays whole, says why, and nothing more is asked before Retry-After.
+    const xai = { ...require('./providers').PROVIDERS.find((p) => p.id === 'xai'), everyMs: 0 };
+    const originalFetch = global.fetch;
+    let xaiAsked = 0;
+    let weeklyAnswer = () => ({ ok: true, json: async () => ({ config: { ...xaiWeekly.config, creditUsagePercent: 96 } }) });
+    global.fetch = async (url) => {
+      xaiAsked++;
+      return url.endsWith('format=credits') ? weeklyAnswer() : { ok: true, json: async () => ({ config: { monthlyLimit: { val: 400 }, used: { val: 100 } } }) };
+    };
+    fs.writeFileSync(path.join(codexHome, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::client': { key: 'test-token' } }));
+    try {
+      await readOne(xai, true);
+      weeklyAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
+      await readOne(xai, true);
+      assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 96], ['Monthly', 25]], 'a throttled weekly lookup keeps the reading on screen');
+      assert.strictEqual(last.get('xai').note, 'Rate limited', 'and says why it did not move');
+      assert.ok(gate.get('xai') >= Date.now() + 89_000, 'gated by the weekly lookup\'s Retry-After');
+      xaiAsked = 0;
+      await readOne(xai, true);
+      await readOne(xai, true);
+      assert.strictEqual(xaiAsked, 0, 'refreshes by hand wait out the gate');
+    } finally {
+      global.fetch = originalFetch;
+      gate.delete('xai');
+      last.delete('xai');
+    }
+
     // A save that fails partway, writing or replacing, leaves the last good file whole and keeps its
     // changes for the next save.
     saveState({ theme: 'paper' });

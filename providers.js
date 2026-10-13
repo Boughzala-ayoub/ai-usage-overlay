@@ -441,8 +441,9 @@ async function readXai() {
       fetchJson(`${GROK_BILLING_API}?format=credits`, headers).catch((e) => e), // the weekly line must not cost the monthly one
     ]);
     const shaped = shapeXai(monthly, weekly instanceof Error ? null : weekly);
-    // On the unified weekly pool the monthly limit is 0 and the weekly lookup is all there is: its failure is the read's.
-    if (shaped.error && weekly instanceof Error) throw weekly;
+    // A 429 gates xAI as a whole, whichever lookup drew it. On the unified weekly pool the monthly limit is 0
+    // and the weekly lookup is all there is: then any failure of it is the read's.
+    if (weekly instanceof Error && (weekly.status === 429 || shaped.error)) throw weekly;
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
