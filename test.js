@@ -627,6 +627,10 @@ async function mainChecks() {
       await readOne(xai, true);
       assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note, renewals], [2, 'terminated', 1], 'a renewal cut off mid-body is soft and not retried');
       assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and leaves auth.json as it was');
+      tokenAnswer = () => ({ ok: true, json: async () => ({ refresh_token: 'r2', expires_in: 21600 }) });
+      await readOne(xai, true);
+      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note], [2, 'Grok sign-in not renewed (no access token).'], 'an answer with no access token is soft');
+      assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and never reaches auth.json');
     } finally {
       Date.now = realNow;
       global.fetch = originalFetch;

@@ -438,6 +438,8 @@ async function renewGrok(k, v) {
     // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
     if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: [400, 401, 403].includes(r.status) ? 401 : r.status });
     t = await r.json();
+    // Checked before auth.json changes: without it the saved key would vanish, and the next read finds no sign-in.
+    if (typeof t?.access_token !== 'string' || !t.access_token) throw new Error('Grok sign-in not renewed (no access token).');
   } catch (e) {
     if (e.status) throw e;
     // The body can fail after the headers, and that is as soft as no answer at all.
