@@ -29,18 +29,21 @@ const TAIL_BYTES = 256 * 1024; // rollout files grow to MBs; the last rate_limit
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 
+// A failed answer as an error with its status and its Retry-After in seconds, seconds or an HTTP date.
+async function httpError(r) {
+  const e = new Error(`HTTP ${r.status}`);
+  e.status = r.status;
+  const retry = r.headers.get('retry-after');
+  e.retryAfter = Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
+  await r.body?.cancel();
+  return e;
+}
+
 async function fetchJson(url, headers) {
   for (let attempt = 0; ; attempt++) {
     try {
       const r = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
-      if (!r.ok) {
-        const e = new Error(`HTTP ${r.status}`);
-        e.status = r.status;
-        const retry = r.headers.get('retry-after');
-        e.retryAfter = Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
-        await r.body?.cancel();
-        throw e;
-      }
+      if (!r.ok) throw await httpError(r);
       return await r.json();
     } catch (e) {
       const transport = !e.status && (e instanceof TypeError || e.name === 'TimeoutError');
@@ -435,8 +438,12 @@ async function renewGrok(k, v) {
       body: new URLSearchParams({ grant_type: 'refresh_token', client_id: v.oidc_client_id || k.split('::')[1], refresh_token: v.refresh_token }),
       signal: AbortSignal.timeout(15_000),
     });
-    // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
-    if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: [400, 401, 403].includes(r.status) ? 401 : r.status });
+    if (!r.ok) {
+      const e = await httpError(r); // a 429 keeps its Retry-After for the gate
+      // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
+      if ([400, 401, 403].includes(e.status)) e.status = 401;
+      throw e;
+    }
     t = await r.json();
     // Checked before auth.json changes: without it the saved key would vanish, and the next read finds no sign-in.
     if (typeof t?.access_token !== 'string' || !t.access_token) throw new Error('Grok sign-in not renewed (no access token).');

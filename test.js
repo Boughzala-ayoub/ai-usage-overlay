@@ -343,7 +343,7 @@ configuredProvider.read()
       global.fetch = async (url, options) => {
         if (url === 'https://auth.x.ai/oauth2/token') {
           renewals.push(Object.fromEntries(options.body));
-          return refuse ? { ok: false, status: 400 } : { ok: true, json: async () => ({ access_token: 'new-token', refresh_token: 'r2', expires_in: 21600 }) };
+          return refuse ? { ok: false, status: 400, headers: new Headers() } : { ok: true, json: async () => ({ access_token: 'new-token', refresh_token: 'r2', expires_in: 21600 }) };
         }
         sent.push(options.headers.Authorization);
         return { ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : pooled) };
@@ -631,6 +631,22 @@ async function mainChecks() {
       await readOne(xai, true);
       assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note], [2, 'Grok sign-in not renewed (no access token).'], 'an answer with no access token is soft');
       assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and never reaches auth.json');
+      // A throttled renewal gates xAI for its Retry-After, in seconds or as an HTTP date, not the 60s fallback.
+      clock = realNow();
+      Date.now = () => clock;
+      for (const [kind, retryAfter] of [['seconds', () => '3600'], ['an HTTP date', () => new Date(clock + 3600_000).toUTCString()]]) {
+        gate.delete('xai');
+        tokenAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': retryAfter() }) });
+        renewals = 0;
+        await readOne(xai, true);
+        clock += 61_000;
+        await readOne(xai, true);
+        assert.strictEqual(renewals, 1, `a renewal throttled by Retry-After in ${kind} waits out the hour`);
+        clock += 3_540_000;
+        await readOne(xai, true);
+        assert.strictEqual(renewals, 2, 'and asks again after it');
+      }
+      Date.now = realNow;
     } finally {
       Date.now = realNow;
       global.fetch = originalFetch;
