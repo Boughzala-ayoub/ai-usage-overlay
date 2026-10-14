@@ -18,6 +18,7 @@ const OPENCODE_AUTH = path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.l
 const OPENCODE_GO_API = 'https://opencode.ai/zen/go/v1/usage';
 const GROK_AUTH = path.join(HOME, '.grok', 'auth.json');
 const GROK_BILLING_API = 'https://cli-chat-proxy.grok.com/v1/billing';
+const GROK_TOKEN_API = 'https://auth.x.ai/oauth2/token';
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -423,19 +424,58 @@ function shapeXai(monthly, weekly) {
   return rows.length ? { plan: '', rows } : { error: 'No usage windows reported.' };
 }
 
+// `grok` renews its six-hour token only while it runs. Past expiry the overlay renews it the same way and writes
+// it back, so `grok` starts from the new tokens if xAI rotated the refresh token.
+async function renewGrok(k, v) {
+  let r;
+  try {
+    // No retry, unlike fetchJson: a lost answer may already have spent the refresh token.
+    r = await fetch(GROK_TOKEN_API, {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: v.oidc_client_id || k.split('::')[1], refresh_token: v.refresh_token }),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (e) {
+    throw Object.assign(new Error(e.name === 'TimeoutError' ? 'Request timed out' : e.message), { soft: true });
+  }
+  // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
+  if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: [400, 401, 403].includes(r.status) ? 401 : r.status });
+  const t = await r.json();
+  const all = JSON.parse(fs.readFileSync(GROK_AUTH, 'utf8'));
+  // If `grok` renewed it meanwhile, its tokens stay.
+  if (all[k]?.refresh_token === v.refresh_token) {
+    const now = Date.now();
+    all[k] = {
+      ...all[k],
+      [all[k].key ? 'key' : 'access_token']: t.access_token,
+      refresh_token: t.refresh_token || v.refresh_token,
+      create_time: new Date(now).toISOString(),
+      expires_at: new Date(now + (Number(t.expires_in) || 3600) * 1000).toISOString(),
+    };
+    const tmp = `${GROK_AUTH}.overlay`;
+    fs.writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, GROK_AUTH);
+  }
+  return t.access_token;
+}
+
 async function readXai() {
-  let token;
+  let entry;
   try {
     // Keyed by issuer and client ("https://auth.x.ai::<client>"); older builds keyed it by the sign-in page.
-    const auth = Object.entries(JSON.parse(fs.readFileSync(GROK_AUTH, 'utf8')));
-    token = auth.filter(([k]) => k.startsWith('https://auth.x.ai') || k === 'https://accounts.x.ai/sign-in')
-      .map(([, v]) => v?.key || v?.access_token).find((t) => typeof t === 'string' && t);
+    entry = Object.entries(JSON.parse(fs.readFileSync(GROK_AUTH, 'utf8'))).find(([k, v]) => {
+      const t = v?.key || v?.access_token;
+      return (k.startsWith('https://auth.x.ai') || k === 'https://accounts.x.ai/sign-in') && typeof t === 'string' && t;
+    });
   } catch {
     /* falls through to the sign-in hint */
   }
-  if (!token) return { error: 'No Grok sign-in — run `grok` to sign in.' };
-  const headers = { Authorization: `Bearer ${token}`, 'x-xai-token-auth': 'xai-grok-cli', Accept: 'application/json' };
+  if (!entry) return { error: 'No Grok sign-in — run `grok` to sign in.' };
+  const [k, v] = entry;
   try {
+    const expired = v.refresh_token && Date.parse(v.expires_at) < Date.now() + MIN;
+    const token = expired ? await renewGrok(k, v) : v.key || v.access_token;
+    const headers = { Authorization: `Bearer ${token}`, 'x-xai-token-auth': 'xai-grok-cli', Accept: 'application/json' };
     // Each lookup stands alone: one that fails costs only its own line.
     const answers = await Promise.all([GROK_BILLING_API, `${GROK_BILLING_API}?format=credits`].map((url) => fetchJson(url, headers).catch((e) => e)));
     const failed = answers.filter((a) => a instanceof Error);
@@ -453,7 +493,7 @@ async function readXai() {
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
-    // `grok` renews the token only while it runs, so after a while away this is the usual answer.
+    // A refresh token xAI no longer takes, or a token renewed elsewhere and revoked.
     if (e.status === 401 || e.status === 403) return { error: 'Grok sign-in expired — run `grok` to renew it.' };
     // The billing endpoint answers 503 now and then: soft, so the last numbers stay up with this note until it recovers.
     if (e.status >= 500) return { error: `xAI usage not refreshed (${e.message}).`, soft: true };

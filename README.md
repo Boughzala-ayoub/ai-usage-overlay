@@ -53,8 +53,9 @@ xAI is the SuperGrok allowance that Grok Build's `/usage` shows. The token is th
 `~/.grok/auth.json`, re-read on every refresh. `/billing?format=credits` gives the weekly percentage
 and when it resets. `/billing` gives monthly credits, and the panel adds a Monthly line only when the
 plan has a monthly limit. On xAI's unified weekly pool that limit is 0, so there is one line. `grok`
-renews its token only while it runs, so after a while away the xAI section says to run `grok`, and
-the chip shows a dash. The endpoint is the CLI's own, not a public API. If its answer changes shape,
+renews its six-hour token only while it runs, so once it has expired the overlay renews it with the
+refresh token and writes the new tokens back to `auth.json` for `grok`. Only if xAI refuses the
+refresh token does the xAI section say to run `grok`, with a dash on the chip. The endpoint is the CLI's own, not a public API. If its answer changes shape,
 the section says no usage windows were reported. xAI's mark is monochrome, so on both screens it
 takes the theme's text colour.
 

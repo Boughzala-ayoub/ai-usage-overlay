@@ -335,6 +335,32 @@ configuredProvider.read()
       assert.strictEqual(outage.error, 'xAI usage not refreshed (HTTP 503).', 'and says why it did not move');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) } : { ok: true, json: async () => pooled });
       assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled weekly lookup gates xAI like any 429');
+      // An expired token is renewed with the refresh token and written back for `grok`, keeping the entry's other fields.
+      const lapsed = { key: 'old-token', refresh_token: 'r1', expires_at: '2026-01-01T00:00:00Z', oidc_client_id: 'cid', email: 'me@x' };
+      fs.writeFileSync(grokAuth, JSON.stringify({ 'https://auth.x.ai::cid': lapsed }));
+      const renewals = [];
+      let refuse = false;
+      global.fetch = async (url, options) => {
+        if (url === 'https://auth.x.ai/oauth2/token') {
+          renewals.push(Object.fromEntries(options.body));
+          return refuse ? { ok: false, status: 400 } : { ok: true, json: async () => ({ access_token: 'new-token', refresh_token: 'r2', expires_in: 21600 }) };
+        }
+        sent.push(options.headers.Authorization);
+        return { ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : pooled) };
+      };
+      sent.length = 0;
+      assert.ok((await xai.read()).rows, 'a renewed token reads');
+      assert.deepStrictEqual(renewals, [{ grant_type: 'refresh_token', client_id: 'cid', refresh_token: 'r1' }]);
+      assert.deepStrictEqual(sent, ['Bearer new-token', 'Bearer new-token'], 'both lookups carry the renewed token');
+      const saved = JSON.parse(fs.readFileSync(grokAuth, 'utf8'))['https://auth.x.ai::cid'];
+      assert.deepStrictEqual([saved.key, saved.refresh_token, saved.email], ['new-token', 'r2', 'me@x'], 'grok gets the new tokens');
+      assert.ok(Date.parse(saved.expires_at) > Date.now() + 5 * 3600_000, 'with the new expiry');
+      await xai.read();
+      assert.strictEqual(renewals.length, 1, 'a live token is not renewed again');
+      fs.writeFileSync(grokAuth, JSON.stringify({ 'https://auth.x.ai::cid': lapsed }));
+      refuse = true;
+      assert.match((await xai.read()).error, /sign-in expired/, 'a refused refresh token asks for `grok`');
+      assert.strictEqual(JSON.parse(fs.readFileSync(grokAuth, 'utf8'))['https://auth.x.ai::cid'].key, 'old-token', 'and leaves the file alone');
       global.fetch = async (url, options) => {
         sent.push(options.headers.Authorization);
         return { ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : xaiMonthly) };
