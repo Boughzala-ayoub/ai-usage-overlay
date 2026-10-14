@@ -634,9 +634,15 @@ async function mainChecks() {
       // A throttled renewal gates xAI for its Retry-After, in seconds or as an HTTP date, not the 60s fallback.
       clock = realNow();
       Date.now = () => clock;
-      for (const [kind, retryAfter] of [['seconds', () => '3600'], ['an HTTP date', () => new Date(clock + 3600_000).toUTCString()]]) {
+      // A body that broke before it was dropped changes nothing: cancelling it rejects, the status and wait stand.
+      const broken = (status, headers) => new Response(new ReadableStream({ start(c) { c.error(new TypeError('body connection terminated')); } }), { status, headers });
+      for (const [kind, answer] of [
+        ['seconds', () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': '3600' }) })],
+        ['an HTTP date', () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': new Date(clock + 3600_000).toUTCString() }) })],
+        ['seconds with a broken body', () => broken(429, { 'retry-after': '3600' })],
+      ]) {
         gate.delete('xai');
-        tokenAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': retryAfter() }) });
+        tokenAnswer = answer;
         renewals = 0;
         await readOne(xai, true);
         clock += 61_000;
@@ -646,6 +652,10 @@ async function mainChecks() {
         await readOne(xai, true);
         assert.strictEqual(renewals, 2, 'and asks again after it');
       }
+      gate.delete('xai');
+      tokenAnswer = () => broken(400);
+      await readOne(xai, true);
+      assert.match(last.get('xai').error, /Grok sign-in expired/, 'a refused refresh token with a broken body still says to run grok');
       Date.now = realNow;
     } finally {
       Date.now = realNow;

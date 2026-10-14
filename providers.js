@@ -35,7 +35,7 @@ async function httpError(r) {
   e.status = r.status;
   const retry = r.headers.get('retry-after');
   e.retryAfter = Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
-  await r.body?.cancel();
+  await r.body?.cancel().catch(() => {}); // a body that already broke rejects here; the status still stands
   return e;
 }
 
