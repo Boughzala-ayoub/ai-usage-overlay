@@ -613,6 +613,20 @@ async function mainChecks() {
       monthlyAnswer = monthly(99);
       await readOne(xai, true);
       assert.deepStrictEqual([last.get('xai').rows.length, last.get('xai').note], [2, undefined], 'both back, the note goes');
+      // An expired token whose renewal fails keeps the reading on screen and leaves auth.json as it was.
+      const grokFile = path.join(codexHome, '.grok', 'auth.json');
+      const lapsedAuth = JSON.stringify({ 'https://auth.x.ai::cid': { key: 'old-token', refresh_token: 'r1', expires_at: '2026-01-01T00:00:00Z', oidc_client_id: 'cid' } });
+      fs.writeFileSync(grokFile, lapsedAuth);
+      let tokenAnswer;
+      let renewals = 0;
+      global.fetch = async (url) => {
+        if (url === 'https://auth.x.ai/oauth2/token') return (renewals++, tokenAnswer());
+        return url.endsWith('format=credits') ? weeklyAnswer() : monthlyAnswer();
+      };
+      tokenAnswer = () => ({ ok: true, json: async () => { throw new TypeError('terminated'); } });
+      await readOne(xai, true);
+      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note, renewals], [2, 'terminated', 1], 'a renewal cut off mid-body is soft and not retried');
+      assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and leaves auth.json as it was');
     } finally {
       Date.now = realNow;
       global.fetch = originalFetch;

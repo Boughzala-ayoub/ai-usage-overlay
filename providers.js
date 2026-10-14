@@ -427,20 +427,22 @@ function shapeXai(monthly, weekly) {
 // `grok` renews its six-hour token only while it runs. Past expiry the overlay renews it the same way and writes
 // it back, so `grok` starts from the new tokens if xAI rotated the refresh token.
 async function renewGrok(k, v) {
-  let r;
+  let t;
   try {
     // No retry, unlike fetchJson: a lost answer may already have spent the refresh token.
-    r = await fetch(GROK_TOKEN_API, {
+    const r = await fetch(GROK_TOKEN_API, {
       method: 'POST',
       body: new URLSearchParams({ grant_type: 'refresh_token', client_id: v.oidc_client_id || k.split('::')[1], refresh_token: v.refresh_token }),
       signal: AbortSignal.timeout(15_000),
     });
+    // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
+    if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: [400, 401, 403].includes(r.status) ? 401 : r.status });
+    t = await r.json();
   } catch (e) {
+    if (e.status) throw e;
+    // The body can fail after the headers, and that is as soft as no answer at all.
     throw Object.assign(new Error(e.name === 'TimeoutError' ? 'Request timed out' : e.message), { soft: true });
   }
-  // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
-  if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: [400, 401, 403].includes(r.status) ? 401 : r.status });
-  const t = await r.json();
   const all = JSON.parse(fs.readFileSync(GROK_AUTH, 'utf8'));
   // If `grok` renewed it meanwhile, its tokens stay.
   if (all[k]?.refresh_token === v.refresh_token) {
