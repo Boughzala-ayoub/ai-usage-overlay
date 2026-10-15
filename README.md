@@ -49,7 +49,11 @@ Code rotates it in place.
 OpenCode Go reports three rolling windows, 5-hour, weekly and monthly, as percentages of the plan's
 dollar caps. The key is the same one `opencode` sends with every Go request.
 
-xAI is the SuperGrok allowance that Grok Build's `/usage` shows. The token is the one `grok` keeps in
+xAI is the SuperGrok allowance that Grok Build's `/usage` shows. The overlay asks Cursor for it
+first, signed in with the Cursor CLI's token in `%APPDATA%\Cursor\auth.json`. On an account merged
+with xAI, Cursor's weekly included usage is the same pool, with the same reset, and Cursor kept
+answering while xAI's weekly lookup returned 500 for hours. With no Cursor sign-in, no merged plan,
+or no answer from Cursor, the overlay reads xAI's own endpoints. The token is the one `grok` keeps in
 `~/.grok/auth.json`, re-read on every refresh. `/billing?format=credits` gives the weekly percentage
 and when it resets. `/billing` gives monthly credits, and the panel adds a Monthly line only when the
 plan has a monthly limit. On xAI's unified weekly pool that limit is 0, so there is one line. `grok`

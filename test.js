@@ -140,6 +140,8 @@ assert.deepStrictEqual(
   ).map((r) => r.label),
   ['Session']
 );
+// Under a point is rounding between two reports of one pool, xAI's whole 17 against Cursor's 17.75; a point is a reset.
+assert.deepStrictEqual(resetRows([{ label: 'Weekly', percent: 17.75 }, { label: 'Session', percent: 1 }], [{ label: 'Weekly', percent: 17 }, { label: 'Session', percent: 0 }]).map((r) => r.label), ['Session']);
 
 // --- Reset text, from both time formats.
 assert.strictEqual(fmtReset(null, now), '');
@@ -193,11 +195,12 @@ const orcaFile = path.join(orcaDir, 'rollout-orca.jsonl');
 fs.writeFileSync(orcaFile, JSON.stringify({ timestamp: '2026-08-30T00:30:00Z', payload: { rate_limits: { primary: { used_percent: 20, window_minutes: 10080 } } } }) + '\n');
 fs.utimesSync(orcaFile, new Date(), new Date(Date.now() + 30_000));
 
-// providers.js reads its paths once, at require. Orca's root is set too, or the test reads the real one.
+// providers.js reads its paths once, at require. Orca's root and APPDATA (Cursor's sign-in) are set too, or the
+// test reads the real ones.
 function loadCodex(home, orca) {
-  const saved = { CODEX_HOME: process.env.CODEX_HOME, ORCA_CODEX_HOME: process.env.ORCA_CODEX_HOME };
+  const saved = { CODEX_HOME: process.env.CODEX_HOME, ORCA_CODEX_HOME: process.env.ORCA_CODEX_HOME, APPDATA: process.env.APPDATA };
   const homedir = os.homedir;
-  Object.assign(process.env, { CODEX_HOME: home, ORCA_CODEX_HOME: orca });
+  Object.assign(process.env, { CODEX_HOME: home, ORCA_CODEX_HOME: orca, APPDATA: path.join(home, 'AppData') });
   os.homedir = () => home;
   delete require.cache[require.resolve('./providers')];
   const codex = require('./providers').PROVIDERS.find((p) => p.id === 'codex');
@@ -335,6 +338,34 @@ configuredProvider.read()
       assert.strictEqual(outage.error, 'xAI usage not refreshed (HTTP 503).', 'and says why it did not move');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) } : { ok: true, json: async () => pooled });
       assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled weekly lookup gates xAI like any 429');
+      // Cursor reports the same pool to an account merged with xAI, signed in as the Cursor CLI, and is asked first.
+      const cursorAuth = path.join(codexHome, 'AppData', 'Cursor', 'auth.json');
+      fs.mkdirSync(path.dirname(cursorAuth), { recursive: true });
+      fs.writeFileSync(cursorAuth, JSON.stringify({ accessToken: 'cursor-token', refreshToken: 'cursor-refresh' }));
+      let merged = true;
+      let cursorStatus = 200;
+      const cursorAsked = [];
+      const xaiAsked = [];
+      global.fetch = async (url, options) => {
+        if (url.startsWith('https://api2.cursor.sh/')) {
+          cursorAsked.push([url.split('/').pop(), options.method, options.headers.Authorization, options.body]);
+          if (cursorStatus !== 200) return { ok: false, status: cursorStatus, headers: new Headers() };
+          return { ok: true, json: async () => (url.endsWith('/GetPlanInfo')
+            ? { planInfo: { includedUsagePeriod: 'INCLUDED_USAGE_PERIOD_WEEKLY', includedUsageResetsAt: '1792450993754' }, ...(merged ? { isMerged: true } : {}) }
+            : { planUsage: { totalPercentUsed: 17.746478873239436 } }) };
+        }
+        xaiAsked.push(url);
+        return url.endsWith('format=credits') ? { ok: false, status: 500, headers: new Headers() } : { ok: true, json: async () => pooled };
+      };
+      const viaCursor = await xai.read();
+      assert.deepStrictEqual([viaCursor.rows.map((r) => [r.label, r.percent, r.resetsAt]), viaCursor.note, viaCursor.error], [[['Weekly', 17.746478873239436, '2026-10-19T23:03:13.754Z']], undefined, undefined], "Cursor's weekly pool is xAI's reading");
+      assert.deepStrictEqual(cursorAsked.sort(), [['GetCurrentPeriodUsage', 'POST', 'Bearer cursor-token', '{}'], ['GetPlanInfo', 'POST', 'Bearer cursor-token', '{}']]);
+      assert.strictEqual(xaiAsked.length, 0, 'and xAI is not asked');
+      merged = false;
+      assert.strictEqual((await xai.read()).error, 'xAI usage not refreshed (HTTP 500).', "an unmerged Cursor plan is its own, so xAI's endpoints answer");
+      [merged, cursorStatus] = [true, 401];
+      assert.strictEqual((await xai.read()).error, 'xAI usage not refreshed (HTTP 500).', "and so do they when Cursor refuses its sign-in");
+      fs.rmSync(cursorAuth);
       // An expired token is renewed with the refresh token and written back for `grok`, keeping the entry's other fields.
       const lapsed = { key: 'old-token', refresh_token: 'r1', expires_at: '2026-01-01T00:00:00Z', oidc_client_id: 'cid', email: 'me@x' };
       fs.writeFileSync(grokAuth, JSON.stringify({ 'https://auth.x.ai::cid': lapsed }));

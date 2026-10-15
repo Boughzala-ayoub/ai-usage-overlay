@@ -19,6 +19,8 @@ const OPENCODE_GO_API = 'https://opencode.ai/zen/go/v1/usage';
 const GROK_AUTH = path.join(HOME, '.grok', 'auth.json');
 const GROK_BILLING_API = 'https://cli-chat-proxy.grok.com/v1/billing';
 const GROK_TOKEN_API = 'https://auth.x.ai/oauth2/token';
+const CURSOR_AUTH = path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Cursor', 'auth.json');
+const CURSOR_DASHBOARD_API = 'https://api2.cursor.sh/aiserver.v1.DashboardService';
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -39,10 +41,10 @@ async function httpError(r) {
   return e;
 }
 
-async function fetchJson(url, headers) {
+async function fetchJson(url, headers, body) {
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(15_000), ...(body ? { method: 'POST', body } : {}) });
       if (!r.ok) throw await httpError(r);
       return await r.json();
     } catch (e) {
@@ -85,7 +87,8 @@ const clamp = (n) => Math.max(0, Math.min(100, Number(n) || 0));
 const ringPercent = (rows, label) => (rows || []).find((r) => r.label === label)?.percent ?? Math.max(0, ...(rows || []).map((r) => r.percent));
 const resetRows = (previous, current) => {
   const before = new Map((previous || []).map((r) => [r.label, Number(r.percent)]));
-  return (current || []).filter((r) => before.has(r.label) && Number(r.percent) < before.get(r.label));
+  // Under a point is rounding, such as xAI's whole percent against Cursor's fraction of the same pool, not a reset.
+  return (current || []).filter((r) => before.has(r.label) && Number(r.percent) <= before.get(r.label) - 1);
 };
 
 // ---- Claude: OAuth token that Claude Code keeps rotating in place, so we re-read it every call.
@@ -470,7 +473,22 @@ async function renewGrok(k, v) {
   return t.access_token;
 }
 
+// The weekly pool as Cursor reports it to an account merged with xAI, signed in with the Cursor CLI's token.
+// Unmerged, Cursor's allowance is its own plan's, so there is none.
+async function readCursorXai() {
+  const { accessToken } = JSON.parse(fs.readFileSync(CURSOR_AUTH, 'utf8'));
+  const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1' };
+  const [usage, plan] = await Promise.all(['GetCurrentPeriodUsage', 'GetPlanInfo'].map((m) => fetchJson(`${CURSOR_DASHBOARD_API}/${m}`, headers, '{}')));
+  const end = Number(plan.planInfo?.includedUsageResetsAt);
+  if (!plan.isMerged || plan.planInfo?.includedUsagePeriod !== 'INCLUDED_USAGE_PERIOD_WEEKLY' || !usage.planUsage) return null;
+  return { plan: '', rows: [{ label: 'Weekly', percent: clamp(usage.planUsage.totalPercentUsed), resetsAt: end ? new Date(end).toISOString() : null }], updatedAt: Date.now() };
+}
+
 async function readXai() {
+  // Cursor first: it kept answering while xAI's weekly lookup failed with a 500 through 2026-10-15. With no Cursor
+  // sign-in, no merged plan or no answer, xAI's own endpoints are read.
+  const viaCursor = await readCursorXai().catch(() => null);
+  if (viaCursor) return viaCursor;
   let entry;
   try {
     // Keyed by issuer and client ("https://auth.x.ai::<client>"); older builds keyed it by the sign-in page.
