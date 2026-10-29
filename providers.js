@@ -41,12 +41,30 @@ async function httpError(r) {
   return e;
 }
 
+// A request's deadline, body included, that holds whatever fetch does. AbortSignal.timeout alone didn't: on
+// 2026-10-29 a Claude read stayed pending 12 hours with no socket, nothing queued in undici, and nothing left
+// that could settle it, which froze Claude's numbers and every phone GET. This timer keeps its own reject.
+function within(ms, request) {
+  const ac = new AbortController();
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new DOMException('The operation timed out.', 'TimeoutError');
+      ac.abort(e);
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([request(ac.signal), late]).finally(() => clearTimeout(timer));
+}
+
 async function fetchJson(url, headers, body) {
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch(url, { headers, signal: AbortSignal.timeout(15_000), ...(body ? { method: 'POST', body } : {}) });
-      if (!r.ok) throw await httpError(r);
-      return await r.json();
+      return await within(15_000, async (signal) => {
+        const r = await fetch(url, { headers, signal, ...(body ? { method: 'POST', body } : {}) });
+        if (!r.ok) throw await httpError(r);
+        return await r.json();
+      });
     } catch (e) {
       const transport = !e.status && (e instanceof TypeError || e.name === 'TimeoutError');
       if (!transport) throw e;
@@ -436,18 +454,20 @@ async function renewGrok(k, v) {
   let t;
   try {
     // No retry, unlike fetchJson: a lost answer may already have spent the refresh token.
-    const r = await fetch(GROK_TOKEN_API, {
-      method: 'POST',
-      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: v.oidc_client_id || k.split('::')[1], refresh_token: v.refresh_token }),
-      signal: AbortSignal.timeout(15_000),
+    t = await within(15_000, async (signal) => {
+      const r = await fetch(GROK_TOKEN_API, {
+        method: 'POST',
+        body: new URLSearchParams({ grant_type: 'refresh_token', client_id: v.oidc_client_id || k.split('::')[1], refresh_token: v.refresh_token }),
+        signal,
+      });
+      if (!r.ok) {
+        const e = await httpError(r); // a 429 keeps its Retry-After for the gate
+        // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
+        if ([400, 401, 403].includes(e.status)) e.status = 401;
+        throw e;
+      }
+      return r.json();
     });
-    if (!r.ok) {
-      const e = await httpError(r); // a 429 keeps its Retry-After for the gate
-      // A refused refresh token is a lapsed sign-in, like a 401 from the usage lookup.
-      if ([400, 401, 403].includes(e.status)) e.status = 401;
-      throw e;
-    }
-    t = await r.json();
     // Checked before auth.json changes: without it the saved key would vanish, and the next read finds no sign-in.
     if (typeof t?.access_token !== 'string' || !t.access_token) throw new Error('Grok sign-in not renewed (no access token).');
   } catch (e) {

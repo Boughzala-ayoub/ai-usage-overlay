@@ -255,6 +255,15 @@ configuredProvider.read()
     const originalKey = process.env.OPENCODE_API_KEY;
     process.env.OPENCODE_API_KEY = 'test-key';
     const networkError = () => new TypeError('fetch failed', { cause: Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' }) });
+    // The 15 s request deadline runs in 15 ms here, or each lost request below would take half a minute.
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms >= 15_000 ? ms / 1000 : ms, ...args);
+    // A read that never settles fails the run instead of hanging it.
+    const settles = (read, what) => {
+      let timer;
+      const late = new Promise((_, reject) => (timer = realSetTimeout(() => reject(new Error(`${what}: the read never settled`)), 2000)));
+      return Promise.race([read, late]).finally(() => clearTimeout(timer));
+    };
     try {
       for (const provider of require('./providers').PROVIDERS) {
         let calls = 0;
@@ -265,6 +274,8 @@ configuredProvider.read()
           calls++;
           if (mode === 'offline' || (mode === 'recover' && calls === 1)) throw networkError();
           if (mode === 'timeout') return { ok: true, json: async () => { throw new DOMException('deadline', 'TimeoutError'); } };
+          // What held Claude's read for 12 hours on 2026-10-29: a request that never answers, deaf to its signal.
+          if (mode === 'lost') return new Promise(() => {});
           if (mode === '429' || mode === '401') return { ok: false, status: Number(mode), headers: new Headers({ 'retry-after': '120' }) };
           return { ok: true, json: async () => ({
             limits: [{ kind: 'session', percent: 12 }],
@@ -276,10 +287,10 @@ configuredProvider.read()
         const recovered = await provider.read();
         assert.strictEqual(recovered.rows?.[0]?.percent, 12, `${provider.id} recovers from a transient fetch failure`);
         assert.strictEqual(calls, 2, 'one retry after a transport failure');
-        for (mode of ['offline', 'timeout', '429', '401']) {
+        for (mode of ['offline', 'timeout', 'lost', '429', '401']) {
           calls = 0;
-          const result = await provider.read();
-          assert.strictEqual(calls, mode === 'offline' || mode === 'timeout' ? 2 : 1, 'bounded retry, never retry HTTP errors');
+          const result = await settles(provider.read(), `${provider.id} ${mode}`);
+          assert.strictEqual(calls, ['offline', 'timeout', 'lost'].includes(mode) ? 2 : 1, 'bounded retry, never retry HTTP errors');
           if (mode === '429') {
             assert.strictEqual(result.retryAfter, 120);
             assert.strictEqual(result.soft, true);
@@ -294,6 +305,7 @@ configuredProvider.read()
       }
     } finally {
       global.fetch = originalFetch;
+      global.setTimeout = realSetTimeout;
       if (originalKey === undefined) delete process.env.OPENCODE_API_KEY;
       else process.env.OPENCODE_API_KEY = originalKey;
     }
