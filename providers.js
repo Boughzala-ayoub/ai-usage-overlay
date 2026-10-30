@@ -79,7 +79,7 @@ async function fetchJson(url, headers, body) {
 }
 
 const CLAUDE_TIERS = {
-  default_claude_max_5x: 'Max 5x',
+  default_claude_max_5x: 'Max', // renamed from Max 5x on 2026-10-30; the tier key kept the old name
   default_claude_max_20x: 'Max 20x',
   default_claude_pro: 'Pro',
   default_claude_free: 'Free',

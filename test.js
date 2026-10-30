@@ -96,7 +96,7 @@ const claude = shapeClaude(
   },
   { organization: { rate_limit_tier: 'default_claude_max_5x' } }
 );
-assert.strictEqual(claude.plan, 'Max 5x');
+assert.strictEqual(claude.plan, 'Max');
 assert.deepStrictEqual(
   claude.rows.map((r) => [r.label, r.percent]),
   [['Session', 6], ['All models', 100], ['Fable', 14]]
