@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog, powerSaveBlocker } = require('electron');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -58,6 +58,7 @@ let cursorTimer = null;
 let snapTimer = null;
 let visible = true;
 let autoHide = true;
+let awakeBlocker = null;
 let ignoring = true; // mirrors setIgnoreMouseEvents, so we only call it on a real change
 let revealed = false;
 let open = false; // the capsule is grown into the full panel
@@ -216,8 +217,7 @@ async function tick(force = false) {
 // the providers and what each summary number reads with this overlay, both ways. The credentials stay in
 // this process. The tailnet is the lock, and settings take JSON only (below), so a web page open on this
 // PC can't post them.
-// ponytail: no pairing, unlike Loom's remote, since all it can do is read numbers and change cosmetic
-// settings; add a token if it ever does more.
+// The tailnet also authorizes the keep-awake setting; the hotspot link authenticates with its shared secret.
 const phones = new Set(); // open /api/events streams
 let toldPhones = '';
 // Every snapshot carries this run of the overlay and a number one higher than the last snapshot made, so a
@@ -227,7 +227,7 @@ const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 let snapshots = 0;
 function phoneState() {
   const t = THEMES.find(([id]) => id === theme);
-  return { css: t ? t[2] : '', theme, enabled, choices, providers: snapshot() };
+  return { css: t ? t[2] : '', theme, enabled, choices, keepAwake: awakeBlocker !== null, providers: snapshot() };
 }
 const numbered = (state) => JSON.stringify({ ...state, run, rev: ++snapshots });
 function phonePayload() {
@@ -290,6 +290,8 @@ function servePhone() {
         return res.writeHead(400).end();
       }
       if (!want || typeof want !== 'object' || Array.isArray(want)) return res.writeHead(400).end(); // null, a list, a bare value
+      if (Object.hasOwn(want, 'keepAwake') && typeof want.keepAwake !== 'boolean') return res.writeHead(400).end();
+      if (typeof want.keepAwake === 'boolean') setKeepAwake(want.keepAwake);
       if (typeof want.theme === 'string') setTheme(want.theme);
       if (Array.isArray(want.enabled)) setEnabled(want.enabled);
       if (want.choices && typeof want.choices === 'object') for (const [id, row] of Object.entries(want.choices)) setChoice(id, row);
@@ -426,6 +428,18 @@ function pollCursor() {
 // ---- chrome
 // The settings the phone shares, set from the tray menu or the phone alike. Each ignores what it doesn't know.
 
+function setKeepAwake(next) {
+  if (typeof next !== 'boolean' || next === (awakeBlocker !== null)) return;
+  if (next) awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  else {
+    powerSaveBlocker.stop(awakeBlocker);
+    awakeBlocker = null;
+  }
+  saveState({ keepAwake: next });
+  tray?.setContextMenu(menu());
+  tellPhones();
+}
+
 function setTheme(id) {
   if (!THEMES.some(([t]) => t === id)) return;
   theme = id;
@@ -549,6 +563,7 @@ function menu() {
         rebuild();
       },
     },
+    { label: 'Keep PC awake', type: 'checkbox', checked: awakeBlocker !== null, click: (item) => setKeepAwake(item.checked) },
     { type: 'separator' },
     { label: 'Drag the pill to any screen edge', enabled: false },
     {
@@ -596,6 +611,7 @@ function loadState() {
   if (THEMES.some(([id]) => id === st.theme)) theme = st.theme;
   if (SIZES.some(([, k]) => k === st.scale)) scale = st.scale;
   if (typeof st.autoHide === 'boolean') autoHide = st.autoHide;
+  setKeepAwake(st.keepAwake === true);
   if (EDGES.includes(st.edge)) edge = st.edge;
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
   displayId = screen.getAllDisplays().some((d) => d.id === st.displayId) ? st.displayId : screen.getPrimaryDisplay().id;
@@ -729,6 +745,10 @@ ipcMain.on('drag-end', () => {
 
 app.on('window-all-closed', () => app.quit());
 app.on('will-quit', (e) => {
+  if (awakeBlocker !== null) {
+    powerSaveBlocker.stop(awakeBlocker);
+    awakeBlocker = null;
+  }
   clearInterval(timer);
   clearInterval(cursorTimer);
   clearInterval(snapTimer);

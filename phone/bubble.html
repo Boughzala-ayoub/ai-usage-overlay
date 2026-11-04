@@ -469,6 +469,9 @@
       const chosen = data?.choices || {};
       html = '<p class="hint">Theme, providers and the bubble\'s numbers are shared with the PC.</p>' +
         (prefsError ? '<p class="err">' + esc(prefsError) + '</p>' : '') +
+        '<h3>PC power</h3>' +
+        '<label class="opt"><span>Keep PC awake</span><input type="checkbox" role="switch" id="keep-awake" aria-describedby="awake-hint"' + (data?.keepAwake === true ? ' checked' : '') + (!reached || typeof data?.keepAwake !== 'boolean' ? ' disabled' : '') + '></label>' +
+        '<p class="hint" id="awake-hint">Prevents automatic sleep while the PC overlay is running. The screen can still turn off.</p>' +
         '<h3>Theme</h3>' +
         options.themes.map(([group, list]) => '<h4>' + esc(group) + '</h4><div class="swatches">' +
           list.map(([id, label, css]) => '<button class="sw" data-theme="' + esc(id) + '" aria-pressed="' + (data?.theme === id) + '"><i style="' + esc(css || NOIR) + '">Aa</i><span>' + esc(label) + '</span></button>').join('') +
@@ -537,6 +540,11 @@
     const t = e.target;
     if (t.dataset.provider) change({ enabled: [...prefs.querySelectorAll('[data-provider]')].filter((x) => x.checked).map((x) => x.dataset.provider) });
     else if (t.id === 'autohide') setAutoHide(t.checked);
+    else if (t.id === 'keep-awake') {
+      const next = t.checked;
+      t.checked = data?.keepAwake === true;
+      change({ keepAwake: next });
+    }
   });
 
   // The tab's size: the page draws it, and tells Bubble.java how big a window it needs. Its height is 6px

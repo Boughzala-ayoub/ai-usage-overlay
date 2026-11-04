@@ -49,7 +49,7 @@ let holdStreams = false; // a cut stream's reconnections wait, so a reconnect's 
 let dropUsage = false; // the next /api/usage connection ends unanswered, as the link ends it switching ways
 let opened = 0; // streams the page has opened
 const waiting = [];
-const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai'], choices: {} };
+const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai'], choices: {}, keepAwake: false };
 // Every provider on: the tallest tab. Its height is 6px above and below, 40.5px per provider, as fit() draws it.
 const COUNT = pc.enabled.length;
 const TAB = 8.5 + 40.5 * COUNT;
@@ -95,6 +95,7 @@ const server = http.createServer(async (req, res) => {
     if (want.theme) pc.theme = want.theme;
     if (want.enabled) pc.enabled = want.enabled;
     if (want.choices) Object.assign(pc.choices, want.choices);
+    if (typeof want.keepAwake === 'boolean') pc.keepAwake = want.keepAwake;
     // As main.js does: the phones hear the change, then the answer goes, unless it is held back.
     const state = payload();
     tell();
@@ -560,6 +561,22 @@ try {
   await page.click('#mn');
   await page.waitForSelector('#prefs .sw');
   posts.length = 0;
+  await page.click('#keep-awake');
+  await until(() => document.querySelector('#keep-awake').checked, 'keep-awake: phone enables');
+  if (!pc.keepAwake || !posts.some((p) => p.body.keepAwake === true)) fail('keep-awake: enable did not reach the PC');
+  await page.click('#keep-awake');
+  await until(() => !document.querySelector('#keep-awake').checked && data.keepAwake === false, 'keep-awake: phone disables');
+  if (pc.keepAwake || !posts.some((p) => p.body.keepAwake === false)) fail('keep-awake: disable did not reach the PC');
+  pc.keepAwake = true;
+  tell();
+  await until(() => document.querySelector('#keep-awake').checked, 'keep-awake: PC changes arrive on phone');
+  answer = 'down';
+  await page.click('#keep-awake');
+  await until(() => !!document.querySelector('#prefs .err'), 'keep-awake: failed change is reported');
+  if (!(await page.$eval('#keep-awake', (e) => e.checked))) fail('keep-awake: failed change must keep the confirmed state');
+  answer = 'ok';
+  await page.click('#keep-awake');
+  await until(() => data.keepAwake === false, 'keep-awake: change works after reconnect');
   await page.click('#prefs [data-theme="paper"]');
   await until(() => document.querySelector('[data-theme="paper"]').getAttribute('aria-pressed') === 'true', 'theme: Paper marked chosen');
   await settle();

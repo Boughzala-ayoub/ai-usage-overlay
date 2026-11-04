@@ -79,8 +79,10 @@ async function fetchJson(url, headers, body) {
 }
 
 const CLAUDE_TIERS = {
-  default_claude_max_5x: 'Max', // renamed from Max 5x on 2026-10-30; the tier key kept the old name
-  default_claude_max_20x: 'Max 20x',
+  // On 2026-10-30 Max 5x became Max and Max 20x became Ultra. The 5x key kept its old name (seen on a real
+  // account); the 20x key is assumed to have too.
+  default_claude_max_5x: 'Max',
+  default_claude_max_20x: 'Ultra',
   default_claude_pro: 'Pro',
   default_claude_free: 'Free',
 };

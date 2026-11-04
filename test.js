@@ -549,6 +549,7 @@ configuredProvider.read()
 async function mainChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-main-'));
   const on = {};
+  const powerCalls = [];
   const electron = {
     app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
     ipcMain: { on() {}, handle() {} },
@@ -556,6 +557,7 @@ async function mainChecks() {
     Menu: { buildFromTemplate: (template) => template },
     screen: { getAllDisplays: () => [{ id: 1 }], getPrimaryDisplay: () => ({ id: 1 }) },
     safeStorage: { decryptString: (sealed) => sealed.toString() }, // synthetic keys only, sealed as plain base64
+    powerSaveBlocker: { start: (type) => (powerCalls.push(['start', type]), 0), stop: (id) => powerCalls.push(['stop', id]) },
   };
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
@@ -565,7 +567,7 @@ async function mainChecks() {
   const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
   const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
@@ -764,6 +766,39 @@ async function mainChecks() {
     const odd = await ask('POST', '/api/settings', '{"choices":{"constructor":"x","__proto__":"Session","toString":""},"theme":7,"enabled":"claude"}');
     assert.strictEqual(odd.status, 200, `unknown settings are ignored, not ${JSON.stringify(odd)}`);
     assert.deepStrictEqual(JSON.parse(odd.body).choices, {}, 'and change nothing');
+    assert.strictEqual(JSON.parse(odd.body).keepAwake, false, 'keep-awake defaults off');
+    const awakeMenu = () => mod.exports.menu().find((item) => item.label === 'Keep PC awake');
+    const powerStates = [];
+    let closePowerStream;
+    phoneHandler(
+      { method: 'GET', url: '/api/events', headers: { host: 'localhost' }, on: (_, fn) => (closePowerStream = fn) },
+      { writeHead() { return this; }, write: (chunk) => powerStates.push(JSON.parse(chunk.slice(6)).keepAwake), end() {} }
+    );
+    for (const value of ['true', 1, null, {}]) {
+      assert.strictEqual((await ask('POST', '/api/settings', JSON.stringify({ keepAwake: value }))).status, 400);
+    }
+    assert.deepStrictEqual(powerCalls, [], 'invalid settings never start a blocker');
+    for (let i = 0; i < 2; i++) {
+      const res = await ask('POST', '/api/settings', '{"keepAwake":true}');
+      assert.strictEqual(JSON.parse(res.body).keepAwake, true);
+    }
+    assert.deepStrictEqual(powerCalls, [['start', 'prevent-app-suspension']], 'repeated enable starts only one blocker, including ID zero');
+    assert.strictEqual(awakeMenu().checked, true, 'phone updates the PC menu');
+    awakeMenu().click({ checked: false });
+    assert.deepStrictEqual(powerCalls.at(-1), ['stop', 0], 'PC toggle releases the same blocker');
+    assert.deepStrictEqual(powerStates, [false, true, false], 'both controls broadcast the state');
+    closePowerStream();
+    on['will-quit']();
+    assert.strictEqual(saved().keepAwake, false);
+    awakeMenu().click({ checked: true });
+    on['will-quit']();
+    assert.deepStrictEqual(powerCalls.at(-1), ['stop', 0], 'quit releases the blocker');
+    assert.strictEqual(saved().keepAwake, true, 'quit preserves the saved choice');
+    loadState();
+    assert.strictEqual(awakeMenu().checked, true, 'startup restores keep-awake');
+    assert.deepStrictEqual(powerCalls.at(-1), ['start', 'prevent-app-suspension']);
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
 
     // Snapshots are numbered in the order the PC makes them, which is not the order they reach a phone: a
     // read waits on its provider before it snapshots, so a stream message sent meanwhile is the older one,
