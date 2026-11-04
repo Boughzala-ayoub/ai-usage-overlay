@@ -16,11 +16,18 @@ const edges = ['left', 'right', 'top', 'bottom'];
 const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
-// The native windows at Size = Large for the four providers below, each only on the edges main gives that shape.
-// From main.js's windowSize(): beside the pill 8 + 86 + 300 + 16 by max(4 × 56, 600) + 32, above or below it
-// max(4 × 88, 300) + 32 by 8 + 60 + 600 + 16.
-const NATIVE = { left: 410, right: 410, top: 384, bottom: 384 };
-viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 384, height: 684, edges: ['top', 'bottom'] });
+// The native windows at Size = Large for the six providers below, each only on the edges main gives that shape.
+// From main.js's windowSize(): beside the pill 8 + 86 + 300 + 16 by max(6 × 56, 600) + 32, above or below it
+// max(6 × 88, 300) + 32 by 8 + 60 + 600 + 16.
+const NATIVE = { left: 410, right: 410, top: 560, bottom: 560 };
+viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 560, height: 684, edges: ['top', 'bottom'] });
+// Extra large on a 600px portrait monitor: main shrinks the pill to fit (pillScale: (600 - 32) / (6 × 88)) and keeps
+// the panel's 1.25, in a window of 600 by 8 + 60 × that + 600 × 1.25 + 16.
+const XL = (600 - 32) / (6 * 88);
+viewports.push({ width: 600, height: Math.ceil(8 + 60 * XL + 750 + 16), edges: ['top', 'bottom'], scale: XL, panel: 1.25 });
+// Extra large on a display 600px tall: main stops the window at the display's height (windowSize), and the panel's rows
+// scroll. Beside the pill the window is 8 + 86 × 1.25 + 300 × 1.25 + 16 wide; above or below it, the 600px display's width.
+viewports.push({ width: Math.ceil(8 + 86 * 1.25 + 375 + 16), height: 600, edges: ['left', 'right'], scale: 1.25, panel: 1.25 }, { width: 600, height: 600, edges: ['top', 'bottom'], scale: XL, panel: 1.25 });
 const data = [
   {
     id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: 37,
@@ -53,6 +60,9 @@ const data = [
     rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }],
     updatedAt: Date.now(),
   },
+  // This PC: a long CPU model in the plan tag, and RAM's GB in the reset column.
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: 23, local: true, rows: [{ label: 'Load', percent: 23, resets: '' }], updatedAt: Date.now() },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', plan: '127.8 GB', ringPercent: 58, local: true, rows: [{ label: 'In use', percent: 58, resets: '112.4 GB' }], updatedAt: Date.now() },
 ];
 
 fs.mkdirSync(shots, { recursive: true });
@@ -80,13 +90,13 @@ await page.addStyleTag({ content: 'html{background:linear-gradient(125deg,#08111
 
 let checked = 0;
 const clipped = new Set();
-for (const { width, height, edges: only } of viewports) {
+for (const { width, height, edges: only, scale, panel: panelZoom } of viewports) {
   await page.setViewport({ width, height, deviceScaleFactor: 1 });
   for (const [theme, , css] of themes) for (const edge of only || edges) for (const state of states) {
     // Every theme at every width would be 10k combinations; themes get the states that show them off.
     if (height !== 700 && theme !== 'noir' && !process.env.UI_THEME) continue;
     if (!process.env.UI_THEME && !['noir', 'paper'].includes(theme) && !shows.includes(state)) continue;
-    await page.evaluate(({ data, edge, theme, css, state }) => {
+    await page.evaluate(({ data, edge, theme, css, state, scale, panelZoom }) => {
       if (state === 'claude-banked') { data[0].bankedResets = 1; data[0].bankedResetExpiries = [Date.parse('2026-10-22T16:00:00Z')]; }
       if (state === 'claude-credit') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z') };
       if (state === 'claude-credit-stale') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), error: 'API credit not refreshed (HTTP 503), showing the last reading.' };
@@ -97,7 +107,7 @@ for (const { width, height, edges: only } of viewports) {
       if (state === 'codex-expiry-missing') delete data[1].bankedResetExpiries;
       if (state === 'codex-multiple') { data[1].bankedResets = 2; data[1].bankedResetExpiries.push(Date.parse('2026-10-12T18:15:00Z')); }
       if (state === 'warning') data[0].rows[0].percent = data[0].ringPercent = 96;
-      if (state === 'limited') data[0].waitMs = data[1].waitMs = data[2].waitMs = data[3].waitMs = 90000;
+      if (state === 'limited') data.forEach((p) => (p.waitMs = 90000));
       if (state === 'limited-one') data[0].waitMs = 90000;
       if (state === 'error') { data[0].rows = []; data[0].error = 'No Claude credentials — run `claude` to sign in.'; }
       if (state === 'xai-unavailable') { data[3].rows = []; data[3].error = 'Grok sign-in expired — run `grok` to renew it.'; }
@@ -110,13 +120,13 @@ for (const { width, height, edges: only } of viewports) {
       const ev = window.__overlayEvents;
       ev.open(false);
       ev.reset(null);
-      ev.layout({ edge, count: data.length, theme, css });
+      ev.layout({ edge, count: data.length, theme, css, scale, panel: panelZoom });
       ev.data(data);
       ev.reveal(state !== 'hidden');
       if (state === 'reset') ev.reset({ id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', rows: [{ label: 'Weekly', percent: 0 }] });
       else if (!['hidden', 'rest'].includes(state)) ev.open(true);
       if (state === 'refreshing') document.querySelector('#rf').click();
-    }, { data, edge, theme, css, state });
+    }, { data, edge, theme, css, state, scale, panelZoom });
     await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const result = await page.evaluate(({ state, edge }) => {
       const root = document.documentElement;
@@ -140,6 +150,7 @@ for (const { width, height, edges: only } of viewports) {
         exposed,
         outside,
         islandW: r.width,
+        summaryW: document.querySelector('#summary').getBoundingClientRect().width,
         detailsW: document.querySelector('#details').getBoundingClientRect().width,
         lipThickness: vertical ? lipRect.width : lipRect.height,
         lipLevels: lip.children.length,
@@ -159,18 +170,20 @@ for (const { width, height, edges: only } of viewports) {
     const panel = !['hidden', 'rest', 'reset'].includes(state);
     if (result.scrollWidth > result.clientWidth) bad.push('horizontal scroll');
     // main sizes each window to hold its capsule. Narrower than NATIVE, as top or bottom at 320px, a page the overlay
-    // never opens, the four-chip capsule is wider than the page: centred, both its ends clip. Its chips and buttons may not.
-    const clip = result.outside.filter((b) => b.id === 'island' && width < NATIVE[edge] && b.top >= -1 && b.bottom <= height + 1 && Math.abs(b.left + b.right - width) <= 2);
+    // never opens, the six-chip capsule is wider than the page: centred, both its ends clip, the end chips with them.
+    // Its buttons may not.
+    const across = !['left', 'right'].includes(edge);
+    const clip = result.outside.filter((b) => across && width < NATIVE[edge] && b.top >= -1 && b.bottom <= height + 1 && (b.id === 'island' ? Math.abs(b.left + b.right - width) <= 2 : !['rf', 'mn'].includes(b.id)));
     if (result.outside.length > clip.length) bad.push('outside the window');
     if (clip.length) clipped.add(`${edge} at ${width}px`);
     if (result.contentOverflow) bad.push('content overflows the panel');
-    if (state === 'hidden' && (result.exposed !== 0 || result.lipThickness !== 5 || result.lipLevels !== 4)) bad.push('lip');
+    if (state === 'hidden' && (result.exposed !== 0 || Math.abs(result.lipThickness - 5 * (scale || 1)) > 0.01 || result.lipLevels !== 6)) bad.push('lip');
     if (state === 'rest' && result.detailsW !== 0) bad.push('panel open at rest');
     if ((panel || state === 'reset') && result.detailsW < 200) bad.push('panel did not open');
-    if (result.islandW > 300 + 86) bad.push('panel too wide');
+    if (result.islandW > Math.max(300 * (panelZoom || 1) + 86 * (scale || 1), result.summaryW + 1)) bad.push('panel too wide');
     if (state === 'reset' && !result.noticing) bad.push('reset notice');
-    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 9) bad.push('one row per limit');
-    if (state === 'long' && result.rows !== 14) bad.push('long rows');
+    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 11) bad.push('one row per limit');
+    if (state === 'long' && result.rows !== 16) bad.push('long rows');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
     if (state === 'limited-one' && !result.status.some((s) => s.startsWith('Rate limited, retry in 2 min'))) bad.push('rate-limit line');
     if (['error', 'loading'].includes(state) && result.chips[0] !== '—') bad.push('empty chip');
@@ -296,6 +309,16 @@ await page.evaluate((data) => {
   ev.data([data[1], { ...data[0], id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283' }]);
   const chips = [...document.querySelectorAll('.chip')].map((c) => c.querySelector('.g').textContent + c.style.getPropertyValue('--c'));
   if (chips.join() !== '◉#10a37f,▣#fab283') throw new Error('Chips kept the old providers\' marks: ' + chips);
+}, data);
+// The footer dates the usage, not CPU and RAM, which are always fresh; with only those two it dates them.
+await page.evaluate((data) => {
+  const ev = window.__overlayEvents;
+  const ft = () => document.querySelector('#ft').textContent;
+  ev.data(data.map((p) => ({ ...p, updatedAt: p.local ? Date.now() : Date.now() - 5 * 60000 })));
+  if (ft() !== 'Updated 5 min ago') throw new Error('Footer with fresh CPU and older usage says ' + ft());
+  ev.data(data.filter((p) => p.local).map((p) => ({ ...p, updatedAt: Date.now() })));
+  if (ft() !== 'Updated just now') throw new Error('Footer with only CPU and RAM says ' + ft());
+  ev.data(data);
 }, data);
 await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
 await page.evaluate(async () => {

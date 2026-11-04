@@ -35,6 +35,7 @@ icon is three level rows, so you can tell the two apart.
 | Codex | `~/.codex/auth.json` then the ChatGPT usage endpoint | 5 min |
 | OpenCode Go | `~/.local/share/opencode/auth.json` (or `OPENCODE_API_KEY`) then `opencode.ai/zen/go/v1/usage` | 5 min |
 | xAI | `~/.grok/auth.json` then `cli-chat-proxy.grok.com/v1/billing` | 5 min |
+| CPU, RAM | This PC, through Node's `os` module. No account, no request | 15 s |
 
 Codex uses only `~/.codex/auth.json` for login and re-reads it on every refresh. If the request
 fails, the overlay reads the rollouts across `CODEX_HOME`, Orca's runtime home, and `~/.codex`, and
@@ -62,6 +63,13 @@ refresh token and writes the new tokens back to `auth.json` for `grok`. Only if 
 refresh token does the xAI section say to run `grok`, with a dash on the chip. The endpoint is the CLI's own, not a public API. If its answer changes shape,
 the section says no usage windows were reported. xAI's mark is monochrome, so on both screens it
 takes the theme's text colour.
+
+CPU and RAM are this PC, so the phone can see them too. CPU is the load across every core since the
+last read, so the first read samples half a second. It is Windows' "% Processor Time", and Task
+Manager shows "% Processor Utility", which can read higher while the CPU boosts. RAM is what Windows
+doesn't count as available, as a percentage, with the GB in use where the reset time goes and the
+total in the plan tag. Both are `local`: read at every tick, never saved for the next start, and a
+fall in either is never announced as a reset. Turn them off under `Providers` like any other.
 
 Adding a provider is one entry in `PROVIDERS` at the bottom of `providers.js` plus its `read()`.
 Return `{ plan, rows: [{ label, percent, resetsAt }], error }` and its chip, its section in the
@@ -105,7 +113,11 @@ puts the capsule back on the right of the primary display.
   already under way still finishes and updates the numbers, but it can't beep or bring the overlay back.
 - `Size` sets how much room the pill takes on the edge, from Small to Extra large. The open panel
   never shrinks below Large, because at Small its reset times would be 7px; it only grows, at Extra
-  large. Both are CSS `zoom` on their own element, and main sizes the window from the two.
+  large. Both are CSS `zoom` on their own element, and main sizes the window from the two. On a top
+  or bottom edge too narrow for a row of chips at that size, as six are at Extra large on a 600px
+  portrait monitor, the pill shrinks to fit. The window is never bigger than its display, so on a short
+  one the panel's rows scroll. A display that turns, rescales, or is unplugged or plugged back in puts
+  the capsule back on its edge at once.
 - A chip reads the highest of that provider's limits, since that one stops you first. `Summary
   shows` picks a specific limit instead, for Claude and OpenCode Go.
 - Every reading, in the pill or the panel, is a number with a thin bar filled to the percentage.
@@ -171,7 +183,7 @@ tailscale serve --bg --https=8443 http://127.0.0.1:7430
 | Route | What it does |
 |---|---|
 | `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. `POST` is the panel's Refresh. |
-| `GET /api/events` | The same, as a stream: once on connecting, then on every change. Countdowns move once a minute, so a phone hears at most that often when nothing else changes. A `ping` event every 20 s lets the page replace a stream that died without closing. |
+| `GET /api/events` | The same, as a stream: once on connecting, then on every change. CPU and RAM move at most every tick, so a phone hears at most every 15 s, or once a minute with both off. A `ping` event every 20 s lets the page replace a stream that died without closing. |
 | `GET /api/options` | The tray menu's choices: themes, providers, summary limits, usage pages. |
 | `POST /api/settings` | `{ theme, enabled, choices }`, any of them, applied as the tray menu applies them. JSON only. |
 
@@ -179,7 +191,8 @@ Requests for any host but loopback or a `*.ts.net` name get a 403. That stops a 
 its own domain at 127.0.0.1 from reading anything. Settings take `application/json` only, which a
 form or a no-cors fetch from another page can't send without a CORS preflight that this server never
 answers. There is no pairing token, unlike Loom's phone remote: anyone on your tailnet can read the
-percentages and change the theme, and nothing more.
+percentages and the PC's CPU and RAM, change the shared settings, and turn Keep PC awake on or off,
+which keeps the PC from sleeping until it is turned off again. Nothing more.
 
 After the PC has been on the phone's hotspot, the overlay watches Tailscale's tunnel to the phone
 (`heal` in `link.js`). Tailscale on the PC can come back from the hotspot with a frozen session: the
@@ -207,9 +220,11 @@ once for "Display over other apps". A quiet notification keeps the bubble alive,
 button takes it away.
 
 `bubble.html` is both states. Collapsed, `Bubble.java` sizes the window to the tab plus 12dp beside
-it and above and below for the shadow (50x154 dp at Medium with three providers, 40.5 dp less
-for each one hidden; the page sends the size with `Android.size()`), and handles every touch
-itself, so a drag never reaches the page. It calls
+it and above and below for the shadow (50x154 dp at Medium with three providers, 40.5 dp more
+or less for each provider added or hidden; the page sends the size with `Android.size()`), and handles
+every touch itself, so a drag never reaches the page. Where the screen between its bars is shorter than
+the tab, as with six providers at Large in landscape, the page shrinks the tab to the room `Android.room()`
+reports, and fits it again whenever the screen turns. It calls
 `press()`, `lift()`, `dock(side)` and `peek()` as the finger and the idle timer move the tab. A tap
 first tells the page where the window sits, then gives the window the whole screen. The page's
 layout follows the window's width, so it can never draw the panel in the small window or the tab
@@ -249,11 +264,12 @@ Put `hover` in the filename and it opens the panel before the capture.
 `npm run test:ui` loads `index.html` in headless Chrome with a fake `window.api` and runs every state
 (loading, error, rate limited, banked resets, a reset notice, a long panel) on all four edges. It
 covers widths from 320 to 1280 plus the two native window sizes, and every theme hidden, at rest,
-open and mid-notice, with all four providers. It fails on horizontal scroll, anything outside the
-window, or text overflowing the panel. The one exception is a top or bottom capsule at 320px. Four
-chips make it 332px wide, so its ends clip, though every chip and button stays in view. main sizes
-that window to hold the capsule and never under 332px, so the run prints the case as a LIMIT line
-instead of failing. A second pass runs the real animations and fails if the chips move while the
+open and mid-notice, with all six providers. It fails on horizontal scroll, anything outside the
+window, or text overflowing the panel. The one exception is a top or bottom capsule at 320 and
+375px. Six chips make it about 490px wide, so its ends clip, the end chips with them, though both
+buttons stay in view. main sizes that window to hold the capsule and never under 560px, so the run
+prints the case as a LIMIT line instead of failing. Above or below a pill that wide, the panel
+stretches to match it. A second pass runs the real animations and fails if the chips move while the
 capsule grows or shrinks, or if Small shrinks anything but the pill. Screenshots land in
 `%TEMP%\ai-usage-overlay-ui`.
 

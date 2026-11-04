@@ -21,6 +21,7 @@ const shots = path.join(os.tmpdir(), 'ai-usage-bubble');
 fs.rmSync(shots, { recursive: true, force: true });
 fs.mkdirSync(shots, { recursive: true });
 const h = 3600_000;
+let cpuLoad = 23; // changes at every read on the real PC
 const providers = (hot) => [
   { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: hot ? 96 : 34, bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
     apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), ...(hot ? { error: 'API credit not refreshed (HTTP 503), showing the last reading.' } : {}) },
@@ -32,6 +33,9 @@ const providers = (hot) => [
   // Hot, xAI is the provider whose usage is unavailable: signed out, no numbers at all.
   { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: hot ? 0 : 42.5, updatedAt: Date.now(), waitMs: 0,
     ...(hot ? { rows: [], error: 'Grok sign-in expired — run `grok` to renew it.' } : { rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }] }) },
+  // This PC, as main.js sends it: a long CPU model, RAM's GB in the reset column.
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: cpuLoad, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'Load', percent: cpuLoad, resets: '' }] },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', plan: '127.8 GB', ringPercent: hot ? 93 : 58, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'In use', percent: hot ? 93 : 58, resets: '112.4 GB' }] },
 ];
 const options = {
   themes: THEME_GROUPS,
@@ -49,7 +53,7 @@ let holdStreams = false; // a cut stream's reconnections wait, so a reconnect's 
 let dropUsage = false; // the next /api/usage connection ends unanswered, as the link ends it switching ways
 let opened = 0; // streams the page has opened
 const waiting = [];
-const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai'], choices: {}, keepAwake: false };
+const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai', 'cpu', 'ram'], choices: {}, keepAwake: false };
 // Every provider on: the tallest tab. Its height is 6px above and below, 40.5px per provider, as fit() draws it.
 const COUNT = pc.enabled.length;
 const TAB = 8.5 + 40.5 * COUNT;
@@ -167,7 +171,9 @@ const failures = [];
 const fail = (what) => failures.push(what) && console.log('FAIL ' + what);
 const rect = (page, sel) => page.$eval(sel, (e) => { const r = e.getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom }; });
 const near = (a, b) => Math.abs(a - b) < 0.6;
-const windowFor = (z) => ({ width: Math.ceil(38 * z) + 12, height: Math.ceil(TAB * z) + 24, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
+// The window Bubble.java gives the tab: what the page asks, within Bubble.size()'s bounds, read from its source.
+const [, MAX_W, MAX_H] = /Math\.min\(width, (\d+)\).*Math\.min\(height, (\d+)\)/.exec(fs.readFileSync(path.join(here, 'src/com/local/aiusage/Bubble.java'), 'utf8')).map(Number);
+const windowFor = (z) => ({ width: Math.min(Math.ceil(38 * z) + 12, MAX_W), height: Math.min(Math.ceil(TAB * z) + 24, MAX_H), deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
 const small = windowFor(1);
 try {
   const page = await browser.newPage();
@@ -436,6 +442,30 @@ try {
     await resize(small);
     if ((await has('snip')) || (await has('shot'))) fail(`${tag}: still snipping back in the small window`);
   }
+  // CPU changes at every read: only its section is redrawn, so the other bars don't sweep from empty again.
+  await open(375, 812, 'right', 120);
+  await page.evaluate(() => (window.kept = [...document.querySelectorAll('#sections .prov')]));
+  cpuLoad = 71;
+  tell();
+  await until(() => document.querySelectorAll('#sections .prov')[4]?.textContent.includes('71'), 'redraw: the new CPU load shows');
+  const redrawn = await page.evaluate(() => [...document.querySelectorAll('#sections .prov')].map((el, i) => el !== kept[i]));
+  if (JSON.stringify(redrawn) !== JSON.stringify([false, false, false, false, true, false])) fail(`redraw: a CPU change replaced sections ${JSON.stringify(redrawn)}`);
+  cpuLoad = 23;
+  // The footer dates the usage, not CPU and RAM, which are always fresh; with only those two it dates them.
+  const foot = await page.evaluate(() => {
+    const all = data.providers;
+    data.providers = all.map((p) => ({ ...p, updatedAt: p.local ? Date.now() : Date.now() - 5 * 60000 }));
+    draw();
+    const aged = ft.textContent;
+    data.providers = all.filter((p) => p.local);
+    draw();
+    const local = ft.textContent;
+    data.providers = all;
+    draw();
+    return [aged, local];
+  });
+  if (foot[0] !== 'Updated 5 min ago' || foot[1] !== 'Updated just now') fail(`footer: ${JSON.stringify(foot)}`);
+  await resize(small);
   // A tap instead of a drag cancels: the window folds back and nothing is copied.
   await open(412, 915, 'left', 120);
   await stub(true);
@@ -681,7 +711,8 @@ try {
   // ---- turning the screen with the panel open, on either edge: the tab follows its edge, nothing leaves the screen
   await page.evaluate(() => setSize(1));
   for (const side of ['right', 'left']) {
-    await open(812, 375, side, 120);
+    // Where Bubble.java's snap leaves it on a landscape screen: inside the bars, which six providers' tab fills.
+    await open(812, 375, side, Math.max(24, Math.min(120, 375 - 48 - small.height)));
     await openCheck(`rotate ${side} at 812x375`, 812, 375, side);
     for (const [width, height] of [[375, 812], [812, 375]]) {
       await resize({ width, height, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
@@ -690,6 +721,38 @@ try {
       await page.screenshot({ path: path.join(shots, `rotate-${side}-${width}x${height}.png`) });
     }
     await closes(() => page.mouse.click(side === 'right' ? 20 : 792, 340));
+  }
+  // ---- Large on a landscape screen too short for six providers' tab: it shrinks to the room between the bars,
+  // as a stand-in for Bubble.java's room() gives it, and fits there collapsed and open. Turned back to a
+  // portrait room, it is Large again.
+  const room = (dp) => page.evaluate((r) => {
+    window.calls = [];
+    window.Android = new Proxy({}, { get: (_, k) => (...a) => (k === 'room' ? r : calls.push([k, ...a])) });
+  }, dp);
+  const fitted = () => page.evaluate(() => [parseFloat(body.style.getPropertyValue('--z')), calls.filter(([k]) => k === 'size').at(-1)]);
+  for (const side of ['right', 'left']) {
+    await room(375 - 24 - 48);
+    await page.evaluate(() => setSize(1.2));
+    const [z, asked] = await fitted();
+    const win = windowFor(z);
+    if (!(z < 1.2) || asked?.[1] !== win.width || asked?.[2] !== win.height || win.height > 375 - 72) fail(`large, landscape ${side}: zoom ${z}, asked for ${JSON.stringify(asked)}, room ${375 - 72}`);
+    await resize(win);
+    const t = await rect(page, '#tab');
+    if (t.b > win.height + 0.5 || !near(t.b - t.t, TAB * z)) fail(`large, landscape ${side}: collapsed, the tab runs ${t.t} to ${t.b} in a ${win.height} window`);
+    await open(812, 375, side, 24, z);
+    await openCheck(`large, landscape ${side}`, 812, 375, side, z);
+    const off = await outOfView();
+    if (off.length) fail(`large, landscape ${side}: off screen: ${off.join(' | ')}`);
+    await page.screenshot({ path: path.join(shots, `large-landscape-${side}.png`) });
+    await unstub();
+    await closes(() => page.mouse.click(side === 'right' ? 20 : 792, 340));
+    await room(915 - 72);
+    await page.evaluate(() => fit());
+    const [tall] = await fitted();
+    if (tall !== 1.2) fail(`large, portrait again ${side}: zoom ${tall}`);
+    await unstub();
+    await page.evaluate(() => setSize(1));
+    await resize(small);
   }
 
   // ---- a new size with the panel open, at the five widths and on either edge, from the bottom of the screen:

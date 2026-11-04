@@ -280,7 +280,7 @@
   // The PC's last answer, kept for when it's out of reach: { css, theme, enabled, choices, providers, at }.
   let data = null;
   let reached = true;
-  let drawn = '';
+  let drawn = []; // each section's last markup
   const stored = (k, fallback) => {
     try {
       return JSON.parse(localStorage.getItem(k)) ?? fallback;
@@ -549,10 +549,15 @@
 
   // The tab's size: the page draws it, and tells Bubble.java how big a window it needs. Its height is 6px
   // above and below, a 37px ring and number per provider, 3.5px between them: 130px for three.
+  // At its size, or smaller where the room between the bars is shorter than that: six providers at Large on a
+  // landscape phone. Bubble.java says how much room there is, and calls this again when the screen turns.
   function fit() {
     const h = 8.5 + 40.5 * Math.max(1, cells.children.length);
+    const room = window.Android?.room() ?? Infinity;
+    const z = Math.max(0.5, Math.min(size, Math.floor(((room - 24) / h) * 100) / 100)); // rounded down: it must fit
     body.style.setProperty('--h', h + 'px');
-    window.Android?.size(Math.ceil(38 * size) + 12, Math.ceil(h * size) + 24);
+    body.style.setProperty('--z', z);
+    window.Android?.size(Math.ceil(38 * z) + 12, Math.ceil(h * z) + 24);
   }
   function setSize(z) {
     size = SIZES.some(([, s]) => s === z) ? z : 1;
@@ -572,14 +577,23 @@
     if (data?.css !== undefined) document.documentElement.style.cssText = data.css;
     body.classList.toggle('away', !reached);
     drawTab(list);
-    // Redrawn only on change, or every bar would sweep again at each minute's read.
-    const html = list.map(section).join('');
-    if (html !== drawn) sections.innerHTML = drawn = html;
+    // Redrawn only on change, and per provider: CPU and RAM change at every read, and must not sweep every
+    // other bar from empty. Their own bars jump to the new number.
+    const next = list.map(section);
+    if (next.length !== drawn.length) sections.innerHTML = next.join('');
+    else next.forEach((html, i) => {
+      if (html === drawn[i]) return;
+      sections.children[i].outerHTML = html;
+      sections.children[i].querySelectorAll('.hair').forEach((el) => el.getAnimations().forEach((a) => a.finish()));
+    });
+    drawn = next;
     away.hidden = reached;
     away.textContent = data
       ? "Can't reach the PC. These numbers are from " + ago(data.at) + '.'
       : "Can't reach the PC. Is it on, with the overlay running and Tailscale connected on both?";
-    const newest = Math.max(0, ...list.map((p) => p.updatedAt || 0));
+    // CPU and RAM are read at every tick, so the footer dates the usage, and them only when they are all there is.
+    const usage = list.some((p) => !p.local) ? list.filter((p) => !p.local) : list;
+    const newest = Math.max(0, ...usage.map((p) => p.updatedAt || 0));
     ft.textContent = body.classList.contains('prefs') ? 'Settings' : newest ? 'Updated ' + ago(newest) : reached ? 'Loading…' : '';
     rf.removeAttribute('aria-busy');
     rf.disabled = list.length > 0 && list.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest

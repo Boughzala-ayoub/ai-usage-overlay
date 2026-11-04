@@ -76,6 +76,9 @@ let theme = 'noir';
 let scale = 1; // Size: the pill's zoom in the renderer, and the panel's once it is above 1
 let hasConsoleKey = false; // a Console session is saved, so the tray offers to forget it
 const panelScale = () => Math.max(1, scale);
+// The pill's zoom: Size's, or smaller where a row of chips at that size is wider than the display it sits on,
+// as six providers at Extra large are on a 600px portrait monitor. The panel keeps its own.
+const pillScale = () => (vertical() ? scale : Math.min(scale, (areaFor(displayId).width - 2 * PAD) / (on().length * CHIP.h)));
 const last = new Map(); // id -> last good { plan, rows, updatedAt }
 const fetched = new Map(); // id -> ms of the last read attempt
 const gate = new Map(); // id -> ms before which we must not ask again (a 429's Retry-After)
@@ -141,13 +144,14 @@ function snapshot() {
       name: p.name,
       glyph: p.glyph,
       color: p.color,
+      local: p.local, // CPU and RAM, which the footers leave out of "Updated"
       ...d,
       // Past its deadline a balance isn't funds, whatever kept the reading: a gated or skipped read, a soft
       // failure, the startup cache. Only the deadline goes out, and the panels say it expired.
       ...(creditExpired(d.apiCredit, now) ? { apiCredit: { expired: true, expiresAt: d.apiCredit.expiresAt } } : {}),
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
-      rows: (d.rows || []).map((r) => ({ ...r, resets: fmtReset(r.resetsAt, now) })),
+      rows: (d.rows || []).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
       waitMs: until > now ? until - now : 0,
     };
   });
@@ -200,7 +204,8 @@ async function readFresh(p, force) {
     return last.set(p.id, { ...prev, note: res.why });
   }
   last.set(p.id, res);
-  if (!res.error) {
+  // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use.
+  if (!res.error && !p.local) {
     showResetNotice(p, resetRows(prev?.rows, res.rows));
     cache[p.id] = res;
     saveState({ cache });
@@ -318,13 +323,21 @@ function servePhone() {
 
 const areaFor = (id) => (screen.getAllDisplays().find((d) => d.id === id) || screen.getPrimaryDisplay()).workArea;
 
+// A display turned, rescaled, unplugged or plugged back in: the capsule goes back on its edge at the size that
+// display now allows (pillScale), on the primary one while its own is gone. Not mid-drag: the drop places it.
+function watchDisplays() {
+  for (const e of ['display-metrics-changed', 'display-removed', 'display-added']) screen.on(e, () => drag || place(false));
+}
+
 function windowSize() {
   const n = on().length;
-  const [s, z] = [scale, panelScale()];
+  const [s, z] = [pillScale(), panelScale()];
   const size = vertical()
     ? { width: EDGE_GAP + SPINE * s + PANEL_W * z + PAD, height: Math.max(n * CHIP.v * s, PANEL_H * z) + 2 * PAD }
     : { width: Math.max(n * CHIP.h * s, PANEL_W * z) + 2 * PAD, height: EDGE_GAP + PILL_H * s + PANEL_H * z + PAD };
-  return { width: Math.ceil(size.width), height: Math.ceil(size.height) };
+  // Never bigger than the display: on a short one the panel's rows scroll instead, since its max-height follows the window.
+  const a = areaFor(displayId);
+  return { width: Math.min(Math.ceil(size.width), a.width), height: Math.min(Math.ceil(size.height), a.height) };
 }
 
 function bounds() {
@@ -359,7 +372,7 @@ function sendLayout() {
   tellPhones();
   if (!alive()) return;
   const t = THEMES.find(([id]) => id === theme);
-  win.webContents.send('layout', { edge, count: on().length, theme, css: t ? t[2] : '', scale });
+  win.webContents.send('layout', { edge, count: on().length, theme, css: t ? t[2] : '', scale: pillScale(), panel: panelScale() });
 }
 
 // ---- hover, click-through and dragging, all driven by the cursor position
@@ -578,7 +591,7 @@ function menu() {
     },
     {
       label: 'Open usage page',
-      submenu: PROVIDERS.map((p) => ({ label: p.name, click: () => shell.openExternal(USAGE_PAGES[p.id]) })),
+      submenu: PROVIDERS.filter((p) => USAGE_PAGES[p.id]).map((p) => ({ label: p.name, click: () => shell.openExternal(USAGE_PAGES[p.id]) })),
     },
     { label: 'Paste Console session key', click: pasteConsoleKey },
     ...(hasConsoleKey ? [{ label: 'Forget Console session key', click: () => useConsoleKey('', undefined) }] : []),
@@ -695,6 +708,7 @@ app.whenReady().then(() => {
   globalShortcut.register(HOTKEY, toggle); // false when another copy already holds it; the menu still works
   timer = setInterval(tick, TICK_MS);
   cursorTimer = setInterval(pollCursor, CURSOR_MS);
+  watchDisplays();
   if (!SHOT) {
     servePhone();
     stopLink = link.start('overlay', PHONE_PORT); // the bubble over the phone's hotspot, where Tailscale can't reach it
@@ -735,10 +749,9 @@ ipcMain.on('drag-end', () => {
   edge = EDGES.reduce((best, e) => (dist[e] < dist[best] ? e : best), 'right');
   // The capsule is centred in the window along its edge, so this leaves it where you dropped it.
   const size = windowSize();
-  along = vertical()
-    ? (cy - size.height / 2 - a.y) / Math.max(1, a.height - size.height)
-    : (cx - size.width / 2 - a.x) / Math.max(1, a.width - size.width);
-  along = Math.max(0, Math.min(1, along));
+  // A window as long as its edge (capped to the display) has nowhere to slide: it keeps where it sat, for a bigger display.
+  const travel = vertical() ? a.height - size.height : a.width - size.width;
+  if (travel > 0) along = Math.max(0, Math.min(1, (vertical() ? cy - size.height / 2 - a.y : cx - size.width / 2 - a.x) / travel));
   saveState({ edge, along, displayId });
   place(true);
 });

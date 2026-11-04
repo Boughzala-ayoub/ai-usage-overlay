@@ -552,12 +552,39 @@ async function readXai() {
   }
 }
 
+// ---- This PC. No account and no request, so `local`: read at every tick, never cached, never a reset notice.
+// CPU is the load since the previous read; RAM is what Windows doesn't count as available, in Task Manager's GB.
+// ponytail: os.cpus() is "% Processor Time"; Task Manager shows "% Processor Utility", which can read higher under turbo.
+const GB = 2 ** 30;
+let cpuBefore = null;
+const cpuTimes = () => os.cpus().reduce((t, c) => ({ idle: t.idle + c.times.idle, all: t.all + Object.values(c.times).reduce((a, b) => a + b, 0) }), { idle: 0, all: 0 });
+async function readCpu() {
+  // The first read has nothing to compare with: half a second of load beats the average since boot.
+  if (!cpuBefore) {
+    cpuBefore = cpuTimes();
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  const now = cpuTimes();
+  const all = now.all - cpuBefore.all;
+  const busy = all > 0 ? 100 * (1 - (now.idle - cpuBefore.idle) / all) : 0;
+  cpuBefore = now;
+  return { plan: os.cpus()[0]?.model.trim() || '', rows: [{ label: 'Load', percent: clamp(Math.round(busy)), resetsAt: null }], updatedAt: Date.now() };
+}
+function readRam() {
+  const total = os.totalmem();
+  const used = total - os.freemem();
+  // `resets` is the row's right-hand column, which for RAM holds the GB in use.
+  return { plan: `${(total / GB).toFixed(1)} GB`, rows: [{ label: 'In use', percent: clamp(Math.round((100 * used) / total)), resetsAt: null, resets: `${(used / GB).toFixed(1)} GB` }], updatedAt: Date.now() };
+}
+
 const PROVIDERS = [
   { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000, read: readClaude },
   { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', everyMs: 5 * 60_000, read: readCodex },
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
   // xAI's mark is monochrome, so it wears the theme's own ink.
   { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', everyMs: 5 * 60_000, read: readXai },
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', everyMs: 0, local: true, read: readCpu },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', everyMs: 0, local: true, read: readRam },
 ];
 
 module.exports = { PROVIDERS, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

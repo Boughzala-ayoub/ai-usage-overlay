@@ -66,6 +66,7 @@ public class Bubble extends Service {
   boolean open, autoHide, peeking;
   int restX, restY; // where the tab sits while the panel is open
   volatile String side = "right"; // the edge it docks on; the page asks as it loads
+  volatile int roomDp = 600; // the screen's height less its bars, in dp: the page fits the tab in it
   final Runnable hide = this::peek;
 
   static String server(Context c) {
@@ -151,6 +152,7 @@ public class Bubble extends Service {
 
   void show() {
     wm = getSystemService(WindowManager.class);
+    roomDp = room(area()); // before the page loads: its first fit() asks
     prefs = getSharedPreferences("bubble", MODE_PRIVATE);
     wDp = prefs.getInt("w", wDp); // the page sends its size as it loads; these are its last one
     hDp = prefs.getInt("h", hDp);
@@ -348,9 +350,15 @@ public class Bubble extends Service {
 
   @JavascriptInterface public String side() { return side; }
 
+  /** The room between the bars in whole dp, rounded down so a tab that fits it fits the screen. */
+  int room(Rect a) { return (int) (a.height() / getResources().getDisplayMetrics().density); }
+
+  @JavascriptInterface public int room() { return roomDp; }
+
   /** The window the tab needs at this phone's bubble size, in dp. */
   @JavascriptInterface public void size(int width, int height) {
-    int nw = Math.max(30, Math.min(width, 120)), nh = Math.max(60, Math.min(height, 300));
+    // A bound on a page gone wrong, not a layout: six providers at Large ask 326. phone/check.mjs reads it from here.
+    int nw = Math.max(30, Math.min(width, 120)), nh = Math.max(60, Math.min(height, 600));
     root.post(() -> {
       if (nw == wDp && nh == hDp) return;
       wDp = nw;
@@ -448,8 +456,14 @@ public class Bubble extends Service {
   @Override public void onConfigurationChanged(Configuration c) {
     super.onConfigurationChanged(c);
     if (root == null) return;
-    // Posted, so the window's metrics and insets are the turned screen's by then.
-    root.post(open ? this::reanchor : this::snap);
+    // Posted, so the window's metrics and insets are the turned screen's by then. A landscape screen can be
+    // too short for the tab at its size, so the page fits it to the new room, and sends a new size if it must.
+    root.post(() -> {
+      roomDp = room(area());
+      js("fit()");
+      if (open) reanchor();
+      else snap();
+    });
   }
 
   @Override public void onDestroy() {

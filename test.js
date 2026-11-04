@@ -265,7 +265,7 @@ configuredProvider.read()
       return Promise.race([read, late]).finally(() => clearTimeout(timer));
     };
     try {
-      for (const provider of require('./providers').PROVIDERS) {
+      for (const provider of require('./providers').PROVIDERS.filter((p) => !p.local)) {
         let calls = 0;
         let mode = 'recover';
         global.fetch = async (url, options) => {
@@ -539,6 +539,7 @@ configuredProvider.read()
     }
   })
   .then(mainChecks)
+  .then(sizingChecks)
   .then(linkChecks)
   .then(healChecks)
   .then(startChecks)
@@ -546,6 +547,94 @@ configuredProvider.read()
   .finally(() => fs.rmSync(codexHome, { recursive: true, force: true }));
 
 // --- main.js polling and persistence, with Electron faked and fake providers: the paths no renderer test reaches.
+// The window main sizes for a top or bottom edge fits the display at every Size: at Extra large six chips are wider than
+// a 600px portrait monitor, so the pill shrinks to fit and the panel keeps its zoom. main.js with the real providers,
+// none of them read, on a fake display.
+function sizingChecks() {
+  const display = { id: 1, workArea: { x: 0, y: 0, width: 600, height: 1000 } };
+  const displays = [display];
+  const events = {};
+  const ipc = {};
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-sizing-'));
+  const electron = {
+    app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on() {}, getPath: () => stateDir },
+    ipcMain: { on: (ch, fn) => (ipc[ch] = fn), handle() {} },
+    screen: {
+      getAllDisplays: () => displays,
+      getPrimaryDisplay: () => display,
+      getDisplayNearestPoint: ({ x }) => displays.find((d) => x >= d.workArea.x && x < d.workArea.x + d.workArea.width) || display,
+      getCursorScreenPoint: () => ({ x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }),
+      on: (e, fn) => (events[e] = fn),
+    },
+  };
+  const mod = { exports: {} };
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { windowSize, pillScale, panelScale, watchDisplays, set: (e, s) => ((edge = e), (scale = s), (displayId = 1)), setWin: (w) => (win = w), setDisplay: (id) => (displayId = id), along: () => along, settle: () => (clearTimeout(saveTimer), clearInterval(snapTimer)) };';
+  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : require(id)), mod, __dirname);
+  const { windowSize, pillScale, panelScale, watchDisplays, set, setWin, setDisplay, along, settle } = mod.exports;
+  for (const [e, s] of [['top', 1.25], ['bottom', 1.25], ['top', 1], ['top', 0.68]]) {
+    set(e, s);
+    assert.ok(windowSize().width <= 600, `six chips on the ${e} edge at Size ${s} fit a 600px display, not ${windowSize().width}px`);
+    assert.strictEqual(panelScale(), Math.max(1, s), 'the panel keeps its zoom');
+  }
+  set('top', 1.25);
+  assert.ok(pillScale() < 1.25 && pillScale() > 1, `Extra large shrinks the pill just enough, to ${pillScale()}`);
+  set('top', 1);
+  assert.strictEqual(pillScale(), 1, 'Large fits, so it stays Large');
+  set('right', 1.25);
+  assert.strictEqual(pillScale(), 1.25, 'a side edge stacks the chips, so it keeps Size');
+
+  // The display changes while the overlay runs: a 1920px monitor turned to 600px, then unplugged for the primary.
+  const sent = [];
+  let bounds = null;
+  setWin({ isDestroyed: () => false, setBounds: (b) => (bounds = b), getBounds: () => bounds, webContents: { send: (ch, v) => sent.push([ch, v]) } });
+  watchDisplays();
+  set('top', 1.25);
+  display.workArea.width = 1920;
+  events['display-metrics-changed']();
+  assert.strictEqual(bounds.width, Math.ceil(6 * 88 * 1.25 + 32), 'on a wide display, Extra large');
+  display.workArea.width = 600;
+  events['display-metrics-changed']();
+  assert.ok(bounds.width <= 600 && bounds.x >= 0 && bounds.x + bounds.width <= 600, `turned to 600px, the window fits it: ${JSON.stringify(bounds)}`);
+  assert.ok(sent.at(-1)[0] === 'layout' && sent.at(-1)[1].scale < 1.25 && sent.at(-1)[1].panel === 1.25, 'and the renderer hears the smaller pill');
+  // A display 600px tall: Extra large's panel alone is 750px, so the window stops at the display and the rows scroll.
+  for (const e of ['right', 'left', 'top', 'bottom']) {
+    set(e, 1.25);
+    display.workArea.height = 600;
+    events['display-metrics-changed']();
+    assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 600 && bounds.x >= 0 && bounds.x + bounds.width <= 600, `on the ${e} edge of a 600px-tall display, the window fits it: ${JSON.stringify(bounds)}`);
+  }
+  display.workArea.height = 1000;
+  set('top', 1.25);
+  // On a second monitor, which is unplugged and then plugged back in: the primary meanwhile, then its own again.
+  const second = { id: 2, workArea: { x: 600, y: 0, width: 1920, height: 1080 } };
+  displays.push(second);
+  setDisplay(2);
+  events['display-added']();
+  assert.ok(bounds.x >= 600 && bounds.width === Math.ceil(6 * 88 * 1.25 + 32), `placed on the second, wide display: ${JSON.stringify(bounds)}`);
+  displays.pop();
+  events['display-removed']();
+  assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 600, `unplugged, on the primary at a size it holds: ${JSON.stringify(bounds)}`);
+  displays.push(second);
+  events['display-added']();
+  assert.ok(bounds.x >= 600, `plugged back in, on its own display again: ${JSON.stringify(bounds)}`);
+
+  // Picked up and dropped where it sits, on a right edge whose window is capped to a 600px-tall display: it has nowhere
+  // to slide, so it keeps its place along the edge rather than going to the corner when the display grows.
+  displays.pop();
+  set('right', 1.25);
+  display.workArea.height = 600;
+  events['display-metrics-changed']();
+  assert.strictEqual(along(), 0.5);
+  ipc['drag-start']();
+  ipc['drag-end']();
+  assert.strictEqual(along(), 0.5, 'a drop with no room to slide keeps its place along the edge');
+  display.workArea.height = 1000;
+  events['display-metrics-changed']();
+  assert.ok(Math.abs(bounds.y + bounds.height / 2 - 500) <= 1, `on the taller display it is still centred: ${JSON.stringify(bounds)}`);
+  settle();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+
 async function mainChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-main-'));
   const on = {};
@@ -567,9 +656,9 @@ async function mainChecks() {
   const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu, savedCache: () => cache };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
-  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState } = mod.exports;
+  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, savedCache } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -605,6 +694,37 @@ async function mainChecks() {
     await readOne({ id: 'claude', everyMs: 0, read: async () => ((clock += 14_000), { error: 'Rate limited', soft: true, retryAfter: 60 }) }, true);
     assert.strictEqual(gate.get('claude'), clock + 60_000, 'gate counts from receipt');
     Date.now = realNow;
+
+    // CPU and RAM from known counters, read as a tick reads them: every read asks again and measures since the
+    // last, nothing is cached, and each reading is dated, so a panel of only these two isn't "Loading…" forever.
+    // A fresh providers module, so its CPU read is a first read whatever asked the CPU before.
+    const real = { cpus: os.cpus, totalmem: os.totalmem, freemem: os.freemem };
+    const key = require.resolve('./providers');
+    const kept = require.cache[key];
+    delete require.cache[key];
+    const freshProviders = require('./providers');
+    require.cache[key] = kept;
+    let cores = [[0, 0], [0, 0]]; // per core, ms [idle, busy]
+    os.cpus = () => cores.map(([idle, user]) => ({ model: ' Test CPU ', times: { user, nice: 0, sys: 0, idle, irq: 0 } }));
+    os.totalmem = () => 16 * 2 ** 30;
+    os.freemem = () => 4 * 2 ** 30;
+    try {
+      const [cpu, ram] = ['cpu', 'ram'].map((id) => freshProviders.PROVIDERS.find((p) => p.id === id));
+      const load = async (then) => ((cores = then), await readOne(cpu, false), last.get('cpu').rows[0].percent);
+      setTimeout(() => (cores = [[400, 100], [100, 400]]), 100); // within the first read's half second
+      assert.strictEqual(await load(cores), 50, 'the first read measures its own half second');
+      assert.strictEqual(await load([[500, 400], [200, 700]]), 75, 'the next read measures since the last one');
+      assert.strictEqual(await load([[700, 400], [400, 700]]), 0, 'and the one after that, again');
+      assert.strictEqual(last.get('cpu').plan, 'Test CPU');
+      await readOne(ram, false);
+      assert.deepStrictEqual([last.get('ram').plan, last.get('ram').rows[0].percent, last.get('ram').rows[0].resets], ['16.0 GB', 75, '12.0 GB'], 'RAM in use, its GB and the total');
+      for (const id of ['cpu', 'ram']) {
+        assert.ok(Number.isFinite(last.get(id).updatedAt), `${id} is dated`);
+        assert.ok(!(id in savedCache()), `${id} is never cached`);
+      }
+    } finally {
+      Object.assign(os, real);
+    }
 
     // xAI asks twice per read. A throttled weekly lookup gates xAI though the monthly one answered: the
     // reading on screen stays whole, says why, and nothing more is asked before Retry-After.

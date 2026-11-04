@@ -149,6 +149,8 @@
     transition: opacity 140ms linear;
   }
   .e-bottom .inner { padding: 8px 14px 4px; border-top: 0; border-bottom: 1px solid var(--line); }
+  /* Above or below a pill wider than the panel (six chips are 490px), the panel fills it rather than leave a bare strip. */
+  .e-top .inner, .e-bottom .inner { min-width: min(100%, calc((100vw - 32px) / var(--z, 1))); }
   /* Beside the pill the panel can be the shorter of the two: it fills the height and centres on it. */
   .e-left .inner, .e-right .inner { justify-content: center; width: min(300px, calc((100vw - 26px - 86px * var(--s, 1)) / var(--z, 1))); max-height: calc((100vh - 36px) / var(--z, 1)); padding-top: 8px; border-top: 0; }
   .e-left .inner { padding-left: 12px; border-left: 1px solid var(--line); }
@@ -518,7 +520,9 @@
   }
 
   function syncFoot() {
-    const newest = Math.max(0, ...data.map((p) => p.updatedAt || 0));
+    // CPU and RAM are read at every tick, so the footer dates the usage, and them only when they are all there is.
+    const usage = data.some((p) => !p.local) ? data.filter((p) => !p.local) : data;
+    const newest = Math.max(0, ...usage.map((p) => p.updatedAt || 0));
     ft.textContent = newest ? ago(newest) : 'Loading…';
     rf.removeAttribute('aria-busy');
     rf.disabled = data.length > 0 && data.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest
@@ -576,7 +580,7 @@
     body.dataset.theme = l.theme || 'noir';
     body.style.cssText = l.css || '';
     body.style.setProperty('--s', l.scale || 1);
-    body.style.setProperty('--z', Math.max(1, l.scale || 1));
+    body.style.setProperty('--z', l.panel || Math.max(1, l.scale || 1)); // main's panel zoom, which a narrow display doesn't shrink
     buildSummary();
     refresh();
   });
