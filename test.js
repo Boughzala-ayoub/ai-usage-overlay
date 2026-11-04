@@ -446,6 +446,39 @@ configuredProvider.read()
     assert.strictEqual(skewed.rows[0].percent, 80, 'the newest event wins even when its file looks older');
   })
   .then(async () => {
+    // Claude's local numbers: Claude Code's copy of /usage in ~/.claude.json, for the account signed in and under an
+    // hour old, shaped as the endpoint's answer is. No request, ever.
+    const config = path.join(codexHome, '.claude.json');
+    const now = Date.now();
+    const writeCopy = (percent, ageMs, account = 'acct') => fs.writeFileSync(config, JSON.stringify({
+      oauthAccount: { accountUuid: 'acct' },
+      cachedUsageUtilization: { fetchedAtMs: now - ageMs, accountUuid: account, utilization: { limits: [{ kind: 'session', percent, resets_at: 'r1' }, { kind: 'weekly_all', percent: 4, resets_at: 'r2' }, { kind: 'weekly_scoped', percent: 1, resets_at: 'r2', scope: { model: { display_name: 'Fable' } } }] } },
+    }));
+    loadCodex(codexHome, codexHome);
+    const { readClaudeLocal } = require('./providers');
+    const originalFetch = global.fetch;
+    global.fetch = async () => assert.fail('local numbers make no request');
+    try {
+      writeCopy(12, 2 * 60_000);
+      const r = readClaudeLocal(now);
+      assert.deepStrictEqual(r.rows.map((x) => [x.label, x.percent, x.resetsAt]), [['Session', 12, 'r1'], ['All models', 4, 'r2'], ['Fable', 1, 'r2']], "Claude Code's copy, in the endpoint's labels");
+      assert.strictEqual(r.updatedAt, now - 2 * 60_000, 'dated by when Claude Code fetched it');
+      writeCopy(12, 2 * 60_000, 'someone-else');
+      assert.strictEqual(readClaudeLocal(now), null, "another account's copy is no copy");
+      writeCopy(12, 61 * 60_000);
+      assert.strictEqual(readClaudeLocal(now), null, 'an hour old is too old');
+      writeCopy(12, -60_000);
+      assert.strictEqual(readClaudeLocal(now), null, 'one from the future is no reading');
+      fs.writeFileSync(config, '{"cachedUsageUtilization": {"fetch');
+      assert.strictEqual(readClaudeLocal(now), null, 'nor one Claude Code is halfway through writing');
+      fs.rmSync(config);
+      assert.strictEqual(readClaudeLocal(now), null, 'nor a missing file');
+    } finally {
+      global.fetch = originalFetch;
+      fs.rmSync(config, { force: true });
+    }
+  })
+  .then(async () => {
     // The API credit rides on Claude's read: asked with the pasted session, kept through a blip, and a
     // dead session says so without costing the usage numbers.
     loadCodex(codexHome, codexHome);
@@ -639,6 +672,7 @@ async function mainChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-main-'));
   const on = {};
   const powerCalls = [];
+  const beeps = [];
   const electron = {
     app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
     ipcMain: { on() {}, handle() {} },
@@ -647,6 +681,7 @@ async function mainChecks() {
     screen: { getAllDisplays: () => [{ id: 1 }], getPrimaryDisplay: () => ({ id: 1 }) },
     safeStorage: { decryptString: (sealed) => sealed.toString() }, // synthetic keys only, sealed as plain base64
     powerSaveBlocker: { start: (type) => (powerCalls.push(['start', type]), 0), stop: (id) => powerCalls.push(['stop', id]) },
+    shell: { beep: () => beeps.push(Date.now()) },
   };
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
@@ -656,9 +691,9 @@ async function mainChecks() {
   const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu, savedCache: () => cache };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
-  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, savedCache } = mod.exports;
+  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, savedCache, setWin, fetched } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -694,6 +729,165 @@ async function mainChecks() {
     await readOne({ id: 'claude', everyMs: 0, read: async () => ((clock += 14_000), { error: 'Rate limited', soft: true, retryAfter: 60 }) }, true);
     assert.strictEqual(gate.get('claude'), clock + 60_000, 'gate counts from receipt');
     Date.now = realNow;
+
+    // A 429 is no news. The numbers on screen stay as they were, with no note; before any numbers the section just
+    // waits. The read is due again as the gate lifts, not five minutes on.
+    {
+      const p = { id: 'gated', everyMs: 5 * 60_000 };
+      let answer = { rows: [{ label: 'Weekly', percent: 40 }], updatedAt: 5000 };
+      let asked = 0;
+      p.read = async () => (asked++, answer);
+      clock = realNow();
+      Date.now = () => clock;
+      await readOne(p, true);
+      answer = { error: 'Rate limited', soft: true, retryAfter: 60 };
+      await readOne(p, true);
+      assert.deepStrictEqual(last.get('gated'), { rows: [{ label: 'Weekly', percent: 40 }], updatedAt: 5000 }, 'a 429 leaves the numbers on screen as they were');
+      answer = { rows: [{ label: 'Weekly', percent: 41 }], updatedAt: 6000 };
+      clock += 59_000;
+      await readOne(p, false);
+      assert.strictEqual(asked, 2, 'nothing is asked while the gate holds');
+      clock += 2000;
+      await readOne(p, false);
+      assert.strictEqual(asked, 3, 'and the read is due the moment it lifts');
+      assert.strictEqual(last.get('gated').rows[0].percent, 41);
+      // Local numbers (readLocal: other clients' files, no request) land when they are newer than the ones on screen:
+      // between reads, through a 429's gate, and after a failed read. Only the usage moves.
+      let local = null;
+      p.readLocal = () => local;
+      const R5 = new Date(clock + 3 * 3600_000).toISOString();
+      const R7 = new Date(clock + 40 * 3600_000).toISOString();
+      answer = { plan: 'Max', apiCredit: { leftCents: 9000, grantedCents: 10000 }, bankedResets: 1, bankedResetExpiries: [1], rows: [{ label: 'Session', percent: 10, resetsAt: R5 }, { label: 'Weekly', percent: 41, resetsAt: R7 }], updatedAt: clock };
+      await readOne(p, true);
+      asked = 0;
+      clock += 60_000;
+      local = { rows: [{ label: 'Session', percent: 30, resetsAt: R5 }, { label: 'Weekly', percent: 41, resetsAt: R7 }, { label: 'Fable', percent: 2, resetsAt: R7 }], updatedAt: clock - 10_000 };
+      await readOne(p, false);
+      const took = last.get('gated');
+      assert.strictEqual(asked, 0, 'between reads, local numbers cost no request');
+      assert.deepStrictEqual(took.rows.map((r) => [r.label, r.percent]), [['Session', 30], ['Weekly', 41], ['Fable', 2]], 'a line that moved lands, one that agrees stays, a new current one joins');
+      assert.deepStrictEqual([took.updatedAt, took.plan, took.apiCredit.leftCents, took.bankedResets], [clock - 10_000, 'Max', 9000, 1], 'dated by the source, with the plan, the credit and the banked resets as read');
+      assert.strictEqual(savedCache().gated.rows[0].percent, 30, 'and saved');
+      local = { rows: [{ label: 'Session', percent: 31, resetsAt: R5 }], updatedAt: clock - 5000 };
+      await readOne(p, false);
+      assert.deepStrictEqual([last.get('gated').rows.map((r) => r.percent), last.get('gated').updatedAt], [[31, 41, 2], clock - 10_000], 'a copy lacking lines on screen moves what it has, and dates nothing');
+      local = { rows: [{ label: 'Session', percent: 5, resetsAt: R5 }], updatedAt: clock - 20_000 };
+      await readOne(p, false);
+      assert.strictEqual(last.get('gated').rows[0].percent, 31, 'older local numbers change nothing');
+      // A newer copy can carry a stale line, since its date need not hold for every line. Each line is judged on its
+      // own. In the same period the higher number is the later one; a later reset time is a new period, and a reset.
+      const iso = (ms) => new Date(clock + ms).toISOString();
+      const H = 3600_000;
+      const S1 = iso(3 * H);
+      const W1 = iso(40 * H).replace('Z', '+00:00'); // as the endpoint writes it
+      const S2 = iso(8 * H);
+      let seen = clock - 5000;
+      const sight = async (rows) => ((local = { rows, updatedAt: ++seen }), await readOne(p, false), last.get('gated').rows.map((r) => [r.label, r.percent]));
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 30, resetsAt: S1 }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen });
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 31, resetsAt: S1 }, { label: 'Weekly', percent: 20, resetsAt: iso(40 * H) }]), [['Session', 31], ['Weekly', 22]], "a stale line in a fresher snapshot can't roll a number back");
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 2, resetsAt: S2 }]), [['Session', 2], ['Weekly', 22]], 'a later reset time is a new period, lower or not');
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 90, resetsAt: S1 }]), [['Session', 2], ['Weekly', 22]], 'and an earlier one is the period before, however high');
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 92, resetsAt: null }]), [['Session', 2], ['Weekly', 22]], 'a line with no reset time never displaces a dated one');
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 3, resetsAt: S2 }]), [['Session', 3], ['Weekly', 22]], 'and the period goes on climbing after it');
+      // Just past a reset the endpoint can say 0% with no reset time: the period before, however high, stays gone.
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 0, resetsAt: null }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen });
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 92, resetsAt: iso(-60_000) }]), [['Session', 0], ['Weekly', 22]], 'a line whose period has ended never comes back');
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 4, resetsAt: S2 }]), [['Session', 4], ['Weekly', 22]], 'a current one takes over an undated one');
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 92, resetsAt: null }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen });
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 3, resetsAt: S2 }]), [['Session', 3], ['Weekly', 22]], 'however high the undated one is');
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 50, resetsAt: iso(-60_000) }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen });
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 5, resetsAt: S2 }]), [['Session', 5], ['Weekly', 22]], 'and one whose own period has ended');
+      // A line not on screen yet joins only when it is current, so an ended one can't drive the summary.
+      assert.deepStrictEqual(await sight([{ label: 'Session', percent: 5, resetsAt: S2 }, { label: 'Fable', percent: 98, resetsAt: iso(-60_000) }, { label: 'Opus', percent: 40, resetsAt: null }]), [['Session', 5], ['Weekly', 22]], 'an unseen line whose period has ended, or with no reset time, is left out');
+      assert.deepStrictEqual(await sight([{ label: 'Fable', percent: 3, resetsAt: W1 }, { label: 'Opus', percent: 0, resetsAt: null }]), [['Session', 5], ['Weekly', 22], ['Fable', 3], ['Opus', 0]], 'a current one joins, and so does a window not started');
+      // A newer copy that agrees with every current line it shares confirms them: the reading's age moves on, the old
+      // note goes, and nothing beeps. One that disputes a line, with a stale number, dates nothing.
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen, note: 'Request timed out' });
+      const before = seen;
+      await sight([{ label: 'Session', percent: 18, resetsAt: S2 }, { label: 'Weekly', percent: 22, resetsAt: W1 }]);
+      assert.deepStrictEqual([last.get('gated').updatedAt, last.get('gated').note], [before, 'Request timed out'], 'a copy with a stale line confirms nothing');
+      await sight([{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Weekly', percent: 22, resetsAt: W1.replace('+00:00', 'Z') }]);
+      assert.deepStrictEqual([last.get('gated').rows.map((r) => r.percent), last.get('gated').updatedAt, last.get('gated').note], [[20, 22], seen, undefined], 'one that agrees dates the reading, and the note goes');
+      // A line on screen the copy lacks may be stale, an ended 98% Fable driving the chip say: nothing is confirmed,
+      // and a line that moves lands without dating the reading or dropping its note.
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Fable', percent: 98, resetsAt: iso(-60_000) }], updatedAt: seen, note: 'Request timed out' });
+      const stale = seen;
+      await sight([{ label: 'Session', percent: 20, resetsAt: S2 }]);
+      assert.deepStrictEqual([last.get('gated').updatedAt, last.get('gated').note], [stale, 'Request timed out'], 'a copy that lacks a line on screen confirms nothing');
+      assert.deepStrictEqual([await sight([{ label: 'Session', percent: 25, resetsAt: S2 }]), last.get('gated').updatedAt, last.get('gated').note], [[['Session', 25], ['Fable', 98]], stale, 'Request timed out'], 'and a line that moves lands without dating the reading');
+      // Two windows not started, 0% with no reset time on both sides, agree.
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Fable', percent: 0, resetsAt: null }], updatedAt: seen, note: 'Request timed out' });
+      await sight([{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Fable', percent: 0, resetsAt: null }]);
+      assert.deepStrictEqual([last.get('gated').updatedAt, last.get('gated').note], [seen, undefined], 'matching windows not started confirm too');
+      last.set('gated', { ...last.get('gated'), rows: [{ label: 'Session', percent: 20, resetsAt: S2 }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: seen });
+      // A new period seen locally is a reset, announced once like the endpoint's: a beep and the notice. A repeated
+      // snapshot, or a fresher one with a stale line, says nothing. Claude is the provider the harness has turned on.
+      {
+        const sent = [];
+        setWin({ isDestroyed: () => false, webContents: { send: (ch, v) => sent.push([ch, v]) } });
+        const c = { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000 };
+        let snap = null;
+        c.read = async () => ({ rows: [{ label: 'Session', percent: 80, resetsAt: S1 }], updatedAt: clock });
+        c.readLocal = () => snap;
+        gate.delete('claude');
+        await readOne(c, true);
+        beeps.length = 0;
+        snap = { rows: [{ label: 'Session', percent: 1, resetsAt: S2 }], updatedAt: clock + 1 };
+        await readOne(c, false);
+        const notices = () => sent.filter(([ch, v]) => ch === 'reset' && v);
+        assert.deepStrictEqual([beeps.length, notices().map(([, v]) => [v.id, v.rows.map((r) => [r.label, r.percent])])], [1, [['claude', [['Session', 1]]]]], 'a new period seen locally beeps and says which limit reset');
+        await readOne(c, false);
+        snap = { rows: [{ label: 'Session', percent: 85, resetsAt: S1 }], updatedAt: clock + 2 };
+        await readOne(c, false);
+        assert.deepStrictEqual([beeps.length, notices().length, last.get('claude').rows[0].percent], [1, 1, 1], 'a repeated snapshot or a stale line says nothing more');
+        setWin(null);
+        for (const m of [last, gate, fetched]) m.delete('claude'); // as the later checks expect to find Claude
+      }
+      answer = { error: 'Rate limited', soft: true, retryAfter: 60 };
+      await readOne(p, true);
+      local = { rows: [{ label: 'Session', percent: 33, resetsAt: S2 }], updatedAt: clock };
+      clock += 1000;
+      await readOne(p, false);
+      assert.deepStrictEqual([asked, last.get('gated').rows[0].percent, gate.get('gated') > clock], [1, 33, true], 'through the gate, newer local numbers land and nothing is asked');
+      gate.delete('gated');
+      answer = { error: 'Request timed out', soft: true };
+      local = { rows: [{ label: 'Session', percent: 34, resetsAt: S2 }, { label: 'Weekly', percent: 22, resetsAt: W1 }], updatedAt: clock + 1 };
+      await readOne(p, true);
+      assert.deepStrictEqual([last.get('gated').rows[0].percent, last.get('gated').note], [34, undefined], 'after a failed read too, and its note goes with the numbers current again');
+      p.readLocal = undefined;
+      // A 429 ends whatever an earlier failure said, since the endpoint answered: the numbers stay without its note,
+      // and a section that had only an error waits for numbers again.
+      const noted = { id: 'noted', everyMs: 0 };
+      let said = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 };
+      noted.read = async () => said;
+      await readOne(noted, true);
+      said = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1, note: 'Monthly usage not refreshed (HTTP 503).' };
+      await readOne(noted, true);
+      on['will-quit'](); // the note's save lands before the 429, as it would 400 ms after the read
+      assert.strictEqual(saved().cache.noted.note, 'Monthly usage not refreshed (HTTP 503).');
+      said = { error: 'Request timed out', soft: true };
+      await readOne(noted, true);
+      assert.strictEqual(last.get('noted').note, 'Request timed out');
+      said = { error: 'Rate limited', soft: true, retryAfter: 1 };
+      await readOne(noted, true);
+      assert.deepStrictEqual(last.get('noted'), { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 }, "a 429 clears an earlier failure's note");
+      on['will-quit'](); // flushes the debounced save, as quitting does
+      assert.strictEqual(saved().cache.noted.note, undefined, 'in state.json too, so a restart during the gate shows none');
+      gate.delete('noted');
+      last.set('noted', { error: 'No Claude credentials — run `claude` to sign in.' });
+      savedCache().noted = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1, note: 'Monthly usage not refreshed (HTTP 503).' };
+      saveState({ cache: savedCache() });
+      on['will-quit'](); // the note's save lands before the 429, as it would 400 ms after the read
+      assert.strictEqual(saved().cache.noted.note, 'Monthly usage not refreshed (HTTP 503).');
+      await readOne(noted, true);
+      assert.strictEqual(last.get('noted'), undefined, 'and an earlier error, so the section waits for numbers');
+      on['will-quit']();
+      assert.strictEqual(saved().cache.noted.note, undefined, 'with the note gone from state.json there too');
+      const fresh = { id: 'gated-fresh', everyMs: 5 * 60_000, read: async () => ({ error: 'Rate limited', soft: true, retryAfter: 60 }) };
+      await readOne(fresh, true);
+      assert.strictEqual(last.get('gated-fresh'), undefined, 'a 429 before any numbers leaves the section waiting for them');
+      Date.now = realNow;
+    }
 
     // CPU and RAM from known counters, read as a tick reads them: every read asks again and measures since the
     // last, nothing is cached, and each reading is dated, so a panel of only these two isn't "Loading…" forever.
@@ -743,7 +937,7 @@ async function mainChecks() {
       weeklyAnswer = () => ({ ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
       await readOne(xai, true);
       assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 96], ['Monthly', 25]], 'a throttled weekly lookup keeps the reading on screen');
-      assert.strictEqual(last.get('xai').note, 'Rate limited', 'and says why it did not move');
+      assert.strictEqual(last.get('xai').note, undefined, 'and adds no note: a rate limit is no news');
       assert.ok(gate.get('xai') >= Date.now() + 89_000, 'gated by the weekly lookup\'s Retry-After');
       xaiAsked = 0;
       await readOne(xai, true);

@@ -78,19 +78,45 @@ panel, the tray checkbox and the window size all follow. Give it a usage page in
 
 ## Rate limits
 
-`/usage` throttles, and a 429 used to make the overlay look broken: the numbers stopped moving and
-Refresh appeared to do nothing. Three things fix that.
+Claude's `/usage` throttles hard, and nothing documents its limit. Every Claude Code session asks
+the same endpoint with the same account, so they and the overlay share one budget. On a Max plan a
+single request can draw a 429, and the overlay used to say `Rate limited, retry in 47s` for it.
 
-The 429's `Retry-After` becomes a per-provider gate in `readOne`, and the gate blocks the manual
-Refresh too. Refusing locally is the only thing that actually keeps us off the endpoint, since a
-button that fires a doomed request every click is what earns the next 429.
+The overlay asks the endpoint first, every five minutes, so its numbers are live whenever it
+answers. It also does what Claude Code does for its own sessions. Claude Code keeps its last answer
+in `~/.claude.json`, as `cachedUsageUtilization`, dated by `fetchedAtMs`. Its sessions share it:
+one fetches, the others reuse it for a minute and, when the endpoint says no, fall back on it for up
+to an hour. Between its own reads, and whenever the endpoint is throttling, the overlay reads that
+copy too, at no request, and shows it when it is newer than its own reading.
 
-The gate and the last good reading both persist to `state.json`, so a restart paints real numbers
-immediately and does not re-hammer an endpoint that already said no.
+The copy counts only for the account signed in now, by account id. One over an hour old, written
+halfway, or changed in shape counts as no copy.
 
-That provider's section says `Rate limited, retry in 47s`. Refresh still asks the other providers,
-and turns itself off only when every provider is gated. Nothing is hidden and nothing is silently
-dropped.
+A copy's date need not hold for every line in it, so each line is judged on its own. A line from
+the copy counts only when its reset time is still ahead. One from a period that has ended, or with
+no reset time, never replaces a line on screen. A current line replaces one on screen that is
+undated or whose period has ended. When both are current, a later reset time is a new period;
+otherwise it is one period, where usage only climbs, so the higher number wins. A stale line can't
+roll a number back, and a number only drops when its period does, which is announced as a reset.
+A line not on screen yet joins only when its reset time is still ahead, or as a window not
+started, at 0% with none. The reading takes the copy's
+date, and an old failure note goes, only when the copy vouches for every line on screen: each one
+moved to the copy's or agrees with it. A line the copy lacks or disputes may be stale, so then the
+lines that moved land and the reading keeps its age and note.
+Only the usage lines move: a line the copy lacks keeps its number, and the plan, the API credit and
+the banked resets stay as the endpoint last gave them.
+
+A 429's `Retry-After` becomes a per-provider gate in `readOne`. The gate blocks the manual Refresh
+too, since a button that fires a doomed request every click earns the next 429. It persists to
+`state.json` with the last good reading, so a restart paints real numbers at once and doesn't ask
+an endpoint that already said no. Meanwhile the local sources keep the numbers moving. When the
+gate lifts, the next tick reads the endpoint again rather than waiting out the rest of the five
+minutes.
+
+A rate limit is never shown, for any provider. The numbers on screen stay as they were, with no
+note, and a section with no numbers yet waits for them. A provider more than ten minutes behind,
+gated or not, says how old its numbers are, as it always did. Refresh still asks the other
+providers, and turns itself off only when every provider is gated.
 
 The request also carries `User-Agent: claude-cli/2.1.280 (external, cli)`, the one Claude Code
 sends. Orca's other trick, a hidden pty that runs `claude`, sends `/usage` and scrapes the TUI, is
@@ -129,8 +155,8 @@ puts the capsule back on the right of the primary display.
   in use read first, and the numbers count up with their bars as the panel opens.
 - Banked resets are one line under their provider: `4 banked resets expire Oct 4, 5, 22 and 29`.
   At zero the line is left out.
-- A provider says so in its own section when it is rate limited (in amber), erroring (in red, with
-  any command set as code), showing a fallback, or more than ten minutes stale. The two icons in the
+- A provider says so in its own section when it is erroring (in red, with any command set as
+  code), showing a fallback, or more than ten minutes stale. A rate limit isn't shown (see Rate limits). The two icons in the
   footer refresh and open the same menu as right-click.
 - When a limit resets, the capsule beeps and opens for six seconds to say which one. Hovering it
   swaps the notice for the full panel.

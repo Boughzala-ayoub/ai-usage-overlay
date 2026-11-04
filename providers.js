@@ -9,6 +9,7 @@ const path = require('path');
 
 const HOME = os.homedir();
 const CLAUDE_CREDS = path.join(HOME, '.claude', '.credentials.json');
+const CLAUDE_CODE_CONFIG = path.join(HOME, '.claude.json'); // where Claude Code keeps its last /usage answer
 const CLAUDE_API = 'https://api.anthropic.com/api/oauth';
 const CONSOLE_API = 'https://platform.claude.com/api';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
@@ -134,6 +135,26 @@ function shapeClaude(usage, profile) {
 
 let claudeProfile = null; // plan tier can't change mid-process; fetched once, halves every later refresh
 
+// ---- Claude's numbers as Claude Code last saw them, read from its file for nothing. Every Claude Code session asks the
+// same /usage endpoint with the same account, which throttles hard (Max accounts see a 429 after a single request), so
+// Claude Code keeps its last answer in ~/.claude.json as cachedUsageUtilization for its sessions to share: one fetches,
+// the others reuse it for a minute and, when the endpoint says no, fall back on it for up to an hour. The overlay does
+// the same: main takes it when it is newer than its own reading, between the five-minute reads and while gated. It is
+// the endpoint's own shape, dated by the fetch, and counts only for the account signed in now.
+// ponytail: an internal file of Claude Code's; one that changes shape is just no copy, and the endpoint carries on.
+function readClaudeLocal(now = Date.now()) {
+  try {
+    const config = JSON.parse(fs.readFileSync(CLAUDE_CODE_CONFIG, 'utf8'));
+    const copy = config.cachedUsageUtilization;
+    const age = now - copy?.fetchedAtMs;
+    if (!copy?.accountUuid || copy.accountUuid !== config.oauthAccount?.accountUuid || !Array.isArray(copy.utilization?.limits) || !(age >= 0 && age < HOUR)) return null;
+    const { rows } = shapeClaude(copy.utilization);
+    return rows.length ? { rows, updatedAt: copy.fetchedAtMs } : null;
+  } catch {
+    return null; // missing, or caught halfway through a write
+  }
+}
+
 // ---- Claude API credit: the monthly credit Max and Team plans pay into a linked Console organization.
 // No public API reports it. The Console's billing page reads it with the browser session, and so do we,
 // with the sessionKey cookie main hands over from its encrypted store.
@@ -221,7 +242,8 @@ async function readClaude() {
     const credit = session === consoleSession && apiCredit;
     return { ...shapeClaude(usage, claudeProfile), ...(credit ? { apiCredit: credit } : {}), updatedAt: Date.now() };
   } catch (e) {
-    // A 429 is a non-event: soft errors keep the last numbers on screen instead of blanking them.
+    // Main keeps the last numbers on screen through a 429, waits out its Retry-After, and meanwhile takes the
+    // newest numbers other clients have (readClaudeLocal).
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
     return { error: e.message || 'Request failed', soft: !!e.soft };
   }
@@ -578,7 +600,7 @@ function readRam() {
 }
 
 const PROVIDERS = [
-  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000, read: readClaude },
+  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000, read: readClaude, readLocal: readClaudeLocal },
   { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', everyMs: 5 * 60_000, read: readCodex },
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
   // xAI's mark is monochrome, so it wears the theme's own ink.
@@ -587,4 +609,4 @@ const PROVIDERS = [
   { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', everyMs: 0, local: true, read: readRam },
 ];
 
-module.exports = { PROVIDERS, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };
+module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

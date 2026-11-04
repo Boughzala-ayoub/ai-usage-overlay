@@ -108,7 +108,7 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
       if (state === 'codex-multiple') { data[1].bankedResets = 2; data[1].bankedResetExpiries.push(Date.parse('2026-10-12T18:15:00Z')); }
       if (state === 'warning') data[0].rows[0].percent = data[0].ringPercent = 96;
       if (state === 'limited') data.forEach((p) => (p.waitMs = 90000));
-      if (state === 'limited-one') data[0].waitMs = 90000;
+      if (state === 'limited-one') { data[0].waitMs = 90000; data[0].updatedAt = Date.now() - 15 * 60000; } // gated, and behind
       if (state === 'error') { data[0].rows = []; data[0].error = 'No Claude credentials — run `claude` to sign in.'; }
       if (state === 'xai-unavailable') { data[3].rows = []; data[3].error = 'Grok sign-in expired — run `grok` to renew it.'; }
       if (state === 'loading') { data[0].rows = []; data[0].updatedAt = null; }
@@ -185,7 +185,9 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
     if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 11) bad.push('one row per limit');
     if (state === 'long' && result.rows !== 16) bad.push('long rows');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
-    if (state === 'limited-one' && !result.status.some((s) => s.startsWith('Rate limited, retry in 2 min'))) bad.push('rate-limit line');
+    // A rate limit is never shown, in any state. Numbers that have fallen behind say how old they are, gated or not.
+    if (result.status.some((s) => s.includes('Rate limited'))) bad.push('rate-limit line');
+    if (state === 'limited-one' && !result.status.includes('Updated 15 min ago')) bad.push('age line while gated');
     if (['error', 'loading'].includes(state) && result.chips[0] !== '—') bad.push('empty chip');
     if (state === 'error' && !result.status.includes('No Claude credentials — run claude to sign in.')) bad.push('error line');
     if (!result.xaiInk) bad.push("xAI mark not in the theme's ink");

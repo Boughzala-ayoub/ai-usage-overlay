@@ -183,19 +183,43 @@ function readOne(p, force) {
 async function readFresh(p, force) {
   const now = Date.now();
   // The gate is the whole rate-limit answer: a 429's Retry-After stops every later request,
-  // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint.
-  if (now < (gate.get(p.id) || 0)) return;
-  if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return;
+  // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint. Meanwhile, and between
+  // reads, a provider with local numbers (Claude: other clients' files) shows them when they are newer.
+  if (now < (gate.get(p.id) || 0)) return takeLocal(p);
+  if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
   fetched.set(p.id, now);
   const res = await p.read();
   const prev = last.get(p.id);
+  // A 429's Retry-After, whether or not a reading came with it: nothing is asked before it, and the read is due
+  // again the moment it lifts rather than a whole cadence later, so the numbers fall behind as little as they can.
+  if (res.retryAfter) {
+    const until = Date.now() + res.retryAfter * 1000; // from the 429's arrival, not the request's start
+    gate.set(p.id, until);
+    fetched.delete(p.id); // the gate alone holds it back now
+    saveState({ gate: Object.fromEntries(gate) });
+  }
   if (res.error && res.soft) {
+    // A rate limit is no news: the numbers on screen stay, or the section waits for its first. Only their age says
+    // they've fallen behind, past ten minutes, as for any provider. The endpoint did answer, so whatever an earlier
+    // failure said (a timeout's note, a sign-in error) is over.
     if (res.retryAfter) {
-      gate.set(p.id, Date.now() + res.retryAfter * 1000); // from the 429's arrival, not the request's start
-      saveState({ gate: Object.fromEntries(gate) });
+      if (!prev?.rows?.length) last.delete(p.id);
+      else {
+        const { note, ...numbers } = prev;
+        last.set(p.id, numbers);
+      }
+      if (cache[p.id]?.note) {
+        const { note: saved, ...clean } = cache[p.id];
+        cache[p.id] = clean; // or a restart during the gate brings the note back
+        saveState({ cache });
+      }
+      return takeLocal(p);
     }
-    // Soft means the numbers on screen are still the best we have: keep them, add a note.
-    if (prev) return last.set(p.id, { ...prev, note: res.error });
+    // Any other soft failure keeps the numbers on screen too, the best we have, with a note.
+    if (prev) {
+      last.set(p.id, { ...prev, note: res.error });
+      return takeLocal(p);
+    }
   }
   // A fallback (it carries `why`) is an old observation, and can be older than the numbers on screen.
   // Then it's no news: keep the newer ones, say why they didn't move, and never read the drop as a
@@ -210,6 +234,58 @@ async function readFresh(p, force) {
     cache[p.id] = res;
     saveState({ cache });
   }
+}
+
+// Which of two sightings of one usage line is the later truth: the one on screen (mine) or a local source's (theirs).
+// A source's date need not hold for every line it carries, so each line is judged on its own, and a local line counts only when it is provably in the period under way now: its
+// reset time is still ahead. One whose period has ended, or with no reset time, never displaces ours, unless neither
+// side is dated. Ours, undated (a window not started) or ended, gives way to a current one. Both current: a later reset
+// time is a new period; otherwise it is one period, where usage only climbs, so the higher number is the later one.
+// Two sources write one period's reset time a few milliseconds apart; the next period's is hours on.
+const PERIOD_SLACK = 30 * 60_000;
+function laterLine(mine, theirs, now = Date.now()) {
+  const [a, b] = [Date.parse(mine.resetsAt), Date.parse(theirs.resetsAt)];
+  const current = (t) => t > now; // NaN, no reset time, is never current
+  if (!current(b)) return Number.isNaN(a) && Number.isNaN(b) && theirs.percent > mine.percent ? theirs : mine;
+  if (!current(a)) return theirs;
+  if (Math.abs(b - a) > PERIOD_SLACK) return b > a ? theirs : mine;
+  return theirs.percent > mine.percent ? theirs : mine;
+}
+
+// A provider's local numbers (readLocal: no request), from a snapshot newer than the reading on screen, line by line
+// (laterLine). A line not on screen yet is added only when it is current: its reset time still ahead, or a window
+// not started (0% with none). The reading is dated by the copy, and a failed read's note goes, only when the copy
+// vouches for every line on screen: each one moved to the copy's or agrees with it. A line it lacks or disputes may be
+// stale, so then the lines that moved land, and the reading keeps its age and note. Only the usage moves: the plan,
+// the API credit and the banked resets stay as last read. A drop can only be a new period, so it is announced as a
+// reset, as from the endpoint.
+function takeLocal(p) {
+  const local = p.readLocal?.();
+  const prev = last.get(p.id);
+  if (!local || (prev?.rows?.length && !(local.updatedAt > (prev.updatedAt ?? -Infinity)))) return;
+  const now = Date.now();
+  const current = (r) => Date.parse(r.resetsAt) > now || (!r.resetsAt && r.percent === 0);
+  const theirs = new Map(local.rows.map((r) => [r.label, r]));
+  const samePeriod = (a, b) => (!a.resetsAt && !b.resetsAt) || Math.abs(Date.parse(a.resetsAt) - Date.parse(b.resetsAt)) <= PERIOD_SLACK;
+  let changed = false;
+  let unverified = 0; // lines on screen the copy doesn't vouch for
+  const rows = (prev?.rows || []).map((r) => {
+    const t = theirs.get(r.label);
+    const next = t ? laterLine(r, t, now) : r;
+    if (next !== r) changed = true;
+    else if (!(t && current(t) && t.percent === r.percent && samePeriod(r, t))) unverified++;
+    return next;
+  });
+  const added = local.rows.filter((r) => !rows.some((k) => k.label === r.label) && current(r));
+  rows.push(...added);
+  if (added.length) changed = true;
+  if (!rows.length || (!changed && unverified)) return; // nothing it says is newer than ours
+  const { note, error, ...rest } = prev || {};
+  const next = unverified ? { ...prev, rows } : { ...rest, rows, updatedAt: local.updatedAt };
+  last.set(p.id, next);
+  showResetNotice(p, resetRows(prev?.rows, next.rows));
+  cache[p.id] = next;
+  saveState({ cache });
 }
 
 async function tick(force = false) {

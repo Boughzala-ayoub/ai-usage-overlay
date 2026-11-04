@@ -473,13 +473,13 @@
 
   function section(p) {
     const rows = p.rows || [];
-    const wait = p.waitMs > 0 ? Math.ceil(p.waitMs / 1000) : 0;
     const lines = [];
     if (!rows.length) lines.push(p.error ? [p.error, ' bad'] : ['Waiting for usage data…', '']);
-    if (wait) lines.push(['Rate limited, retry in ' + (wait < 60 ? wait + 's' : Math.ceil(wait / 60) + ' min'), ' warn']);
-    else if (p.note) lines.push([p.note, '']);
+    if (p.note) lines.push([p.note, '']);
     // A provider that has fallen behind says so, note or not; the footer speaks for the ones that are current.
-    if (!wait && p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push([ago(p.updatedAt), '']);
+    // A rate limit isn't shown: main keeps the numbers through it and asks again as it lifts. Fallen behind, gated or
+    // not, a provider says how old its numbers are.
+    if (p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push([ago(p.updatedAt), '']);
     const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : ''; // OpenCode Go's plan is "Go": say it once
     return '<section class="prov" style="--c:' + esc(p.color) + '">' +
       '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span title="' + esc(plan) + '">' + esc(plan) + '</span></header>' +

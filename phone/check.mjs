@@ -281,6 +281,8 @@ try {
     const signedOut = state === 'hot';
     if (signedOut !== xai.off || xai.num !== (signedOut ? '—' : '43%')) fail(`${state}: the xAI ring reads ${xai.num}${xai.off ? ', off' : ''}`);
     if (signedOut !== xai.status.includes('Grok sign-in expired — run grok to renew it.')) fail(`${state}: the xAI section says ${JSON.stringify(xai.status)}`);
+    // Hot, Codex is gated and an hour behind: no rate-limit line, only how old its numbers are.
+    if (xai.status.some((s) => s.includes('Rate limited')) || signedOut !== xai.status.includes('Updated 1 hr ago')) fail(`${state}: a gated Codex says ${JSON.stringify(xai.status)}`);
     if (state === 'down') {
       answer = 'down';
       await page.evaluate(() => load());
