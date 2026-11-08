@@ -680,9 +680,14 @@ async function mainChecks() {
     Menu: { buildFromTemplate: (template) => template },
     screen: { getAllDisplays: () => [{ id: 1 }], getPrimaryDisplay: () => ({ id: 1 }) },
     safeStorage: { decryptString: (sealed) => sealed.toString() }, // synthetic keys only, sealed as plain base64
-    powerSaveBlocker: { start: (type) => (powerCalls.push(['start', type]), 0), stop: (id) => powerCalls.push(['stop', id]) },
     shell: { beep: () => beeps.push(Date.now()) },
   };
+  // Keep-awake's PowerShell helper, never really started: each child is numbered so a stop names the one it ends.
+  const childProcess = { spawn: (cmd, args, opts) => {
+    const id = powerCalls.filter(([what]) => what === 'start').length;
+    powerCalls.push(['start', cmd, args.at(-1).includes('SetThreadExecutionState(0x80000001)') && opts.windowsHide && opts.stdio[0] === 'pipe']);
+    return { on() { return this; }, kill: () => powerCalls.push(['stop', id]) };
+  } };
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
   const http = { createServer: (fn) => ((phoneHandler = fn), { on() { return this; }, listen() { return this; } }) };
@@ -692,7 +697,7 @@ async function mainChecks() {
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
   const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
-  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === './providers' ? providers : require(id)), mod, __dirname);
+  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : require(id)), mod, __dirname);
   const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, savedCache, setWin, fetched } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
@@ -1096,7 +1101,7 @@ async function mainChecks() {
       const res = await ask('POST', '/api/settings', '{"keepAwake":true}');
       assert.strictEqual(JSON.parse(res.body).keepAwake, true);
     }
-    assert.deepStrictEqual(powerCalls, [['start', 'prevent-app-suspension']], 'repeated enable starts only one blocker, including ID zero');
+    assert.deepStrictEqual(powerCalls, [['start', 'powershell.exe', true]], 'repeated enable starts one hidden helper holding ES_SYSTEM_REQUIRED on an open stdin');
     assert.strictEqual(awakeMenu().checked, true, 'phone updates the PC menu');
     awakeMenu().click({ checked: false });
     assert.deepStrictEqual(powerCalls.at(-1), ['stop', 0], 'PC toggle releases the same blocker');
@@ -1106,11 +1111,12 @@ async function mainChecks() {
     assert.strictEqual(saved().keepAwake, false);
     awakeMenu().click({ checked: true });
     on['will-quit']();
-    assert.deepStrictEqual(powerCalls.at(-1), ['stop', 0], 'quit releases the blocker');
+    assert.deepStrictEqual(powerCalls.at(-1), ['stop', 1], 'quit releases the blocker');
     assert.strictEqual(saved().keepAwake, true, 'quit preserves the saved choice');
     loadState();
     assert.strictEqual(awakeMenu().checked, true, 'startup restores keep-awake');
-    assert.deepStrictEqual(powerCalls.at(-1), ['start', 'prevent-app-suspension']);
+    assert.deepStrictEqual(powerCalls.at(-1), ['start', 'powershell.exe', true]);
+    assert.strictEqual(powerCalls.filter(([what]) => what === 'start').length, 3, 'one helper per enable');
     awakeMenu().click({ checked: false });
     on['will-quit']();
 

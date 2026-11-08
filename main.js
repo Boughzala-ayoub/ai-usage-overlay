@@ -1,5 +1,6 @@
 'use strict';
-const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog } = require('electron');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -517,11 +518,26 @@ function pollCursor() {
 // ---- chrome
 // The settings the phone shares, set from the tray menu or the phone alike. Each ignores what it doesn't know.
 
+// Keep PC awake. Electron's powerSaveBlocker can't: its 'prevent-app-suspension' is Windows'
+// PowerRequestExecutionRequired, which means "system required" only on S3 PCs, so this Modern Standby laptop
+// slept on idle anyway; 'prevent-display-sleep' would keep the screen lit. A hidden PowerShell holds
+// ES_SYSTEM_REQUIRED instead until its stdin closes: we kill it, quit, or crash. Windows still sleeps when
+// the lid closes, and on battery it drops the request 5 min after the sleep timeout.
+const AWAKE_PS = `Add-Type -Namespace W -Name P -MemberDefinition '[DllImport("kernel32.dll")] public static extern int SetThreadExecutionState(int f);'; [void][W.P]::SetThreadExecutionState(0x80000001); [void][Console]::In.ReadToEnd()`;
+
+function holdAwake() {
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', AWAKE_PS], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
+  child.on('error', (e) => console.error('keep awake:', e.message));
+  // ponytail: one that dies while wanted comes back 10 s later, forever if PowerShell can't run at all
+  child.on('exit', () => setTimeout(() => awakeBlocker === child && (awakeBlocker = holdAwake()), 10_000));
+  return child;
+}
+
 function setKeepAwake(next) {
   if (typeof next !== 'boolean' || next === (awakeBlocker !== null)) return;
-  if (next) awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  if (next) awakeBlocker = holdAwake();
   else {
-    powerSaveBlocker.stop(awakeBlocker);
+    awakeBlocker.kill();
     awakeBlocker = null;
   }
   saveState({ keepAwake: next });
@@ -835,7 +851,7 @@ ipcMain.on('drag-end', () => {
 app.on('window-all-closed', () => app.quit());
 app.on('will-quit', (e) => {
   if (awakeBlocker !== null) {
-    powerSaveBlocker.stop(awakeBlocker);
+    awakeBlocker.kill();
     awakeBlocker = null;
   }
   clearInterval(timer);
