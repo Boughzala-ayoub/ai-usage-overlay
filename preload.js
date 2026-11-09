@@ -13,7 +13,7 @@ contextBridge.exposeInMainWorld('api', {
   get: () => ipcRenderer.invoke('data'),
   rects: (r) => ipcRenderer.send('rects', r),
   menu: () => ipcRenderer.send('menu'),
-  refresh: () => ipcRenderer.send('refresh'),
+  refresh: () => ipcRenderer.invoke('refresh'),
   dragStart: () => ipcRenderer.send('drag-start'),
   dragEnd: () => ipcRenderer.send('drag-end'),
 });

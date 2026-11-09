@@ -175,9 +175,11 @@ function showResetNotice(p, rows) {
 }
 
 // One read per provider at a time. Two overlapping refreshes used to race, and a slow older answer
-// landing last rolled the numbers back and beeped a reset that never happened.
+// landing last rolled the numbers back and beeped a reset that never happened. Each read pushes as it
+// settles, whoever asked for it: a read can take over a minute to give up, and the other providers' numbers,
+// CPU and RAM and the countdowns used to wait for it.
 function readOne(p, force) {
-  if (!inflight.has(p.id)) inflight.set(p.id, readFresh(p, force).finally(() => inflight.delete(p.id)));
+  if (!inflight.has(p.id)) inflight.set(p.id, readFresh(p, force).finally(() => (inflight.delete(p.id), push())));
   return inflight.get(p.id);
 }
 
@@ -289,10 +291,10 @@ function takeLocal(p) {
   saveState({ cache });
 }
 
+// No push of its own: each read pushes as it settles (readOne), which re-renders the countdowns too.
 async function tick(force = false) {
   if (!visible) return; // hidden means hidden: no polling, no requests
   await Promise.all(on().map((p) => readOne(p, force)));
-  push(); // every beat, even with no new data: the countdowns need re-rendering
 }
 
 // ---- the phone bubble (phone/), over Tailscale. It gets what the panel shows, and shares the theme,
@@ -303,8 +305,8 @@ async function tick(force = false) {
 const phones = new Set(); // open /api/events streams
 let toldPhones = '';
 // Every snapshot carries this run of the overlay and a number one higher than the last snapshot made, so a
-// phone keeps the newest however they reach it: a read snapshots only after its provider answers, so it can
-// be newer than a stream message that left while it waited, though it arrives after it.
+// phone keeps the newest however they reach it: a read snapshots only once its providers answer or its wait runs
+// out, so it can be newer than a stream message that left while it waited, though it arrives after it.
 const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 let snapshots = 0;
 function phoneState() {
@@ -342,8 +344,13 @@ function servePhone() {
     }
     if (url === '/api/usage') {
       // GET reads only what is due, as the tick would; POST is the phone's Refresh. Both stop at a 429's gate.
-      await Promise.allSettled(on().map((p) => readOne(p, req.method === 'POST')));
-      push();
+      // Neither waits on a slow read past its cap, since one can take 75 s to give up: the answer is what there is,
+      // and the stream brings each later reading as it lands. The phone gives up on a GET at 20 s, and on a
+      // Refresh at 60 s.
+      let cap;
+      const capped = new Promise((r) => (cap = setTimeout(r, req.method === 'POST' ? 45_000 : 5000)));
+      await Promise.race([Promise.allSettled(on().map((p) => readOne(p, req.method === 'POST'))), capped]);
+      clearTimeout(cap);
       return json(res, phonePayload());
     }
     if (url === '/api/events') {
@@ -354,7 +361,10 @@ function servePhone() {
     }
     if (url === '/api/link') {
       // The phone link's secret (link.js), for the phone over Tailscale only: the tailnet is what vouches for it.
-      if (!/\.ts\.net(:\d+)?$/.test(req.headers.host)) return res.writeHead(403).end();
+      // Never down the link itself, whatever Host it says: a gateway that relays the handshake between this PC and
+      // the phone can send its own GO and get a pipe to this port. Pipes come from link.PIPE_FROM, and
+      // tailscale serve from 127.0.0.1.
+      if (!/\.ts\.net(:\d+)?$/.test(req.headers.host) || [link.PIPE_FROM, '::ffff:' + link.PIPE_FROM].includes(req.socket.remoteAddress)) return res.writeHead(403).end();
       return json(res, { secret: link.secret() });
     }
     if (url === '/api/options') {
@@ -575,9 +585,9 @@ function setChoice(id, row) {
 
 // The Console's sessionKey cookie, for the Claude API credit line. It unlocks the whole Console account,
 // so it is checked before it can reach a request header, saved only encrypted to this Windows user, and
-// taken off the clipboard.
-function pasteConsoleKey() {
-  const key = clipboard.readText().trim();
+// taken off the clipboard. Electron 44 made reading the clipboard asynchronous.
+async function pasteConsoleKey() {
+  const key = (await clipboard.readText()).trim();
   if (!/^sk-ant-sid[\w-]+$/.test(key)) {
     dialog.showErrorBox('No Console session key on the clipboard', 'In Chrome, open platform.claude.com, press F12, and under Application > Cookies copy the value of sessionKey. Then pick Paste Console session key again.');
     return;
@@ -811,7 +821,7 @@ ipcMain.on('rects', (_e, r) => {
   rects = r; // the page is never zoomed as a whole, so its CSS px are the window's px
 });
 ipcMain.on('menu', () => tray.popUpContextMenu());
-ipcMain.on('refresh', () => tick(true));
+ipcMain.handle('refresh', () => tick(true)); // settles when every read it asked for has, for the button's spinner
 ipcMain.handle('data', () => snapshot());
 
 ipcMain.on('drag-start', () => {

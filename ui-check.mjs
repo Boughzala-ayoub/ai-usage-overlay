@@ -82,7 +82,9 @@ await page.evaluateOnNewDocument(() => {
     onReveal: (fn) => (events.reveal = fn),
     onDragging: (fn) => (events.dragging = fn),
     get: async () => [],
-    rects(r) { window.__rects = r; }, menu() { window.__menuCalled = true; }, refresh() { window.__refreshCalled = true; }, dragStart() {}, dragEnd() {},
+    rects(r) { window.__rects = r; }, menu() { window.__menuCalled = true; }, dragStart() {}, dragEnd() {},
+    // As main's: settles once every read it asked for has, which here is when the check says.
+    refresh() { window.__refreshCalled = true; return new Promise((r) => (window.__refreshed = r)); },
   };
 });
 await page.goto(base, { waitUntil: 'load' });
@@ -97,6 +99,7 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
     if (height !== 700 && theme !== 'noir' && !process.env.UI_THEME) continue;
     if (!process.env.UI_THEME && !['noir', 'paper'].includes(theme) && !shows.includes(state)) continue;
     await page.evaluate(({ data, edge, theme, css, state, scale, panelZoom }) => {
+      window.__refreshed?.(); // the last state's refresh is over
       if (state === 'claude-banked') { data[0].bankedResets = 1; data[0].bankedResetExpiries = [Date.parse('2026-10-22T16:00:00Z')]; }
       if (state === 'claude-credit') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z') };
       if (state === 'claude-credit-stale') data[0].apiCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), error: 'API credit not refreshed (HTTP 503), showing the last reading.' };
@@ -223,6 +226,7 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
 }
 
 await page.evaluate((data) => {
+  window.__refreshed?.();
   window.__overlayEvents.reset(null);
   window.__overlayEvents.data(data);
   window.__overlayEvents.open(true);
@@ -271,8 +275,12 @@ for (const edge of edges) {
     check(document.querySelector('#details').getBoundingClientRect().width > 250, 'Panel did not open');
     document.querySelector('#rf').click();
     check(getComputedStyle(document.querySelector('#rf svg')).animationName === 'spin', 'Refresh icon does not spin');
+    // Main pushes each provider's numbers as it answers: the button spins, and stays off, until the whole refresh has.
     ev.data(data);
-    check(!document.querySelector('#rf').hasAttribute('aria-busy'), 'Refresh spinner did not stop after data arrived');
+    check(document.querySelector('#rf').hasAttribute('aria-busy') && document.querySelector('#rf').disabled, 'Refresh spinner stopped with the first numbers in');
+    window.__refreshed();
+    await new Promise(requestAnimationFrame);
+    check(!document.querySelector('#rf').hasAttribute('aria-busy') && !document.querySelector('#rf').disabled, 'Refresh spinner did not stop once the refresh did');
     ev.open(false);
     await settle();
     check(document.querySelector('#details').getBoundingClientRect().width === 0, 'Panel did not close');

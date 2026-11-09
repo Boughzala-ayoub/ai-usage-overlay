@@ -13,6 +13,9 @@ const { execFile } = require('child_process');
 
 const PORT = 7499;
 const POOL = 6; // waiting connections: a page opens a few at once
+// Pipes reach this PC's port from an address of their own, so the overlay can tell them from tailscale serve,
+// which comes from 127.0.0.1. Whoever sent the GO, nothing the tailnet alone vouches for goes down a pipe.
+const PIPE_FROM = '127.0.0.2';
 // One secret for every app on this PC that speaks the link (Loom too), so the phone needs only one.
 const SECRET_FILE = path.join(process.env.LOCALAPPDATA || require('os').homedir(), 'phone-link', 'secret');
 // There while a `tailscale down` of heal()'s own hasn't been undone by an up.
@@ -96,7 +99,7 @@ function connect(gw, name, port, key, freed) {
           stage = 'piping';
           s.removeListener('data', onData);
           s.setTimeout(0);
-          const local = net.connect({ host: '127.0.0.1', port }, () => {
+          const local = net.connect({ host: '127.0.0.1', port, localAddress: PIPE_FROM }, () => {
             s.write('OK\n');
             s.pipe(local);
             local.pipe(s);
@@ -253,4 +256,4 @@ function start(name, port) {
   };
 }
 
-module.exports = { PORT, SECRET_FILE, hmac, secret, gateways, gateway, connect, heal, start };
+module.exports = { PORT, PIPE_FROM, SECRET_FILE, hmac, secret, gateways, gateway, connect, heal, start };

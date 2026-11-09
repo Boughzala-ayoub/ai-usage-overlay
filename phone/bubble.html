@@ -595,8 +595,9 @@
     const usage = list.some((p) => !p.local) ? list.filter((p) => !p.local) : list;
     const newest = Math.max(0, ...usage.map((p) => p.updatedAt || 0));
     ft.textContent = body.classList.contains('prefs') ? 'Settings' : newest ? 'Updated ' + ago(newest) : reached ? 'Loading…' : '';
-    rf.removeAttribute('aria-busy');
-    rf.disabled = list.length > 0 && list.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest
+    // Off while a Refresh is out, too: the stream brings each provider's numbers as it answers, and a second tap
+    // would ask the ones that already have all over again.
+    rf.disabled = rf.hasAttribute('aria-busy') || (list.length > 0 && list.every((p) => p.waitMs > 0)); // one gated provider doesn't stop the rest
     drawPrefs();
   }
 
@@ -716,7 +717,10 @@
   rf.onclick = () => {
     rf.disabled = true;
     rf.setAttribute('aria-busy', 'true');
-    load(true);
+    load(true).then(() => {
+      rf.removeAttribute('aria-busy');
+      draw();
+    });
   };
   mn.onclick = () => showPrefs(!body.classList.contains('prefs'));
 

@@ -180,6 +180,10 @@ try {
   page.on('pageerror', (e) => fail('page error: ' + e.message));
   await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   const settle = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  // Every animation that ends, run to its end. Two frames aren't enough: on a loaded machine the panel's pull can
+  // still be pending, and a pending animation draws its first frame, so the card measures at 30% scale beside the
+  // tab however short reduced motion makes it. pulse and spin never end, so they're left out.
+  const ended = () => page.evaluate(() => Promise.all(document.getAnimations().filter((a) => a.effect.getTiming().iterations !== Infinity).map((a) => a.finished.catch(() => {}))));
   // setViewport can return before the page has the new size; wait for it, then for a frame drawn at it.
   const resize = async (v) => {
     await page.setViewport(v);
@@ -221,6 +225,7 @@ try {
     await settle(); // a lift() just before leaves a slide running for two frames
     await page.evaluate((a) => expand(...a), [side === 'right' ? width - win.width : 0, wy, 24, 48]);
     await resize({ width, height, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
+    await ended();
   };
   // Bubble.java's reanchor(): when the screen turns or the size changes with the panel open, the tab's
   // window goes back to its edge for the new screen and size, inside the bars, and the page gets that place.
@@ -232,6 +237,7 @@ try {
       fail(`${tag}: ${e.message.split('\n')[0]}`);
     }
     await settle();
+    await ended();
   };
   // Every control on screen lies inside the viewport: a page that hides its overflow passes a scrollWidth
   // check with them cut off. Rows scrolled out of their list are not on screen, so they don't count, and of a
@@ -467,6 +473,18 @@ try {
     return [aged, local];
   });
   if (foot[0] !== 'Updated 5 min ago' || foot[1] !== 'Updated just now') fail(`footer: ${JSON.stringify(foot)}`);
+  // A Refresh spins, and stays off, until the PC answers it, though the stream brings each provider's numbers
+  // meanwhile: a second tap would ask the ones that already answered all over again.
+  holdUsage = true;
+  await page.click('#rf');
+  for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 20));
+  tell();
+  await until(() => document.querySelectorAll('#sections .prov')[4]?.textContent.includes('23'), 'refresh: a streamed reading lands meanwhile');
+  const spinning = await page.$eval('#rf', (b) => [b.disabled, b.getAttribute('aria-busy')].join());
+  if (spinning !== 'true,true') fail(`refresh: with the stream's numbers in and the Refresh still out, the button is ${spinning}`);
+  release?.();
+  release = null;
+  await until(() => !rf.disabled && !rf.hasAttribute('aria-busy'), 'refresh: the button is back once the PC answers');
   await resize(small);
   // A tap instead of a drag cancels: the window folds back and nothing is copied.
   await open(412, 915, 'left', 120);

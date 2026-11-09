@@ -679,9 +679,12 @@ async function mainChecks() {
     globalShortcut: { unregisterAll() {} },
     Menu: { buildFromTemplate: (template) => template },
     screen: { getAllDisplays: () => [{ id: 1 }], getPrimaryDisplay: () => ({ id: 1 }) },
-    safeStorage: { decryptString: (sealed) => sealed.toString() }, // synthetic keys only, sealed as plain base64
+    safeStorage: { decryptString: (sealed) => sealed.toString(), encryptString: (key) => Buffer.from(key) }, // synthetic keys only, sealed as plain base64
     shell: { beep: () => beeps.push(Date.now()) },
+    // As Electron 44 and later read it: a promise. A synthetic key, never the real clipboard's.
+    clipboard: { readText: async () => ' sk-ant-sid01-pasted\n', clear: () => (clipboardCleared = true) },
   };
+  let clipboardCleared = false;
   // Keep-awake's PowerShell helper, never really started: each child is numbered so a stop names the one it ends.
   const childProcess = { spawn: (cmd, args, opts) => {
     const id = powerCalls.filter(([what]) => what === 'start').length;
@@ -691,14 +694,21 @@ async function mainChecks() {
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
   const http = { createServer: (fn) => ((phoneHandler = fn), { on() { return this; }, listen() { return this; } }) };
-  // One provider whose read the checks hold and finish by hand; no real account is ever asked.
+  // One provider whose read the checks hold and finish by hand, and a CPU that answers at once; no real account is
+  // ever asked.
   const held = { read: async () => ({ rows: [] }) };
-  const providers = { ...require('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
+  let cpuLoad = 5;
+  const providers = { ...require('./providers'), PROVIDERS: [
+    { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() },
+    { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', everyMs: 0, local: true, read: async () => ({ rows: [{ label: 'Load', percent: cpuLoad }], updatedAt: Date.now() }) },
+  ] };
+  // The link's secret is a made-up one: the real one is never read.
+  const link = { ...require('./link'), secret: () => 'e'.repeat(64) };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
-  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : require(id)), mod, __dirname);
-  const { readOne, saveState, gate, last, servePhone, useConsoleKey, snapshot, loadState, savedCache, setWin, fetched } = mod.exports;
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
+  new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : id === './link' ? link : require(id)), mod, __dirname);
+  const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedCache, setWin, fetched } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -1120,6 +1130,47 @@ async function mainChecks() {
     awakeMenu().click({ checked: false });
     on['will-quit']();
 
+    // The link's secret never goes down the link. A gateway that relays the handshake between this PC and the phone
+    // can send its own GO, get a pipe to this port, and say it is a.b.ts.net: the pipe still comes from
+    // link.PIPE_FROM, and is refused. Anything else goes through, and tailscale serve, from 127.0.0.1, gets the secret.
+    {
+      const net = require('net');
+      const key = 'f'.repeat(64); // the link's, made up too
+      const listen = (server) => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+      const overlay = await listen(require('http').createServer(phoneHandler));
+      let request, relayed;
+      const gateway = await listen(net.createServer((s) => {
+        const nonce = 'c'.repeat(32);
+        let got = '';
+        s.write(`LINK1 ${nonce}\n`);
+        s.once('data', (hello) => {
+          const [name, theirs] = String(hello).trim().split(' ');
+          s.write(`${link.hmac(key, `phone|${name}|${nonce}|${theirs}`)}\nGO\n`);
+          s.on('data', (d) => (got += d) === 'OK\n' && s.write(`GET ${request} HTTP/1.1\r\nHost: a.b.ts.net\r\nConnection: close\r\n\r\n`));
+          s.on('close', () => relayed(got));
+        });
+      }));
+      const realConnect = net.connect;
+      net.connect = (opts, ...rest) => realConnect({ ...opts, port: opts.port === link.PORT ? gateway.address().port : opts.port }, ...rest);
+      const relay = (url) => new Promise((r) => {
+        [request, relayed] = [url, r];
+        link.connect('127.0.0.1', 'overlay', overlay.address().port, key, () => {});
+      });
+      try {
+        assert.match(await relay('/api/link'), /^OK\nHTTP\/1\.1 403 /, 'a pipe gets no secret, whatever Host it says');
+        assert.match(await relay('/api/options'), /^OK\nHTTP\/1\.1 200 /, 'anything else goes through');
+        const served = await new Promise((r) => require('http').get({ host: '127.0.0.1', port: overlay.address().port, path: '/api/link', headers: { host: 'a.b.ts.net' }, agent: false }, (res) => {
+          let body = '';
+          res.on('data', (d) => (body += d)).on('end', () => r(body));
+        }));
+        assert.deepStrictEqual(JSON.parse(served), { secret: 'e'.repeat(64) }, 'tailscale serve gets it');
+      } finally {
+        net.connect = realConnect;
+        overlay.close();
+        gateway.close();
+      }
+    }
+
     // Snapshots are numbered in the order the PC makes them, which is not the order they reach a phone: a
     // read waits on its provider before it snapshots, so a stream message sent meanwhile is the older one,
     // though it arrives first. The phone keeps the newest by number.
@@ -1144,6 +1195,42 @@ async function mainChecks() {
     assert.strictEqual(fresh.providers[0].rows[0].percent, 80, 'the read answered with the fresh one');
     assert.ok(typeof fresh.run === 'string' && fresh.run === cached.run, `both from one run of the overlay, not ${fresh.run} and ${cached.run}`);
     assert.ok(fresh.rev > cached.rev, `the fresh snapshot is numbered after the cached one, not ${fresh.rev} after ${cached.rev}`);
+
+    // One slow provider holds back nobody else. Each read pushes as it settles: the window and the phones hear CPU's
+    // load while Claude's read is still out, and a phone's read answers with what there is after a short wait, not
+    // after Claude's 30 s. Claude's numbers follow both ways once they land.
+    {
+      const sent = [];
+      setWin({ isDestroyed: () => false, webContents: { send: (ch, v) => ch === 'data' && sent.push(v.map((p) => p.rows[0].percent)) } });
+      last.set('claude', { rows: [{ label: 'Weekly', percent: 20 }], updatedAt: 1 });
+      gate.delete('claude');
+      let finish = null;
+      held.read = () => new Promise((r) => (finish = r));
+      cpuLoad = 41;
+      const beat = tick();
+      for (let i = 0; i < 50 && !sent.length; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.ok(finish, "Claude's read is out");
+      assert.deepStrictEqual(sent, [[20, 41]], "the window hears CPU while Claude's read is still out");
+      const streamed = [];
+      let hangUp = () => {};
+      phoneHandler(
+        { method: 'GET', url: '/api/events', headers: { host: '127.0.0.1:7430' }, on: (e, fn) => e === 'close' && (hangUp = fn) },
+        { writeHead() { return this; }, write: (chunk) => streamed.push(JSON.parse(String(chunk).replace(/^data: /, '')).providers.map((p) => p.rows[0].percent)), end() {} }
+      );
+      cpuLoad = 42;
+      // The cap's wait runs out at once, since what counts is what the answer holds while Claude's read is out.
+      const realTimeout = global.setTimeout;
+      global.setTimeout = (fn, ms, ...rest) => realTimeout(fn, ms > 1000 ? 0 : ms, ...rest);
+      const usage = ask('GET', '/api/usage');
+      global.setTimeout = realTimeout;
+      const answered = await usage;
+      assert.deepStrictEqual(answered.body && JSON.parse(answered.body).providers.map((p) => p.rows[0].percent), [20, 42], `the phone's read answers with what there is, not ${JSON.stringify(answered)}`);
+      finish({ rows: [{ label: 'Weekly', percent: 21 }], updatedAt: 2 });
+      await beat;
+      hangUp();
+      assert.deepStrictEqual([sent.at(-1), streamed.at(-1)], [[21, 42], [21, 42]], 'then Claude follows, to the window and down the stream');
+      setWin(null);
+    }
 
     // Forgetting the Console session takes its credit off the screen, the phones and the saved cache at once,
     // even while Claude's reads are gated, and keeps the usage rows.
@@ -1198,6 +1285,13 @@ async function mainChecks() {
       loadState();
       assert.deepStrictEqual([shownClaude().apiCredit, shownClaude().rows[0].percent, gate.get('claude')], [want, 40, deadline + 3_600_000], `restored at ${new Date(at).toISOString()}`);
     }
+
+    // A Console session key pasted from the tray menu, though Electron 44 made reading the clipboard asynchronous:
+    // it is saved sealed, and taken off the clipboard.
+    Date.now = realNow;
+    await pasteConsoleKey();
+    on['will-quit']();
+    assert.deepStrictEqual([Buffer.from(saved().consoleSession, 'base64').toString(), clipboardCleared], ['sk-ant-sid01-pasted', true], 'a pasted Console session key is saved sealed, and leaves the clipboard');
   } finally {
     Date.now = realNow;
     on['will-quit']?.(); // flush before the folder goes, or a pending save recreates it

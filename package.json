@@ -34,8 +34,8 @@
     }
   },
   "devDependencies": {
-    "electron": "^38.0.0",
-    "electron-builder": "^25.0.0",
-    "puppeteer-core": "^25.9.0"
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
+    "puppeteer-core": "^25.16.0"
   }
 }

@@ -9,7 +9,7 @@ is transparent and click-through, so the overlay never eats a click meant for wh
 
 ```
 npm install
-node node_modules/electron/install.js   # npm 11 blocks postinstall scripts; this fetches the binary
+node node_modules/electron/install.js   # electron no longer fetches its binary on install; this does
 npm start
 npm test                                # pure-logic checks, no electron, no network
 npm run test:ui                         # the renderer in headless Chrome, every edge, state and theme
@@ -116,7 +116,8 @@ minutes.
 A rate limit is never shown, for any provider. The numbers on screen stay as they were, with no
 note, and a section with no numbers yet waits for them. A provider more than ten minutes behind,
 gated or not, says how old its numbers are, as it always did. Refresh still asks the other
-providers, and turns itself off only when every provider is gated.
+providers. It spins, and stays off, until every read it asked for has settled, and it is off whenever
+every provider is gated.
 
 The request also carries `User-Agent: claude-cli/2.1.280 (external, cli)`, the one Claude Code
 sends. Orca's other trick, a hidden pty that runs `claude`, sends `/usage` and scrapes the TUI, is
@@ -208,8 +209,8 @@ tailscale serve --bg --https=8443 http://127.0.0.1:7430
 
 | Route | What it does |
 |---|---|
-| `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. `POST` is the panel's Refresh. |
-| `GET /api/events` | The same, as a stream: once on connecting, then on every change. CPU and RAM move at most every tick, so a phone hears at most every 15 s, or once a minute with both off. A `ping` event every 20 s lets the page replace a stream that died without closing. |
+| `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. It waits at most 5 s for those reads, then answers with what there is, and the stream brings the rest. `POST` is the panel's Refresh, and waits at most 45 s. |
+| `GET /api/events` | The same, as a stream: once on connecting, then on every change. Each provider's reading goes out as it lands, not with the slowest one's. CPU and RAM move at most every tick, so with nothing else new a phone hears at most twice every 15 s, or once a minute with both off. A `ping` event every 20 s lets the page replace a stream that died without closing. |
 | `GET /api/options` | The tray menu's choices: themes, providers, summary limits, usage pages. |
 | `POST /api/settings` | `{ theme, enabled, choices }`, any of them, applied as the tray menu applies them. JSON only. |
 
@@ -261,8 +262,8 @@ other way: the panel shrinks back into the tab, then the page calls `Android.col
 out of reach, the tab greys out and the panel says how old the numbers are. Every snapshot the overlay
 sends carries `run`, an id for this run of the overlay, and `rev`, one higher than the last snapshot it
 made. The page keeps the newest by `rev`, whichever way it came and in whatever order: a read snapshots
-only after its provider answers, so it can be newer than a stream message that reached the phone first,
-and an old answer landing late is dropped. A new `run` (the overlay restarted) wins whatever its
+only once its providers answer or its wait runs out, so it can be newer than a stream message that
+reached the phone first, and an old answer landing late is dropped. A new `run` (the overlay restarted) wins whatever its
 `rev`, and the run it replaced is retired, so a late snapshot from before the restart can't come back.
 A snapshot without numbers counts as the oldest. A stream that got a 502 while the overlay was down starts
 again on the next good read.

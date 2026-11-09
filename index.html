@@ -524,15 +524,18 @@
     const usage = data.some((p) => !p.local) ? data.filter((p) => !p.local) : data;
     const newest = Math.max(0, ...usage.map((p) => p.updatedAt || 0));
     ft.textContent = newest ? ago(newest) : 'Loading…';
-    rf.removeAttribute('aria-busy');
-    rf.disabled = data.length > 0 && data.every((p) => p.waitMs > 0); // one gated provider doesn't stop the rest
+    // Off while a refresh is out, too: its numbers land as each provider answers, and a second click would ask the
+    // ones that already have all over again.
+    rf.disabled = rf.hasAttribute('aria-busy') || (data.length > 0 && data.every((p) => p.waitMs > 0)); // one gated provider doesn't stop the rest
   }
 
   rf.onclick = () => {
-    // Immediate feedback, because a refresh can legitimately change nothing on screen.
+    // Immediate feedback, because a refresh can legitimately change nothing on screen. It spins until every read
+    // it asked for has settled.
     rf.disabled = true;
     rf.setAttribute('aria-busy', 'true');
-    window.api.refresh();
+    const done = () => (rf.removeAttribute('aria-busy'), syncFoot());
+    window.api.refresh().then(done, done);
   };
   $('#mn').onclick = () => window.api.menu();
 
