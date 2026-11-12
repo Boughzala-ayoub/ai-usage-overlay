@@ -300,7 +300,7 @@ configuredProvider.read()
               assert.strictEqual(result.soft, true, 'network failures preserve the last reading');
               assert.match(result.error, mode === 'offline' ? /UND_ERR_CONNECT_TIMEOUT/ : /timed out/);
             }
-          } else assert.match(result.note, /local usage/, 'Codex retains its offline fallback');
+          } else assert.deepStrictEqual([typeof result.why, result.note], ['string', undefined], 'Codex retains its offline fallback, without a note');
         }
       }
     } finally {
@@ -330,7 +330,7 @@ configuredProvider.read()
       weeklyDown = true;
       const weeklyLost = await xai.read();
       assert.deepStrictEqual(weeklyLost.rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
-      assert.strictEqual(weeklyLost.note, 'Weekly usage not refreshed (HTTP 500).', 'and says the weekly one did not refresh');
+      assert.strictEqual(weeklyLost.note, undefined, 'with no message about the weekly one');
       // And the other way round, on the unified pool too: a monthly outage costs only the monthly line, a 429 still gates.
       const week96 = { config: { ...xaiWeekly.config, creditUsagePercent: 96 } };
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 503, headers: new Headers() });
@@ -559,10 +559,10 @@ configuredProvider.read()
         assert.strictEqual((await claude.read()).apiCredit.leftCents, 9195);
         status = 503;
         const failed = (await claude.read()).apiCredit;
-        assert.deepStrictEqual([failed.leftCents, failed.error], [9195, 'API credit not refreshed (HTTP 503), showing the last reading.']);
+        assert.deepStrictEqual([failed.leftCents, failed.error], [9195, undefined], 'a failed refresh keeps the balance, with no message');
         Date.now = () => Date.parse('2026-10-28T12:00:00Z');
         const lapsed = await claude.read();
-        assert.deepStrictEqual(lapsed.apiCredit, { error: 'API credit not refreshed (HTTP 503).' }, 'expired funds are not shown as available');
+        assert.ok(creditExpired(lapsed.apiCredit), 'expired funds are not shown as available: the panels say they expired');
         assert.strictEqual(lapsed.rows[0].percent, 12, 'while usage keeps refreshing');
       } finally {
         Date.now = realNow;
@@ -732,10 +732,10 @@ async function mainChecks() {
     // A local fallback older than the live reading on screen is no news; a newer reading still lands.
     const codexAt = (percent, updatedAt, extra) => ({ id: 'codex', everyMs: 0, read: async () => ({ rows: [{ label: '5h limit', percent }], updatedAt, ...extra }) });
     await readOne(codexAt(80, 2000), true);
-    await readOne(codexAt(20, 1000, { note: 'Live refresh failed; showing local usage.', why: 'Live refresh failed.' }), true);
+    await readOne(codexAt(20, 1000, { why: 'Live refresh failed.' }), true);
     assert.strictEqual(last.get('codex').rows[0].percent, 80, 'an older fallback keeps the newer reading');
-    assert.strictEqual(last.get('codex').note, 'Live refresh failed.', 'and says why it did not move');
-    await readOne(codexAt(10, 3000, { note: 'Live refresh failed; showing local usage.', why: 'Live refresh failed.' }), true);
+    assert.strictEqual(last.get('codex').note, undefined, 'with no message');
+    await readOne(codexAt(10, 3000, { why: 'Live refresh failed.' }), true);
     assert.strictEqual(last.get('codex').rows[0].percent, 10, 'a newer fallback still lands');
 
     // Retry-After runs from the 429's arrival, 14s after the request left.
@@ -882,7 +882,14 @@ async function mainChecks() {
       assert.strictEqual(saved().cache.noted.note, 'Monthly usage not refreshed (HTTP 503).');
       said = { error: 'Request timed out', soft: true };
       await readOne(noted, true);
-      assert.strictEqual(last.get('noted').note, 'Request timed out');
+      assert.deepStrictEqual(last.get('noted'), { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 }, 'a timeout keeps the numbers, with no message, and drops the old note');
+      // A first read that fails soft shows no error: the section waits for numbers. One that asks you to act stays.
+      const first = { id: 'first', everyMs: 0, read: async () => ({ error: 'xAI usage not refreshed (HTTP 503).', soft: true }) };
+      await readOne(first, true);
+      assert.strictEqual(last.get('first'), undefined, 'a first read that fails soft shows no error');
+      last.set('first', { error: 'Grok sign-in expired — run `grok` to renew it.' });
+      await readOne(first, true);
+      assert.strictEqual(last.get('first').error, 'Grok sign-in expired — run `grok` to renew it.', 'a soft failure leaves an error you must act on');
       said = { error: 'Rate limited', soft: true, retryAfter: 1 };
       await readOne(noted, true);
       assert.deepStrictEqual(last.get('noted'), { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 }, "a 429 clears an earlier failure's note");
@@ -972,8 +979,8 @@ async function mainChecks() {
       clock += 510_000;
       await readOne(xai, true);
       assert.strictEqual(xaiAsked, 2, 'and a refresh past it asks again');
-      // One lookup failing beside one that answers: the good line lands with a note naming what didn't refresh,
-      // and the note goes once both answer again.
+      // One lookup failing beside one that answers: the good line lands, with no message, and both lines are back
+      // once both answer again.
       gate.delete('xai');
       Date.now = realNow;
       const weekly = (percent) => () => ({ ok: true, json: async () => ({ config: { ...xaiWeekly.config, creditUsagePercent: percent } }) });
@@ -983,7 +990,7 @@ async function mainChecks() {
       [weeklyAnswer, monthlyAnswer] = [weekly(5), () => ({ ok: false, status: 503, headers: new Headers() })];
       await readOne(xai, true);
       assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 5]], 'the weekly line lands');
-      assert.strictEqual(last.get('xai').note, 'Monthly usage not refreshed (HTTP 503).', 'with a note saying the monthly one did not');
+      assert.strictEqual(last.get('xai').note, undefined, 'with no message about the monthly one');
       monthlyAnswer = monthly(99);
       await readOne(xai, true);
       assert.deepStrictEqual([last.get('xai').rows.length, last.get('xai').note], [2, undefined], 'both back, the note goes');
@@ -999,11 +1006,11 @@ async function mainChecks() {
       };
       tokenAnswer = () => ({ ok: true, json: async () => { throw new TypeError('terminated'); } });
       await readOne(xai, true);
-      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note, renewals], [2, 'terminated', 1], 'a renewal cut off mid-body is soft and not retried');
+      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note, renewals], [2, undefined, 1], 'a renewal cut off mid-body is soft, silent and not retried');
       assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and leaves auth.json as it was');
       tokenAnswer = () => ({ ok: true, json: async () => ({ refresh_token: 'r2', expires_in: 21600 }) });
       await readOne(xai, true);
-      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note], [2, 'Grok sign-in not renewed (no access token).'], 'an answer with no access token is soft');
+      assert.deepStrictEqual([last.get('xai').rows?.length, last.get('xai').note], [2, undefined], 'an answer with no access token is soft and silent');
       assert.strictEqual(fs.readFileSync(grokFile, 'utf8'), lapsedAuth, 'and never reaches auth.json');
       // A throttled renewal gates xAI for its Retry-After, in seconds or as an HTTP date, not the 60s fallback.
       clock = realNow();

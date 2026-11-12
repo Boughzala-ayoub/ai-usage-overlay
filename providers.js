@@ -205,10 +205,9 @@ async function readApiCredit() {
   } catch (e) {
     if (session !== consoleSession) return undefined;
     if (e.status === 401 || e.status === 403) return (lastApiCredit = { error: 'Console session expired. Copy a new `sessionKey` and pick Paste Console session key in the tray.' });
-    if (lastApiCredit?.error) return lastApiCredit;
-    // Offline, throttled or a 5xx: the balance on hand is old news, and expired funds aren't funds.
-    const why = `API credit not refreshed (${e.message})`;
-    return lastApiCredit && !creditExpired(lastApiCredit) ? { ...lastApiCredit, error: why + ', showing the last reading.' } : { error: why + '.' };
+    // Offline, throttled or a 5xx: the balance on hand stays, without a message, like every provider's numbers.
+    // Past its deadline main and the panels say it expired; with none on hand there is no credit line.
+    return lastApiCredit;
   }
   return lastApiCredit;
 }
@@ -362,8 +361,8 @@ function lastRateLimits(file) {
   return null;
 }
 
-// `why` is why live usage didn't come. It rides along on the reading, so main can still say it when it
-// keeps a newer reading already on screen instead of this older local one.
+// `why` is why live usage didn't come. It marks the reading as a fallback, so main keeps a newer reading
+// already on screen instead of this older local one.
 function readCodexFallback(why) {
   const files = rollouts();
   // Soft, like the no-usage case below: a reading already on screen stays instead of being blanked.
@@ -382,7 +381,7 @@ function readCodexFallback(why) {
     if (!best || at > best.at) best = { shaped, at };
   }
   if (!best) return { error: 'No Codex usage in recent sessions — run `codex` once.', soft: true };
-  return { ...best.shaped, ...(best.at > -Infinity ? { updatedAt: best.at } : {}), note: why + '; showing local usage.', why: why + '.' };
+  return { ...best.shaped, ...(best.at > -Infinity ? { updatedAt: best.at } : {}), why: why + '.' };
 }
 
 async function readCodex() {
@@ -559,16 +558,15 @@ async function readXai() {
     const wait = (e) => e.retryAfter || 60;
     const fatal = failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
     if (fatal) throw fatal;
-    // One lookup failed beside one that answered: the line that answered lands, and the note says which didn't.
-    // A soft error here would make readFresh keep the old lines instead.
-    const [lost] = failed;
-    if (lost) shaped.note = `${lost === answers[0] ? 'Monthly' : 'Weekly'} usage not refreshed (${lost.message}).`;
+    // One lookup failed beside one that answered: the line that answered lands, with no message about the other.
+    // ponytail: on a split monthly + weekly plan the failed line drops out until the next read. The unified pool
+    // has no monthly line, so there a weekly failure is the read's, and readFresh keeps the old numbers.
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
     // A refresh token xAI no longer takes, or a token renewed elsewhere and revoked.
     if (e.status === 401 || e.status === 403) return { error: 'Grok sign-in expired — run `grok` to renew it.' };
-    // The billing endpoint answers 503 now and then: soft, so the last numbers stay up with this note until it recovers.
+    // The billing endpoint answers 503 now and then: soft, so the last numbers stay up until it recovers.
     if (e.status >= 500) return { error: `xAI usage not refreshed (${e.message}).`, soft: true };
     return { error: e.message || 'Request failed', soft: !!e.soft };
   }

@@ -202,33 +202,27 @@ async function readFresh(p, force) {
     saveState({ gate: Object.fromEntries(gate) });
   }
   if (res.error && res.soft) {
-    // A rate limit is no news: the numbers on screen stay, or the section waits for its first. Only their age says
-    // they've fallen behind, past ten minutes, as for any provider. The endpoint did answer, so whatever an earlier
-    // failure said (a timeout's note, a sign-in error) is over.
-    if (res.retryAfter) {
-      if (!prev?.rows?.length) last.delete(p.id);
-      else {
-        const { note, ...numbers } = prev;
-        last.set(p.id, numbers);
-      }
-      if (cache[p.id]?.note) {
-        const { note: saved, ...clean } = cache[p.id];
-        cache[p.id] = clean; // or a restart during the gate brings the note back
-        saveState({ cache });
-      }
-      return takeLocal(p);
+    // A rate limit, a timeout, a server error, no network: none is news or anything to act on, so none shows a
+    // message. The numbers on screen stay, or the section waits for its first, and only their age says they've
+    // fallen behind, past ten minutes, as for any provider. An earlier read's note goes too. A 429 also ends an
+    // earlier error, since the endpoint did answer; other failures leave one that asks you to act (a sign-in).
+    if (prev?.rows?.length) {
+      const { note, ...numbers } = prev;
+      last.set(p.id, numbers);
+    } else if (res.retryAfter) last.delete(p.id);
+    if (cache[p.id]?.note) {
+      const { note: saved, ...clean } = cache[p.id];
+      cache[p.id] = clean; // or a restart brings the note back
+      saveState({ cache });
     }
-    // Any other soft failure keeps the numbers on screen too, the best we have, with a note.
-    if (prev) {
-      last.set(p.id, { ...prev, note: res.error });
-      return takeLocal(p);
-    }
+    return takeLocal(p);
   }
   // A fallback (it carries `why`) is an old observation, and can be older than the numbers on screen.
-  // Then it's no news: keep the newer ones, say why they didn't move, and never read the drop as a
-  // reset. Undated counts as oldest. Live readings skip this: they are "now", whatever the clock did.
+  // Then it's no news: keep the newer ones, without a note, and never read the drop as a reset.
+  // Undated counts as oldest. Live readings skip this: they are "now", whatever the clock did.
   if (res.why && prev?.rows?.length && (res.updatedAt ?? -Infinity) < (prev.updatedAt ?? -Infinity)) {
-    return last.set(p.id, { ...prev, note: res.why });
+    const { note, ...numbers } = prev;
+    return last.set(p.id, numbers);
   }
   last.set(p.id, res);
   // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use.
