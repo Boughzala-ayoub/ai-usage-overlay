@@ -406,9 +406,13 @@ async function readCodex() {
 
   try {
     const shaped = shapeCodexUsage(await fetchJson(CODEX_API, headers));
-    if (!shaped.error && shaped.bankedResets > 0 && Date.now() >= resetDetailsRetryAt) {
+    // At 0 too: right after a first grant /usage can still say 0 while the list has it.
+    if (!shaped.error && shaped.bankedResets !== undefined && Date.now() >= resetDetailsRetryAt) {
       try {
-        shaped.bankedResetExpiries = shapeCodexResetCredits(await fetchJson(CODEX_RESETS_API, headers));
+        const expiries = shapeCodexResetCredits(await fetchJson(CODEX_RESETS_API, headers));
+        // For minutes after a grant, /usage still gives the old count while the list has the new reset ("2 banked
+        // resets expire Nov 30, Dec 1 and 12"), so the list counts them and the number matches its dates.
+        if (expiries) Object.assign(shaped, { bankedResets: expiries.length, bankedResetExpiries: expiries });
       } catch (e) {
         if (e.status === 429) resetDetailsRetryAt = Date.now() + Math.max(60, e.retryAfter) * 1000;
         // Expiry lookup failure must not discard the live usage or reset count.

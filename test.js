@@ -224,14 +224,20 @@ configuredProvider.read()
     let mode = 'ok';
     global.fetch = async (url, options) => {
       assert.strictEqual(options.headers.Authorization, 'Bearer test-token', 'Codex login comes only from ~/.codex, ignoring CODEX_HOME and Orca');
-      if (url.endsWith('/usage')) return { ok: true, json: async () => ({ rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 604800 } }, rate_limit_reset_credits: { available_count: 1 } }) };
+      if (url.endsWith('/usage')) return { ok: true, json: async () => ({ rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 604800 } }, rate_limit_reset_credits: { available_count: mode === 'first' ? 0 : 1 } }) };
       detailCalls++;
       if (mode === 'error') throw new Error('Offline');
       if (mode === 'throttled') return { ok: false, status: 429, headers: new Headers({ 'retry-after': '120' }) };
-      return { ok: true, json: async () => ({ credits: [{ status: 'available', expires_at: '2026-10-04T05:36:14Z' }] }) };
+      const granted = mode === 'granted' ? [{ status: 'available', expires_at: '2026-10-12T18:15:00Z' }] : [];
+      return { ok: true, json: async () => ({ credits: [{ status: 'available', expires_at: '2026-10-04T05:36:14Z' }, ...granted] }) };
     };
     try {
       assert.deepStrictEqual((await configuredProvider.read()).bankedResetExpiries, [Date.parse('2026-10-04T05:36:14Z')]);
+      mode = 'granted';
+      const granted = await configuredProvider.read();
+      assert.deepStrictEqual([granted.bankedResets, granted.bankedResetExpiries], [2, [Date.parse('2026-10-04T05:36:14Z'), Date.parse('2026-10-12T18:15:00Z')]], 'a list newer than the usage count counts its own resets');
+      mode = 'first';
+      assert.strictEqual((await configuredProvider.read()).bankedResets, 1, 'a first reset shows while /usage still says 0');
       mode = 'error';
       const unavailable = await configuredProvider.read();
       assert.strictEqual(unavailable.bankedResets, 1, 'expiry failure preserves banked count');
@@ -912,6 +918,8 @@ async function mainChecks() {
       assert.deepStrictEqual(savedReading({ ...weekly7, apiCredit: { error: 'API credit not refreshed (HTTP 503).' } }), weekly7, 'with no balance, the credit line goes');
       const sessionGone = { error: 'Console session expired. Copy a new `sessionKey` and pick Paste Console session key in the tray.' };
       assert.deepStrictEqual(savedReading({ ...weekly7, apiCredit: sessionGone }), { ...weekly7, apiCredit: sessionGone }, 'an error to act on stays');
+      assert.deepStrictEqual(savedReading({ ...weekly7, bankedResets: 2, bankedResetExpiries: [1, 2, 3] }), { ...weekly7, bankedResets: 3, bankedResetExpiries: [1, 2, 3] }, 'a saved count behind its dates takes their number');
+      assert.deepStrictEqual(savedReading({ ...weekly7, bankedResets: 2 }), { ...weekly7, bankedResets: 2 }, 'a count with no list stays');
       const fresh = { id: 'gated-fresh', everyMs: 5 * 60_000, read: async () => ({ error: 'Rate limited', soft: true, retryAfter: 60 }) };
       await readOne(fresh, true);
       assert.strictEqual(last.get('gated-fresh'), undefined, 'a 429 before any numbers leaves the section waiting for them');
@@ -1288,6 +1296,10 @@ async function mainChecks() {
     await readOne(claude, true);
     assert.strictEqual(reads, 0, 'the gate still holds');
     assert.deepStrictEqual([shownClaude().apiCredit, shownClaude().rows[0].percent], [{ expired: true, expiresAt: deadline }, 40], 'from its deadline the balance is gone, the usage stays');
+    last.set('claude', { ...lapsing, bankedResets: 3, bankedResetExpiries: [1, 2, null] });
+    assert.strictEqual(shownClaude().bankedResetExpiries, undefined, 'a reset with no deadline leaves the count alone, without dates');
+    last.set('claude', { ...lapsing, bankedResets: 2, bankedResetExpiries: [1, 2] });
+    assert.deepStrictEqual(shownClaude().bankedResetExpiries, [1, 2], 'with every deadline known, the dates show');
 
     // The same reading and gate restored at startup, with a Console session that decrypts.
     saveState({ cache: { claude: lapsing }, gate: { claude: deadline + 3_600_000 }, consoleSession: Buffer.from('sk-ant-sid01-synthetic').toString('base64') });

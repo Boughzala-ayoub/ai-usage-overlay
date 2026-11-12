@@ -150,6 +150,8 @@ function snapshot() {
       // Past its deadline a balance isn't funds, whatever kept the reading: a gated or skipped read, a soft
       // failure, the startup cache. Only the deadline goes out, and the panels say it expired.
       ...(creditExpired(d.apiCredit, now) ? { apiCredit: { expired: true, expiresAt: d.apiCredit.expiresAt } } : {}),
+      // A banked reset with no deadline would read "3 banked resets expire Nov 30 and Dec 1", so the count shows alone.
+      ...(d.bankedResetExpiries?.some((t) => !Number.isFinite(t)) ? { bankedResetExpiries: undefined } : {}),
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
       rows: (d.rows || []).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
@@ -709,6 +711,8 @@ function savedReading(v) {
     if (Number.isFinite(credit.leftCents)) reading.apiCredit = credit;
     else delete reading.apiCredit;
   }
+  // An older build could save Codex's count from /usage beside a newer list's dates; the list counts, as readCodex does now.
+  if (Array.isArray(reading.bankedResetExpiries)) reading.bankedResets = reading.bankedResetExpiries.length;
   return reading;
 }
 
