@@ -274,9 +274,10 @@ configuredProvider.read()
           calls++;
           if (mode === 'offline' || (mode === 'recover' && calls === 1)) throw networkError();
           if (mode === 'timeout') return { ok: true, json: async () => { throw new DOMException('deadline', 'TimeoutError'); } };
+          if (mode === 'truncated') return { ok: true, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } };
           // What held Claude's read for 12 hours on 2026-10-29: a request that never answers, deaf to its signal.
           if (mode === 'lost') return new Promise(() => {});
-          if (mode === '429' || mode === '401') return { ok: false, status: Number(mode), headers: new Headers({ 'retry-after': '120' }) };
+          if (/^\d+$/.test(mode)) return { ok: false, status: Number(mode), headers: new Headers({ 'retry-after': '120' }) };
           return { ok: true, json: async () => ({
             limits: [{ kind: 'session', percent: 12 }],
             rate_limit: { primary_window: { used_percent: 12, limit_window_seconds: 18000 } },
@@ -287,18 +288,18 @@ configuredProvider.read()
         const recovered = await provider.read();
         assert.strictEqual(recovered.rows?.[0]?.percent, 12, `${provider.id} recovers from a transient fetch failure`);
         assert.strictEqual(calls, 2, 'one retry after a transport failure');
-        for (mode of ['offline', 'timeout', 'lost', '429', '401']) {
+        for (mode of ['offline', 'timeout', 'lost', 'truncated', '429', '401', '503', '408']) {
           calls = 0;
           const result = await settles(provider.read(), `${provider.id} ${mode}`);
-          assert.strictEqual(calls, ['offline', 'timeout', 'lost'].includes(mode) ? 2 : 1, 'bounded retry, never retry HTTP errors');
+          assert.strictEqual(calls, ['offline', 'timeout', 'lost', 'truncated'].includes(mode) ? 2 : 1, 'bounded retry, never retry HTTP errors');
           if (mode === '429') {
             assert.strictEqual(result.retryAfter, 120);
             assert.strictEqual(result.soft, true);
           } else if (provider.id !== 'codex') {
             if (mode === '401') assert.ok(!result.soft, 'invalid credentials remain a hard error');
             else {
-              assert.strictEqual(result.soft, true, 'network failures preserve the last reading');
-              assert.match(result.error, mode === 'offline' ? /UND_ERR_CONNECT_TIMEOUT/ : /timed out/);
+              assert.strictEqual(result.soft, true, `${provider.id} ${mode}: network and server failures preserve the last reading`);
+              assert.match(result.error, mode === 'offline' ? /UND_ERR_CONNECT_TIMEOUT/ : /^\d+$/.test(mode) ? new RegExp(`HTTP ${mode}`) : mode === 'truncated' ? /JSON/ : /timed out/);
             }
           } else assert.deepStrictEqual([typeof result.why, result.note], ['string', undefined], 'Codex retains its offline fallback, without a note');
         }
@@ -329,12 +330,11 @@ configuredProvider.read()
       assert.deepStrictEqual(sent, ['Bearer test-token', 'Bearer test-token'], 'both lookups carry the token grok keeps');
       weeklyDown = true;
       const weeklyLost = await xai.read();
-      assert.deepStrictEqual(weeklyLost.rows.map((r) => r.label), ['Monthly'], 'a failed weekly lookup keeps the monthly line');
-      assert.strictEqual(weeklyLost.note, undefined, 'with no message about the weekly one');
-      // And the other way round, on the unified pool too: a monthly outage costs only the monthly line, a 429 still gates.
+      assert.ok(weeklyLost.soft && !weeklyLost.rows, 'a failed lookup whose line was on screen fails the read, so main keeps every old number');
+      // And the other way round; a 429 still gates.
       const week96 = { config: { ...xaiWeekly.config, creditUsagePercent: 96 } };
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 503, headers: new Headers() });
-      assert.deepStrictEqual((await xai.read()).rows?.map((r) => [r.label, r.percent]), [['Weekly', 96]], 'a failed monthly lookup keeps the weekly line');
+      assert.ok((await xai.read()).soft, 'so does a failed monthly lookup whose line was on screen');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 429, headers: new Headers({ 'retry-after': '90' }) });
       assert.strictEqual((await xai.read()).retryAfter, 90, 'a throttled monthly lookup gates xAI');
       global.fetch = async (url) => ({ ok: false, status: 429, headers: new Headers(url.endsWith('format=credits') ? {} : { 'retry-after': '30' }) });
@@ -344,6 +344,15 @@ configuredProvider.read()
       global.fetch = async (url) => ({ ok: true, json: async () => (url.endsWith('format=credits') ? xaiWeekly : pooled) });
       const pool = await xai.read();
       assert.deepStrictEqual([pool.rows.map((r) => r.label), pool.note], [['Weekly'], undefined], 'a zero monthly limit is no outage');
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: true, json: async () => week96 } : { ok: false, status: 503, headers: new Headers() });
+      assert.deepStrictEqual((await xai.read()).rows?.map((r) => [r.label, r.percent]), [['Weekly', 96]], 'the unified monthly lookup has no line, so its failure lets the weekly line land');
+      const expired = 'Grok sign-in expired — run `grok` to renew it.';
+      global.fetch = async (url) => ({ ok: false, status: url.endsWith('format=credits') ? 401 : 503, headers: new Headers() });
+      assert.strictEqual((await xai.read()).error, expired, 'a refused sign-in wins over a server error');
+      global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 401, headers: new Headers() } : { ok: true, json: async () => xaiMonthly });
+      assert.strictEqual((await xai.read()).error, expired, 'and over a lookup that answered');
+      global.fetch = async (url) => ({ ok: true, json: async () => (url.endsWith('format=credits') ? {} : pooled) });
+      assert.strictEqual((await xai.read()).error, 'No usage windows reported.', 'both answering with no window is that error, not a crash');
       global.fetch = async (url) => (url.endsWith('format=credits') ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => pooled });
       const outage = await xai.read();
       assert.ok(outage.soft && !outage.rows, 'an outage keeps the last reading on screen');
@@ -564,6 +573,10 @@ configuredProvider.read()
         const lapsed = await claude.read();
         assert.ok(creditExpired(lapsed.apiCredit), 'expired funds are not shown as available: the panels say they expired');
         assert.strictEqual(lapsed.rows[0].percent, 12, 'while usage keeps refreshing');
+        Date.now = () => Date.parse('2026-10-10T12:00:00Z');
+        const savedCredit = { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2026-10-27T00:00:00Z') };
+        setConsoleKey('sk-ant-sid01-c', savedCredit);
+        assert.deepStrictEqual((await claude.read()).apiCredit, savedCredit, 'a restart keeps the saved balance through a failed first refresh');
       } finally {
         Date.now = realNow;
       }
@@ -706,9 +719,9 @@ async function mainChecks() {
   const link = { ...require('./link'), secret: () => 'e'.repeat(64) };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : id === './link' ? link : require(id)), mod, __dirname);
-  const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedCache, setWin, fetched } = mod.exports;
+  const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, savedCache, setWin, fetched } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -870,41 +883,35 @@ async function mainChecks() {
       await readOne(p, true);
       assert.deepStrictEqual([last.get('gated').rows[0].percent, last.get('gated').note], [34, undefined], 'after a failed read too, and its note goes with the numbers current again');
       p.readLocal = undefined;
-      // A 429 ends whatever an earlier failure said, since the endpoint answered: the numbers stay without its note,
-      // and a section that had only an error waits for numbers again.
-      const noted = { id: 'noted', everyMs: 0 };
-      let said = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 };
-      noted.read = async () => said;
+      // A soft failure keeps the numbers on screen with no message, and a section with none yet waits for them. A 429
+      // also ends an earlier error, since the endpoint answered; any other soft failure leaves one you must act on.
+      const weekly7 = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 };
+      const noted = { id: 'noted', everyMs: 0, read: async () => weekly7 };
       await readOne(noted, true);
-      said = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1, note: 'Monthly usage not refreshed (HTTP 503).' };
+      noted.read = async () => ({ error: 'Request timed out', soft: true });
       await readOne(noted, true);
-      on['will-quit'](); // the note's save lands before the 429, as it would 400 ms after the read
-      assert.strictEqual(saved().cache.noted.note, 'Monthly usage not refreshed (HTTP 503).');
-      said = { error: 'Request timed out', soft: true };
-      await readOne(noted, true);
-      assert.deepStrictEqual(last.get('noted'), { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 }, 'a timeout keeps the numbers, with no message, and drops the old note');
-      // A first read that fails soft shows no error: the section waits for numbers. One that asks you to act stays.
+      assert.deepStrictEqual(last.get('noted'), weekly7, 'a timeout keeps the numbers, with no message');
       const first = { id: 'first', everyMs: 0, read: async () => ({ error: 'xAI usage not refreshed (HTTP 503).', soft: true }) };
       await readOne(first, true);
       assert.strictEqual(last.get('first'), undefined, 'a first read that fails soft shows no error');
-      last.set('first', { error: 'Grok sign-in expired — run `grok` to renew it.' });
+      const signIn = { error: 'Grok sign-in expired — run `grok` to renew it.' };
+      last.set('first', signIn);
       await readOne(first, true);
-      assert.strictEqual(last.get('first').error, 'Grok sign-in expired — run `grok` to renew it.', 'a soft failure leaves an error you must act on');
-      said = { error: 'Rate limited', soft: true, retryAfter: 1 };
-      await readOne(noted, true);
-      assert.deepStrictEqual(last.get('noted'), { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1 }, "a 429 clears an earlier failure's note");
-      on['will-quit'](); // flushes the debounced save, as quitting does
-      assert.strictEqual(saved().cache.noted.note, undefined, 'in state.json too, so a restart during the gate shows none');
-      gate.delete('noted');
-      last.set('noted', { error: 'No Claude credentials — run `claude` to sign in.' });
-      savedCache().noted = { rows: [{ label: 'Weekly', percent: 7 }], updatedAt: 1, note: 'Monthly usage not refreshed (HTTP 503).' };
-      saveState({ cache: savedCache() });
-      on['will-quit'](); // the note's save lands before the 429, as it would 400 ms after the read
-      assert.strictEqual(saved().cache.noted.note, 'Monthly usage not refreshed (HTTP 503).');
-      await readOne(noted, true);
-      assert.strictEqual(last.get('noted'), undefined, 'and an earlier error, so the section waits for numbers');
+      assert.deepStrictEqual(last.get('first'), signIn, 'a soft failure leaves an error you must act on, adding nothing');
+      first.read = async () => ({ error: 'Rate limited', soft: true, retryAfter: 1 });
+      await readOne(first, true);
+      assert.strictEqual(last.get('first'), undefined, 'a 429 ends it, so the section waits for numbers');
+      gate.delete('first');
+      // Only an older build's state.json holds a note, saved with a failed refresh: a restart drops it.
+      saveState({ cache: { ...savedCache(), noted: { ...weekly7, note: 'Monthly usage not refreshed (HTTP 503).' } } });
       on['will-quit']();
-      assert.strictEqual(saved().cache.noted.note, undefined, 'with the note gone from state.json there too');
+      loadState();
+      assert.deepStrictEqual(last.get('noted'), weekly7, "a restart drops an older build's note");
+      const balance = { leftCents: 9195, grantedCents: 10000, expiresAt: 1 };
+      assert.deepStrictEqual(savedReading({ ...weekly7, apiCredit: { ...balance, error: 'API credit not refreshed (HTTP 503), showing the last reading.' } }), { ...weekly7, apiCredit: balance }, 'and its credit warning, keeping the balance');
+      assert.deepStrictEqual(savedReading({ ...weekly7, apiCredit: { error: 'API credit not refreshed (HTTP 503).' } }), weekly7, 'with no balance, the credit line goes');
+      const sessionGone = { error: 'Console session expired. Copy a new `sessionKey` and pick Paste Console session key in the tray.' };
+      assert.deepStrictEqual(savedReading({ ...weekly7, apiCredit: sessionGone }), { ...weekly7, apiCredit: sessionGone }, 'an error to act on stays');
       const fresh = { id: 'gated-fresh', everyMs: 5 * 60_000, read: async () => ({ error: 'Rate limited', soft: true, retryAfter: 60 }) };
       await readOne(fresh, true);
       assert.strictEqual(last.get('gated-fresh'), undefined, 'a 429 before any numbers leaves the section waiting for them');
@@ -979,21 +986,21 @@ async function mainChecks() {
       clock += 510_000;
       await readOne(xai, true);
       assert.strictEqual(xaiAsked, 2, 'and a refresh past it asks again');
-      // One lookup failing beside one that answers: the good line lands, with no message, and both lines are back
-      // once both answer again.
+      // One lookup failing beside one that answers, its line on screen: the read failed, so every old number stays
+      // with its age, with no message, and both lines move again once both answer.
       gate.delete('xai');
       Date.now = realNow;
       const weekly = (percent) => () => ({ ok: true, json: async () => ({ config: { ...xaiWeekly.config, creditUsagePercent: percent } }) });
       const monthly = (used) => () => ({ ok: true, json: async () => ({ config: { monthlyLimit: { val: 100 }, used: { val: used } } }) });
       [weeklyAnswer, monthlyAnswer] = [weekly(4), monthly(99)];
       await readOne(xai, true);
+      const both = last.get('xai');
       [weeklyAnswer, monthlyAnswer] = [weekly(5), () => ({ ok: false, status: 503, headers: new Headers() })];
       await readOne(xai, true);
-      assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 5]], 'the weekly line lands');
-      assert.strictEqual(last.get('xai').note, undefined, 'with no message about the monthly one');
+      assert.deepStrictEqual(last.get('xai'), both, 'a failed monthly lookup keeps both old lines and their age, with no message');
       monthlyAnswer = monthly(99);
       await readOne(xai, true);
-      assert.deepStrictEqual([last.get('xai').rows.length, last.get('xai').note], [2, undefined], 'both back, the note goes');
+      assert.deepStrictEqual(last.get('xai').rows.map((r) => [r.label, r.percent]), [['Weekly', 5], ['Monthly', 99]], 'both answer, both move');
       // An expired token whose renewal fails keeps the reading on screen and leaves auth.json as it was.
       const grokFile = path.join(codexHome, '.grok', 'auth.json');
       const lapsedAuth = JSON.stringify({ 'https://auth.x.ai::cid': { key: 'old-token', refresh_token: 'r1', expires_at: '2026-01-01T00:00:00Z', oidc_client_id: 'cid' } });

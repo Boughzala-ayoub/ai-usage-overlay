@@ -36,6 +36,7 @@ const HOUR = 60 * MIN;
 async function httpError(r) {
   const e = new Error(`HTTP ${r.status}`);
   e.status = r.status;
+  e.soft = r.status >= 500 || r.status === 408; // a server error or timeout fixes itself: no message, the last numbers stay
   const retry = r.headers.get('retry-after');
   e.retryAfter = Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
   await r.body?.cancel().catch(() => {}); // a body that already broke rejects here; the status still stands
@@ -67,7 +68,8 @@ async function fetchJson(url, headers, body) {
         return await r.json();
       });
     } catch (e) {
-      const transport = !e.status && (e instanceof TypeError || e.name === 'TimeoutError');
+      // A body cut short (SyntaxError) is as soft as no answer at all.
+      const transport = !e.status && (e instanceof TypeError || e instanceof SyntaxError || e.name === 'TimeoutError');
       if (!transport) throw e;
       if (attempt === 0) {
         await new Promise((resolve) => setTimeout(resolve, 250));
@@ -161,13 +163,14 @@ function readClaudeLocal(now = Date.now()) {
 let consoleKey = '';
 let consoleSession = 0; // bumped on every key change: a read begun under an older key writes and publishes nothing
 let consoleOrgs = null; // the session's API organizations; they don't change while it lasts
-let lastApiCredit; // the session's last answer; a failed refresh shows its funds flagged, until they expire
+let lastApiCredit; // the session's last answer, which a failed refresh keeps; past its deadline main says it expired
 
-function setConsoleKey(key) {
+// `saved` is the balance a restart found saved with this key, so a failed first refresh keeps it too.
+function setConsoleKey(key, saved) {
   consoleKey = key || '';
   consoleSession++;
   consoleOrgs = null;
-  lastApiCredit = undefined;
+  lastApiCredit = saved;
 }
 
 // Every unexpired tranche of the plan's credit, summed the way the Console's billing widget sums them.
@@ -527,6 +530,8 @@ async function readCursorXai() {
   return { plan: '', rows: [{ label: 'Weekly', percent: clamp(usage.planUsage.totalPercentUsed), resetsAt: end ? new Date(end).toISOString() : null }], updatedAt: Date.now() };
 }
 
+let xaiLines = []; // the lines of the last xAI reading both lookups answered
+
 async function readXai() {
   // Cursor first: it kept answering while xAI's weekly lookup failed with a 500 through 2026-10-15. With no Cursor
   // sign-in, no merged plan or no answer, xAI's own endpoints are read.
@@ -552,15 +557,20 @@ async function readXai() {
     const answers = await Promise.all([GROK_BILLING_API, `${GROK_BILLING_API}?format=credits`].map((url) => fetchJson(url, headers).catch((e) => e)));
     const failed = answers.filter((a) => a instanceof Error);
     const shaped = shapeXai(...answers.map((a) => (a instanceof Error ? null : a)));
-    // A 429 gates xAI as a whole, whichever lookup drew it, for the longer wait if both did. With no line left a
-    // failure is the read's, the monthly lookup's first. On the unified weekly pool the monthly limit is 0, so
-    // that's any weekly failure.
+    // A refused sign-in is the read's, whatever else answered: it asks you to act. Then a 429 gates xAI as a whole,
+    // whichever lookup drew it, for the longer wait if both did. With no line left a failure is the read's, the
+    // monthly lookup's first. On the unified weekly pool the monthly limit is 0, so that's any weekly failure.
     const wait = (e) => e.retryAfter || 60;
-    const fatal = failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
+    const fatal = failed.find((e) => e.status === 401 || e.status === 403) ||
+      failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
     if (fatal) throw fatal;
-    // One lookup failed beside one that answered: the line that answered lands, with no message about the other.
-    // ponytail: on a split monthly + weekly plan the failed line drops out until the next read. The unified pool
-    // has no monthly line, so there a weekly failure is the read's, and readFresh keeps the old numbers.
+    // One lookup failed beside one that answered. If the failed one had a line in the last full reading, the read
+    // failed, so readFresh keeps every old number with its age. If it had none (the unified pool's monthly), the
+    // line that answered lands.
+    // ponytail: xaiLines starts empty, so a partial failure on the first read after a restart lands the good line alone.
+    const [lost] = failed;
+    if (lost && xaiLines.includes(lost === answers[0] ? 'Monthly' : 'Weekly')) throw lost;
+    if (!lost) xaiLines = (shaped.rows || []).map((r) => r.label);
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
     if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };

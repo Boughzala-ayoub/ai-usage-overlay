@@ -204,26 +204,15 @@ async function readFresh(p, force) {
   if (res.error && res.soft) {
     // A rate limit, a timeout, a server error, no network: none is news or anything to act on, so none shows a
     // message. The numbers on screen stay, or the section waits for its first, and only their age says they've
-    // fallen behind, past ten minutes, as for any provider. An earlier read's note goes too. A 429 also ends an
-    // earlier error, since the endpoint did answer; other failures leave one that asks you to act (a sign-in).
-    if (prev?.rows?.length) {
-      const { note, ...numbers } = prev;
-      last.set(p.id, numbers);
-    } else if (res.retryAfter) last.delete(p.id);
-    if (cache[p.id]?.note) {
-      const { note: saved, ...clean } = cache[p.id];
-      cache[p.id] = clean; // or a restart brings the note back
-      saveState({ cache });
-    }
+    // fallen behind, past ten minutes, as for any provider. A 429 also ends an earlier error, since the endpoint
+    // did answer; other failures leave one that asks you to act (a sign-in).
+    if (!prev?.rows?.length && res.retryAfter) last.delete(p.id);
     return takeLocal(p);
   }
   // A fallback (it carries `why`) is an old observation, and can be older than the numbers on screen.
-  // Then it's no news: keep the newer ones, without a note, and never read the drop as a reset.
+  // Then it's no news: keep the newer ones and never read the drop as a reset.
   // Undated counts as oldest. Live readings skip this: they are "now", whatever the clock did.
-  if (res.why && prev?.rows?.length && (res.updatedAt ?? -Infinity) < (prev.updatedAt ?? -Infinity)) {
-    const { note, ...numbers } = prev;
-    return last.set(p.id, numbers);
-  }
+  if (res.why && prev?.rows?.length && (res.updatedAt ?? -Infinity) < (prev.updatedAt ?? -Infinity)) return;
   last.set(p.id, res);
   // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use.
   if (!res.error && !p.local) {
@@ -711,6 +700,18 @@ function toggle() {
   tray.setContextMenu(menu());
 }
 
+// A reading as an older build saved it, without what such a build said about a failed refresh: a note, or a
+// warning on the API credit. The balance and an error you must act on stay.
+function savedReading(v) {
+  const { note, ...reading } = v || {};
+  if (/^API credit not refreshed/.test(reading.apiCredit?.error)) {
+    const { error, ...credit } = reading.apiCredit;
+    if (Number.isFinite(credit.leftCents)) reading.apiCredit = credit;
+    else delete reading.apiCredit;
+  }
+  return reading;
+}
+
 function loadState() {
   const st = readState();
   // A provider added after the state was saved starts on; `known` is what the saving build had.
@@ -725,11 +726,11 @@ function loadState() {
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
   displayId = screen.getAllDisplays().some((d) => d.id === st.displayId) ? st.displayId : screen.getPrimaryDisplay().id;
   // Last good numbers, so a restart paints real levels before the first request comes back.
-  if (st.cache && typeof st.cache === 'object') cache = st.cache;
+  if (st.cache && typeof st.cache === 'object') cache = Object.fromEntries(Object.entries(st.cache).map(([id, v]) => [id, savedReading(v)]));
   for (const [id, v] of Object.entries(cache)) last.set(id, v);
   for (const [id, v] of Object.entries(st.gate || {})) if (v > Date.now()) gate.set(id, v);
   try {
-    if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')));
+    if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')), cache.claude?.apiCredit);
     hasConsoleKey = !!st.consoleSession;
   } catch {
     /* sealed for another Windows user or machine: the line stays off until the key is pasted again */
