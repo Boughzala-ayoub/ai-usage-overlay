@@ -176,9 +176,7 @@
 
   /* ---- settings, in the same card: the PC's tray menu, plus what only this phone has */
   #prefs { --ring: var(--fg); padding-bottom: 6px; } /* the page's own ink, for the chosen theme's outline */
-  #prefs h3 { padding: 16px 0 8px; font-size: 13px; font-weight: 600; color: var(--soft); }
   #prefs h4 { padding: 6px 0 6px; font-size: 12px; font-weight: 500; color: var(--dim); }
-  #prefs .hint { padding-top: 12px; color: var(--dim); font-size: 12.5px; }
   .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 8px; }
   /* Each swatch's chip wears its own theme: the theme's colours are set on the chip, and its name stays in the page's. */
   .sw { display: grid; place-items: stretch; gap: 4px; min-width: 0; width: 100%; height: auto; padding: 0; color: var(--dim); text-align: left; }
@@ -204,6 +202,17 @@
   .links button { display: inline-flex; align-items: center; gap: 6px; }
   #remove { width: 100%; height: 44px; margin: 18px 0 0; border-radius: 12px; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hot) 40%, transparent); color: var(--hot); font: 600 14px/1 Geist, system-ui, sans-serif; }
   #prefs .err { padding-top: 12px; color: var(--hot); font-size: 12.5px; }
+  /* Each group folds to one line, with what it's set to now on the right. */
+  #prefs .awake { margin-top: 6px; }
+  #prefs details { border-top: 1px solid var(--line); }
+  #prefs details[open] { padding-bottom: 12px; }
+  #prefs summary { display: flex; align-items: center; gap: 10px; min-height: 48px; list-style: none; font-size: 14px; font-weight: 600; color: var(--soft); }
+  #prefs summary::-webkit-details-marker { display: none; }
+  #prefs summary .val { flex: 1; min-width: 0; color: var(--dim); font-size: 12.5px; font-weight: 500; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #prefs summary::after { content: ''; flex-shrink: 0; width: 6px; height: 6px; margin: 0 4px 3px 0; border: solid var(--dim); border-width: 0 1.6px 1.6px 0; transform: rotate(45deg); transition: transform 160ms var(--out); }
+  #prefs details[open] > summary::after { margin-bottom: -3px; transform: rotate(-135deg); }
+  #prefs summary:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; border-radius: 6px; }
+  #prefs details h4:first-of-type { padding-top: 0; }
 
   .foot { display: flex; align-items: center; flex-shrink: 0; padding-top: 6px; border-top: 1px solid var(--line); } /* the buttons' own padding spaces their icons */
   #ft { flex: 1; min-width: 0; color: var(--dim); font-size: 12.5px; }
@@ -426,6 +435,17 @@
       (c.error ? '<p class="status warn">' + esc(c.error).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>' : '');
   }
 
+  // "Renews Nov 23, 04:50 · in 7d 22h", in this phone's time. A date worked out from the day the plan started, rather
+  // than told by the provider, says "about". A reading saved here while the PC is out of reach is checked against
+  // this phone's clock: a date gone by says nothing about the next one. The countdown is the PC's, so out of reach,
+  // where it would stand still, only the date shows.
+  function renews(p) {
+    if (!(p.renewsAt > Date.now())) return '';
+    const d = new Date(p.renewsAt);
+    const when = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    return '<p class="bank renews">Renews ' + (p.renewsGuess ? 'about ' : '') + '<b class="fig">' + esc(when) + '</b>' + (p.renewsIn && reached ? ' · ' + esc(p.renewsIn) : '') + '</p>';
+  }
+
   function section(p) {
     const rows = p.rows || [];
     const lines = [];
@@ -444,7 +464,7 @@
           '<span class="pc fig">' + pctText(r.percent) + '<small>%</small></span>' +
           '<span class="rs">' + esc(r.resets) + '</span>' +
         '</div>').join('') +
-      banked(p) + credit(p) +
+      banked(p) + credit(p) + renews(p) +
       lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
     '</section>';
   }
@@ -459,6 +479,7 @@
   const NOIR = '--bg:#171b23;--line:#a4adbb26;--fg:#f3f5f8;--dim:#a4adbb';
   let size = stored('size', 1);
   let autoHide = stored('autoHide', false);
+  const opened = new Set(); // the settings groups open now; in memory, so they all start folded when the bubble restarts
 
   function drawPrefs() {
     if (!body.classList.contains('prefs')) return;
@@ -467,29 +488,29 @@
     else {
       const on = data?.enabled || [];
       const chosen = data?.choices || {};
-      html = '<p class="hint">Theme, providers and the bubble\'s numbers are shared with the PC.</p>' +
-        (prefsError ? '<p class="err">' + esc(prefsError) + '</p>' : '') +
-        '<h3>PC power</h3>' +
-        '<label class="opt"><span>Keep PC awake</span><input type="checkbox" role="switch" id="keep-awake" aria-describedby="awake-hint"' + (data?.keepAwake === true ? ' checked' : '') + (!reached || typeof data?.keepAwake !== 'boolean' ? ' disabled' : '') + '></label>' +
-        '<p class="hint" id="awake-hint">Prevents automatic sleep while the PC overlay is running. The screen can still turn off.</p>' +
-        '<h3>Theme</h3>' +
-        options.themes.map(([group, list]) => '<h4>' + esc(group) + '</h4><div class="swatches">' +
+      const theme = options.themes.flatMap(([, list]) => list).find(([id]) => id === data?.theme)?.[1] || '';
+      const picks = options.providers.filter((p) => options.choices[p.id] && on.includes(p.id));
+      // A group stays as it was left across redraws: a stream snapshot redraws the settings every few seconds.
+      const fold = (id, title, value, inner) => '<details data-fold="' + id + '"' + (opened.has(id) ? ' open' : '') + '><summary>' + title + '<span class="val">' + esc(value) + '</span></summary>' + inner + '</details>';
+      html = (prefsError ? '<p class="err">' + esc(prefsError) + '</p>' : '') +
+        '<label class="opt awake"><span>Keep PC awake</span><input type="checkbox" role="switch" id="keep-awake"' + (data?.keepAwake === true ? ' checked' : '') + (!reached || typeof data?.keepAwake !== 'boolean' ? ' disabled' : '') + '></label>' +
+        fold('theme', 'Theme', theme, options.themes.map(([group, list]) => '<h4>' + esc(group) + '</h4><div class="swatches">' +
           list.map(([id, label, css]) => '<button class="sw" data-theme="' + esc(id) + '" aria-pressed="' + (data?.theme === id) + '"><i style="' + esc(css || NOIR) + '">Aa</i><span>' + esc(label) + '</span></button>').join('') +
-        '</div>').join('') +
-        '<h3>Providers</h3>' +
-        options.providers.map((p) => '<label class="opt" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + '<span>' + esc(p.name) + '</span><input type="checkbox" role="switch" data-provider="' + esc(p.id) + '"' + (on.includes(p.id) ? ' checked' : '') + '></label>').join('') +
-        '<h3>Number on the bubble</h3>' +
-        options.providers.filter((p) => options.choices[p.id] && on.includes(p.id)).map((p) => '<div class="pick" style="--c:' + esc(p.color) + '"><span class="who">' + mark(p, 'g') + esc(p.name) + '</span><div class="seg">' +
-          options.choices[p.id].map(([label, row]) => '<button data-choice="' + esc(p.id) + '" data-row="' + esc(row) + '" aria-pressed="' + ((chosen[p.id] || '') === row) + '">' + esc(label) + '</button>').join('') +
-        '</div></div>').join('') +
-        '<h3>This phone</h3>' +
-        '<div class="pick"><span class="who">Bubble size</span><div class="seg">' +
-          SIZES.map(([label, z]) => '<button data-size="' + z + '" aria-pressed="' + (size === z) + '">' + label + '</button>').join('') +
-        '</div></div>' +
-        '<label class="opt"><span>Hide at the edge when idle</span><input type="checkbox" role="switch" id="autohide"' + (autoHide ? ' checked' : '') + '></label>' +
-        '<h3>Usage pages</h3><div class="links">' +
+        '</div>').join('')) +
+        fold('providers', 'Providers', on.length + ' of ' + options.providers.length + ' on',
+          options.providers.map((p) => '<label class="opt" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + '<span>' + esc(p.name) + '</span><input type="checkbox" role="switch" data-provider="' + esc(p.id) + '"' + (on.includes(p.id) ? ' checked' : '') + '></label>').join('')) +
+        fold('choices', 'Number on the bubble', picks.map((p) => options.choices[p.id].find(([, row]) => row === (chosen[p.id] || ''))?.[0] || '').filter(Boolean).join(', '),
+          picks.map((p) => '<div class="pick" style="--c:' + esc(p.color) + '"><span class="who">' + mark(p, 'g') + esc(p.name) + '</span><div class="seg">' +
+            options.choices[p.id].map(([label, row]) => '<button data-choice="' + esc(p.id) + '" data-row="' + esc(row) + '" aria-pressed="' + ((chosen[p.id] || '') === row) + '">' + esc(label) + '</button>').join('') +
+          '</div></div>').join('')) +
+        fold('phone', 'This phone', SIZES.find(([, z]) => z === size)[0] + (autoHide ? ', hides at the edge' : ''),
+          '<div class="pick"><span class="who">Bubble size</span><div class="seg">' +
+            SIZES.map(([label, z]) => '<button data-size="' + z + '" aria-pressed="' + (size === z) + '">' + label + '</button>').join('') +
+          '</div></div>' +
+          '<label class="opt"><span>Hide at the edge when idle</span><input type="checkbox" role="switch" id="autohide"' + (autoHide ? ' checked' : '') + '></label>') +
+        fold('pages', 'Usage pages', '', '<div class="links">' +
           options.providers.filter((p) => options.pages[p.id]).map((p) => '<button data-page="' + esc(options.pages[p.id]) + '" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + esc(p.name) + '</button>').join('') +
-        '</div>' +
+        '</div>') +
         '<button id="remove">Remove bubble</button>';
     }
     if (html !== prefsDrawn) prefs.innerHTML = prefsDrawn = html;
@@ -536,6 +557,11 @@
     else if (b.dataset.page) window.Android ? Android.open(b.dataset.page) : window.open(b.dataset.page);
     else if (b.id === 'remove') window.Android?.remove();
   });
+  // toggle doesn't bubble, so it's caught on the way down.
+  prefs.addEventListener('toggle', (e) => {
+    const id = e.target.dataset?.fold;
+    if (id) e.target.open ? opened.add(id) : opened.delete(id);
+  }, true);
   prefs.addEventListener('change', (e) => {
     const t = e.target;
     if (t.dataset.provider) change({ enabled: [...prefs.querySelectorAll('[data-provider]')].filter((x) => x.checked).map((x) => x.dataset.provider) });
@@ -570,6 +596,7 @@
     autoHide = on;
     store('autoHide', on);
     window.Android?.autoHide(on);
+    drawPrefs(); // the This phone line says it
   }
 
   function draw() {

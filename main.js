@@ -152,6 +152,10 @@ function snapshot() {
       ...(creditExpired(d.apiCredit, now) ? { apiCredit: { expired: true, expiresAt: d.apiCredit.expiresAt } } : {}),
       // A banked reset with no deadline would read "3 banked resets expire Nov 30 and Dec 1", so the count shows alone.
       ...(d.bankedResetExpiries?.some((t) => !Number.isFinite(t)) ? { bankedResetExpiries: undefined } : {}),
+      // When the plan next bills, with its countdown. A date that has passed (a reading kept through failed reads,
+      // or from before a restart) says nothing about the next one, so it goes.
+      ...(d.renewsAt > now ? { renewsIn: fmtReset(d.renewsAt, now) } : { renewsAt: undefined, renewsGuess: undefined }),
+      renewsFor: undefined, // the account a date belongs to: main's to check, not the screens'
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
       rows: (d.rows || []).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
@@ -194,7 +198,19 @@ async function readFresh(p, force) {
   if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
   fetched.set(p.id, now);
   const res = await p.read();
-  const prev = last.get(p.id);
+  let prev = last.get(p.id);
+  // Signed in to another account since: the next bill on hand was the last one's, whatever else this read brings or
+  // keeps (a failure or an older fallback keeps the reading on screen). A reading that can't tell whose it is (no
+  // sign-in to read) says nothing either way.
+  const otherAccount = (r) => r?.renewsFor && res.renewsFor && r.renewsFor !== res.renewsFor;
+  if (otherAccount(prev)) {
+    const forget = ({ renewsAt, renewsGuess, ...rest }) => ({ ...rest, renewsFor: res.renewsFor });
+    last.set(p.id, (prev = forget(prev)));
+    if (otherAccount(cache[p.id])) {
+      cache[p.id] = forget(cache[p.id]);
+      saveState({ cache });
+    }
+  }
   // A 429's Retry-After, whether or not a reading came with it: nothing is asked before it, and the read is due
   // again the moment it lifts rather than a whole cadence later, so the numbers fall behind as little as they can.
   if (res.retryAfter) {
@@ -215,6 +231,11 @@ async function readFresh(p, force) {
   // Then it's no news: keep the newer ones and never read the drop as a reset.
   // Undated counts as oldest. Live readings skip this: they are "now", whatever the clock did.
   if (res.why && prev?.rows?.length && (res.updatedAt ?? -Infinity) < (prev.updatedAt ?? -Infinity)) return;
+  // A reading that says nothing of the next bill (its lookup failed, a restart hasn't asked yet, or there was no sign-in
+  // to read) keeps the date on hand while it is ahead, and whose it is. One that says there is none (null) drops it.
+  if (res.renewsAt === undefined && prev?.renewsAt > Date.now() && (res.renewsFor === undefined || res.renewsFor === prev.renewsFor)) {
+    Object.assign(res, { renewsAt: prev.renewsAt, renewsGuess: prev.renewsGuess, renewsFor: prev.renewsFor });
+  }
   last.set(p.id, res);
   // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use.
   if (!res.error && !p.local) {

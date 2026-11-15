@@ -3,6 +3,7 @@
 //   { plan, rows: [{ label, percent, resetsAt }], error, updatedAt }
 // Pure shaping is exported separately so test.js can check it without touching disk or network.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -15,6 +16,7 @@ const CONSOLE_API = 'https://platform.claude.com/api';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const CODEX_API = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_RESETS_API = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+const CODEX_ACCOUNTS_API = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27'; // the plan's renews_at
 const OPENCODE_AUTH = path.join(process.env.XDG_DATA_HOME || path.join(HOME, '.local', 'share'), 'opencode', 'auth.json');
 const OPENCODE_GO_API = 'https://opencode.ai/zen/go/v1/usage';
 const GROK_AUTH = path.join(HOME, '.grok', 'auth.json');
@@ -106,6 +108,19 @@ function fmtReset(resetsAt, now = Date.now()) {
   return `in ${m}m`;
 }
 
+// The first monthly anniversary of `start` after `now`, as Stripe bills a monthly plan: the same day and time each
+// month, or the month's last day when the month is shorter (a plan started on the 31st bills on Nov 30).
+function nextMonthly(start, now = Date.now()) {
+  const s = new Date(start);
+  if (Number.isNaN(s.getTime())) return null;
+  for (let n = 1; ; n++) {
+    const [y, m] = [s.getUTCFullYear(), s.getUTCMonth() + n];
+    const day = Math.min(s.getUTCDate(), new Date(Date.UTC(y, m + 1, 0)).getUTCDate());
+    const t = Date.UTC(y, m, day, s.getUTCHours(), s.getUTCMinutes(), s.getUTCSeconds());
+    if (t > now) return t;
+  }
+}
+
 const clamp = (n) => Math.max(0, Math.min(100, Number(n) || 0));
 const ringPercent = (rows, label) => (rows || []).find((r) => r.label === label)?.percent ?? Math.max(0, ...(rows || []).map((r) => r.percent));
 const resetRows = (previous, current) => {
@@ -124,8 +139,14 @@ function shapeClaude(usage, profile) {
     const ends = typeof g?.ends_at === 'string' ? Date.parse(g.ends_at) : NaN;
     return Array(left).fill(Number.isFinite(ends) ? ends : null);
   }).sort((a, b) => (a ?? Infinity) - (b ?? Infinity));
+  // The profile gives only the day the subscription started, so the next bill is worked out from it: renewsGuess.
+  // ponytail: assumes a monthly plan whose billing day never moved; an annual plan or a plan change would need a real source.
+  // With no profile (its lookup failed) the reading says nothing of it, and main keeps the date on hand; null is none.
+  const org = profile?.organization;
+  const renewsAt = org && (org.billing_type === 'stripe_subscription' && org.subscription_status === 'active' ? nextMonthly(org.subscription_created_at) : null);
   return {
     ...(grants ? { bankedResets: expiries.length, bankedResetExpiries: expiries } : {}),
+    ...(org ? { renewsAt, ...(renewsAt ? { renewsGuess: true } : {}) } : {}),
     plan: CLAUDE_TIERS[profile?.organization?.rate_limit_tier] || profile?.organization?.rate_limit_tier || '',
     rows: limits.map((l) => ({
       label: CLAUDE_LABELS[l?.kind] || l?.scope?.model?.display_name || l?.kind || 'Usage',
@@ -290,6 +311,14 @@ function shapeCodexUsage(usage) {
   }), ...(Number.isSafeInteger(bankedResets) && bankedResets >= 0 ? { bankedResets } : {}) };
 }
 
+// When ChatGPT next bills the signed-in account's plan, or null with no renewal ahead (cancelled, or free).
+function shapeCodexRenewal(check, accountId) {
+  const accounts = check?.accounts || {};
+  const t = Date.parse((accounts[accountId] || accounts.default)?.entitlement?.renews_at);
+  return Number.isFinite(t) ? t : null;
+}
+let codexRenewal = { account: null, at: undefined, due: 0 }; // asked every 6 hours, and again once the date has passed
+
 function shapeCodexResetCredits(details) {
   if (!Array.isArray(details?.credits)) return undefined;
   return details.credits.filter((c) => c?.status === 'available').map((c) => {
@@ -403,6 +432,12 @@ async function readCodex() {
     originator: 'Codex Desktop',
   };
   if (tokens.account_id) headers['ChatGPT-Account-Id'] = tokens.account_id;
+  // Another sign-in has its own next bill, asked for at once. The account goes out hashed, so main keeps a date on hand
+  // only for the account it belongs to.
+  const account = crypto.createHash('sha256').update(String(tokens.account_id || tokens.access_token)).digest('hex').slice(0, 12);
+  if (codexRenewal.account !== account) codexRenewal = { account, at: undefined, due: 0 };
+  // What this run knows: a date, null for none ahead, or nothing yet (its lookup failed), when main keeps the one on hand.
+  const renewal = () => ({ renewsFor: account, ...(codexRenewal.at !== undefined ? { renewsAt: codexRenewal.at > Date.now() ? codexRenewal.at : null } : {}) });
 
   try {
     const shaped = shapeCodexUsage(await fetchJson(CODEX_API, headers));
@@ -418,10 +453,20 @@ async function readCodex() {
         // Expiry lookup failure must not discard the live usage or reset count.
       }
     }
-    return shaped.error ? readCodexFallback('Live usage unavailable') : { ...shaped, updatedAt: Date.now() };
+    if (!shaped.error && Date.now() >= codexRenewal.due) {
+      const now = Date.now();
+      try {
+        const at = shapeCodexRenewal(await fetchJson(CODEX_ACCOUNTS_API, headers), tokens.account_id);
+        // Again in 6 hours, or as the date comes, for the next one. An answer whose date has passed waits the 6 hours.
+        codexRenewal = { account, at, due: Math.min(now + 6 * HOUR, at > now ? at : Infinity) };
+      } catch {
+        codexRenewal.due = now + 30 * MIN; // the date must not cost the usage numbers
+      }
+    }
+    return shaped.error ? { ...readCodexFallback('Live usage unavailable'), ...renewal() } : { ...shaped, ...renewal(), updatedAt: Date.now() };
   } catch (e) {
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
-    return readCodexFallback('Live refresh failed');
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60, ...renewal() }; // whose, for main
+    return { ...readCodexFallback('Live refresh failed'), ...renewal() };
   }
 }
 
@@ -530,8 +575,9 @@ async function readCursorXai() {
   const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1' };
   const [usage, plan] = await Promise.all(['GetCurrentPeriodUsage', 'GetPlanInfo'].map((m) => fetchJson(`${CURSOR_DASHBOARD_API}/${m}`, headers, '{}')));
   const end = Number(plan.planInfo?.includedUsageResetsAt);
+  const bills = Number(plan.planInfo?.billingCycleEnd); // epoch ms as a string, when the merged plan next bills
   if (!plan.isMerged || plan.planInfo?.includedUsagePeriod !== 'INCLUDED_USAGE_PERIOD_WEEKLY' || !usage.planUsage) return null;
-  return { plan: '', rows: [{ label: 'Weekly', percent: clamp(usage.planUsage.totalPercentUsed), resetsAt: end ? new Date(end).toISOString() : null }], updatedAt: Date.now() };
+  return { plan: '', rows: [{ label: 'Weekly', percent: clamp(usage.planUsage.totalPercentUsed), resetsAt: end ? new Date(end).toISOString() : null }], renewsAt: bills > Date.now() ? bills : null, updatedAt: Date.now() };
 }
 
 let xaiLines = []; // the lines of the last xAI reading both lookups answered
@@ -621,4 +667,4 @@ const PROVIDERS = [
   { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', everyMs: 0, local: true, read: readRam },
 ];
 
-module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, shapeClaude, shapeCodex, shapeCodexUsage, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };
+module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };

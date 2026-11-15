@@ -4,7 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { shapeApiCredit, creditExpired, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, shapeXai, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
+const { shapeApiCredit, creditExpired, nextMonthly, shapeClaude, shapeCodexRenewal, shapeCodex, shapeCodexUsage, shapeCodexResetCredits, shapeOpenCodeGo, shapeXai, fmtReset, windowLabel, ringPercent, resetRows, lastRateLimits } = require('./providers');
 
 const now = Date.UTC(2026, 7, 29, 12, 0, 0);
 
@@ -105,6 +105,27 @@ assert.strictEqual(ringPercent(claude.rows, 'Session'), 6);
 assert.strictEqual(ringPercent(claude.rows, 'All models'), 100);
 assert.strictEqual(ringPercent(claude.rows, 'Fable'), 14);
 assert.strictEqual(ringPercent(claude.rows, ''), 100, 'no selection keeps the highest-limit default');
+
+// --- When the plans next bill.
+const at = Date.parse;
+assert.strictEqual(nextMonthly('2026-06-24T18:05:04.222Z', at('2026-11-15T03:00:00Z')), at('2026-11-24T18:05:04Z'), 'the same day and time this month');
+assert.strictEqual(nextMonthly('2026-06-24T18:05:04Z', at('2026-11-24T18:05:04Z')), at('2026-12-24T18:05:04Z'), 'on the moment itself, the next month');
+assert.strictEqual(nextMonthly('2026-01-31T10:00:00Z', at('2026-02-10T00:00:00Z')), at('2026-02-28T10:00:00Z'), 'a 31st bills on a shorter month\'s last day');
+assert.strictEqual(nextMonthly('2026-01-31T10:00:00Z', at('2026-03-01T00:00:00Z')), at('2026-03-31T10:00:00Z'), 'and on the 31st again when the month has one');
+assert.strictEqual(nextMonthly('2025-12-15T08:00:00Z', at('2026-12-20T00:00:00Z')), at('2027-01-15T08:00:00Z'), 'across a year');
+assert.strictEqual(nextMonthly('not a date'), null);
+const subscribed = (org) => shapeClaude({}, { organization: { billing_type: 'stripe_subscription', subscription_status: 'active', subscription_created_at: '2020-01-05T00:00:00Z', ...org } });
+assert.ok(subscribed().renewsAt > Date.now() && subscribed().renewsGuess === true, 'Claude\'s next bill is worked out from the day it started');
+assert.strictEqual(new Date(subscribed().renewsAt).getUTCDate(), 5);
+assert.strictEqual(subscribed({ subscription_status: 'canceled' }).renewsAt, null, 'a cancelled plan bills no more');
+assert.strictEqual(subscribed({ billing_type: 'apple_subscription' }).renewsAt, null, 'billed elsewhere, on a calendar we can\'t see');
+assert.strictEqual(claude.renewsAt, null, 'a profile without the date has none');
+assert.ok(!('renewsAt' in shapeClaude({}, null)), 'no profile says nothing, so main keeps the date on hand');
+const check = { accounts: { acc: { entitlement: { renews_at: '2026-11-23T03:50:20+00:00' } }, default: { entitlement: { renews_at: '2026-12-01T00:00:00Z' } } } };
+assert.strictEqual(shapeCodexRenewal(check, 'acc'), at('2026-11-23T03:50:20Z'), 'the signed-in account\'s plan');
+assert.strictEqual(shapeCodexRenewal(check, 'other'), at('2026-12-01T00:00:00Z'), 'else the default account\'s');
+assert.strictEqual(shapeCodexRenewal({ accounts: { acc: { entitlement: { renews_at: null } } } }, 'acc'), null, 'no renewal ahead');
+assert.strictEqual(shapeCodexRenewal(null, 'acc'), null);
 assert.deepStrictEqual(shapeClaude({}, null).rows, [], 'a limits-less response is empty, not a crash');
 assert.strictEqual(shapeClaude({}, null).bankedResets, undefined, 'missing cedar_ember is not a zero balance');
 assert.strictEqual(shapeClaude({ cedar_ember: { eligible: false, grants: [] } }, null).bankedResets, undefined, 'ineligible accounts show no banked row');
@@ -221,9 +242,13 @@ configuredProvider.read()
     fs.writeFileSync(path.join(codexHome, '.codex', 'auth.json'), JSON.stringify({ tokens: { access_token: 'test-token' } }));
     const originalFetch = global.fetch;
     let detailCalls = 0;
+    let renewCalls = 0;
+    let renewsAt = null;
+    let renewFails = false;
     let mode = 'ok';
     global.fetch = async (url, options) => {
       assert.strictEqual(options.headers.Authorization, 'Bearer test-token', 'Codex login comes only from ~/.codex, ignoring CODEX_HOME and Orca');
+      if (url.includes('/accounts/check')) return (renewCalls++, renewFails ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => ({ accounts: { default: { entitlement: { renews_at: renewsAt } } } }) });
       if (url.endsWith('/usage')) return { ok: true, json: async () => ({ rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 604800 } }, rate_limit_reset_credits: { available_count: mode === 'first' ? 0 : 1 } }) };
       detailCalls++;
       if (mode === 'error') throw new Error('Offline');
@@ -248,6 +273,39 @@ configuredProvider.read()
       const callsBefore = detailCalls;
       await configuredProvider.read();
       assert.strictEqual(detailCalls, callsBefore, 'expiry lookup respects Retry-After');
+      // The next bill: asked again after 6 hours, and once as its date comes, but not at every read after it while
+      // ChatGPT still gives the date that has passed.
+      const realNow = Date.now;
+      let shift = 7 * 3600_000;
+      Date.now = () => realNow() + shift;
+      try {
+        mode = 'ok';
+        renewsAt = new Date(Date.now() + 2 * 3600_000).toISOString();
+        renewCalls = 0;
+        assert.strictEqual((await configuredProvider.read()).renewsAt, Date.parse(renewsAt), 'the plan\'s renews_at');
+        await configuredProvider.read();
+        assert.strictEqual(renewCalls, 1, 'not asked again before 6 hours');
+        shift += 3 * 3600_000;
+        assert.strictEqual((await configuredProvider.read()).renewsAt, null, 'a date gone by is none ahead');
+        await configuredProvider.read();
+        await configuredProvider.read();
+        assert.strictEqual(renewCalls, 2, 'asked once as the date came, then not at every read');
+        shift += 6 * 3600_000;
+        renewsAt = new Date(Date.now() + 30 * 24 * 3600_000).toISOString();
+        assert.strictEqual((await configuredProvider.read()).renewsAt, Date.parse(renewsAt), 'the next date, 6 hours on');
+        assert.strictEqual(renewCalls, 3);
+        // Signed in to another account: its own date, asked for at once. Its lookup failing says nothing, so main
+        // can't keep the first account's date for it.
+        const before = (await configuredProvider.read()).renewsFor;
+        fs.writeFileSync(path.join(codexHome, '.codex', 'auth.json'), JSON.stringify({ tokens: { access_token: 'test-token', account_id: 'other' } }));
+        renewFails = true;
+        const switched = await configuredProvider.read();
+        assert.strictEqual(renewCalls, 4, 'another account is asked for at once');
+        assert.ok(!('renewsAt' in switched) && switched.renewsFor && switched.renewsFor !== before, 'a failed lookup for a new account carries no date, and says whose');
+        assert.ok(!/other|test-token/.test(switched.renewsFor), 'the account goes out hashed');
+      } finally {
+        Date.now = realNow;
+      }
     } finally {
       global.fetch = originalFetch;
     }
@@ -1300,6 +1358,49 @@ async function mainChecks() {
     assert.strictEqual(shownClaude().bankedResetExpiries, undefined, 'a reset with no deadline leaves the count alone, without dates');
     last.set('claude', { ...lapsing, bankedResets: 2, bankedResetExpiries: [1, 2] });
     assert.deepStrictEqual(shownClaude().bankedResetExpiries, [1, 2], 'with every deadline known, the dates show');
+    // The next bill shows with its countdown until it passes; a kept reading's date gone by says nothing.
+    last.set('claude', { ...lapsing, renewsAt: deadline + 2 * 3_600_000, renewsGuess: true });
+    assert.deepStrictEqual([shownClaude().renewsIn, shownClaude().renewsGuess], ['in 2h', true], 'a bill ahead shows its countdown');
+    last.set('claude', { ...lapsing, renewsAt: deadline, renewsGuess: true });
+    assert.deepStrictEqual([shownClaude().renewsAt, shownClaude().renewsGuess, shownClaude().renewsIn], [undefined, undefined, undefined], 'a bill gone by goes');
+    // A read that says nothing of the next bill (its lookup failed, or a restart hasn't asked yet) keeps the date on
+    // hand for the same account. One that says there is none, another account's, or a date gone by doesn't.
+    gate.delete('claude');
+    const carried = async (prev, res) => {
+      last.set('claude', { ...lapsing, ...prev });
+      savedCache().claude = last.get('claude');
+      held.read = async () => ({ rows: [{ label: 'Weekly', percent: 40 }], updatedAt: 7, ...res });
+      await readOne(claude, true);
+      return last.get('claude').renewsAt;
+    };
+    const ahead = deadline + 5 * 86_400_000;
+    assert.strictEqual(await carried({ renewsAt: ahead, renewsGuess: true }, {}), ahead, 'a read that says nothing keeps the date on hand');
+    assert.strictEqual(last.get('claude').renewsGuess, true, 'and whether it was worked out');
+    assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a' }, { renewsFor: 'a' }), ahead, 'for the same account');
+    assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a' }, { renewsFor: 'b' }), undefined, 'not for another');
+    assert.strictEqual(await carried({ renewsAt: ahead }, { renewsAt: null }), null, 'a read that says there is none drops it');
+    assert.strictEqual(await carried({ renewsAt: deadline - 1 }, {}), undefined, 'a date gone by is not kept');
+    // Signed in to another account, the date on hand goes even when the read keeps the reading on screen (a failure, an
+    // older fallback), and from the saved cache too. A read that can't tell whose it is (no sign-in to read) keeps it.
+    // On disk too: account A's date saved, B's read fails, and the next start finds no date.
+    last.set('claude', { ...lapsing, renewsAt: ahead, renewsFor: 'a' });
+    savedCache().claude = last.get('claude');
+    saveState({ cache: savedCache() });
+    on['will-quit']();
+    held.read = async () => ({ error: 'HTTP 503', soft: true, renewsFor: 'b' });
+    await readOne(claude, true);
+    assert.strictEqual(last.get('claude').renewsAt, undefined, 'another account\'s failed read');
+    on['will-quit']();
+    last.clear();
+    loadState();
+    assert.deepStrictEqual([last.get('claude')?.rows?.[0]?.percent, last.get('claude')?.renewsAt], [40, undefined], 'and not after a restart');
+    gate.delete('claude');
+    assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a', updatedAt: 10 }, { why: 'Live refresh failed.', updatedAt: 5, renewsFor: 'b' }), undefined, 'another account\'s older fallback');
+    assert.strictEqual(last.get('claude').updatedAt, 10, 'which still keeps the newer numbers');
+    assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a' }, { why: 'Live refresh unavailable.', updatedAt: 8 }), ahead, 'a read that can\'t tell whose keeps it');
+    assert.strictEqual(last.get('claude').renewsFor, 'a', 'and whose it is');
+    last.set('claude', { ...lapsing, renewsAt: ahead, renewsFor: 'a' });
+    assert.deepStrictEqual([shownClaude().renewsAt, shownClaude().renewsFor], [ahead, undefined], 'whose date it is stays in main');
 
     // The same reading and gate restored at startup, with a Console session that decrypts.
     saveState({ cache: { claude: lapsing }, gate: { claude: deadline + 3_600_000 }, consoleSession: Buffer.from('sk-ant-sid01-synthetic').toString('base64') });

@@ -31,6 +31,7 @@ viewports.push({ width: Math.ceil(8 + 86 * 1.25 + 375 + 16), height: 600, edges:
 const data = [
   {
     id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: 37,
+    renewsAt: Date.now() + 232 * 3600_000, renewsGuess: true, renewsIn: 'in 9d 16h', // worked out, so "about"
     rows: [
       { label: 'Session', percent: 37, resets: 'in 2h 10m' },
       { label: 'All models', percent: 14, resets: 'in 3d 4h' },
@@ -40,6 +41,7 @@ const data = [
   },
   {
     id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: 4,
+    renewsAt: Date.now() + 193 * 3600_000, renewsIn: 'in 8d 1h',
     bankedResets: 1,
     bankedResetExpiries: [Date.parse('2026-10-04T05:36:14Z')],
     rows: [{ label: 'Weekly', percent: 4, resets: 'in 6d 2h' }],
@@ -165,7 +167,8 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
         xaiInk: getComputedStyle(document.querySelectorAll('.chip .g')[3]).color === getComputedStyle(document.body).color,
         xaiLabel: document.querySelectorAll('.chip')[3].getAttribute('aria-label'),
         status: [...document.querySelectorAll('.status')].map((el) => el.textContent),
-        bank: [...document.querySelectorAll('.bank')].map((el) => el.textContent),
+        bank: [...document.querySelectorAll('.bank:not(.renews)')].map((el) => el.textContent),
+        renews: [...document.querySelectorAll('.renews')].map((el) => el.textContent),
         rects: window.__rects,
       };
     }, { state, edge });
@@ -212,6 +215,9 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
         'claude-credit-stale': ['$91.95 of $100 API credit left, expires Oct 27', '1 banked reset expires Oct 4'],
       }[state] ?? ['1 banked reset expires Oct 4'];
       if (JSON.stringify(result.bank) !== JSON.stringify(bank)) bad.push('banked resets');
+      // When Claude and Codex next bill, in this PC's time: Claude's worked out, so "about".
+      const renews = [/^Renews about [A-Z][a-z]{2} \d{1,2}, \d\d:\d\d · in 9d 16h$/, /^Renews [A-Z][a-z]{2} \d{1,2}, \d\d:\d\d · in 8d 1h$/];
+      if (result.renews.length !== 2 || !renews.every((re, i) => re.test(result.renews[i]))) bad.push('next bills');
       if ((state === 'claude-credit-stale') !== result.status.includes('API credit not refreshed (HTTP 503), showing the last reading.')) bad.push('stale credit line');
       // A balance past its deadline isn't shown as funds, whatever data still carries it.
       if ((state === 'claude-credit-lapsed') !== result.status.includes('API credit expired Sep 27, waiting for a fresh reading.')) bad.push('lapsed credit line');

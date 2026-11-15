@@ -23,10 +23,10 @@ fs.mkdirSync(shots, { recursive: true });
 const h = 3600_000;
 let cpuLoad = 23; // changes at every read on the real PC
 const providers = (hot) => [
-  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: hot ? 96 : 34, bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
+  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: hot ? 96 : 34, renewsAt: Date.now() + 232 * h, renewsGuess: true, renewsIn: 'in 9d 16h', bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
     apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), ...(hot ? { error: 'API credit not refreshed (HTTP 503), showing the last reading.' } : {}) },
     rows: [{ label: 'Session', percent: hot ? 96 : 34, resets: 'in 3h 2m' }, { label: 'All models', percent: 56, resets: 'in 3h 42m' }, { label: 'Fable', percent: 0, resets: 'in 3h 42m' }] },
-  { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: hot ? 100 : 3, bankedResets: 2, bankedResetExpiries: [Date.parse('2026-10-28T10:00:00Z'), Date.parse('2026-11-04T10:00:00Z')], updatedAt: Date.now() - (hot ? h : 0), waitMs: hot ? 90_000 : 0,
+  { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: hot ? 100 : 3, renewsAt: Date.now() + 193 * h, renewsIn: 'in 8d 1h', bankedResets: 2, bankedResetExpiries: [Date.parse('2026-10-28T10:00:00Z'), Date.parse('2026-11-04T10:00:00Z')], updatedAt: Date.now() - (hot ? h : 0), waitMs: hot ? 90_000 : 0,
     rows: [{ label: 'Weekly', percent: hot ? 100 : 3, resets: 'in 6d 12h' }] },
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', plan: 'Go', ringPercent: hot ? 78 : 61, updatedAt: Date.now(), waitMs: 0,
     rows: [{ label: '5h limit', percent: 0, resets: 'in 5h' }, { label: 'Weekly', percent: 1, resets: 'in 4d 2h' }, { label: 'Monthly', percent: hot ? 78 : 61, resets: 'in 2d 23h' }] },
@@ -190,6 +190,9 @@ try {
     await page.waitForFunction((w) => innerWidth === w, {}, v.width);
     await settle();
   };
+  // Opens the settings groups named, or every one, that are folded.
+  const unfold = (ids) => page.evaluate((ids) => document.querySelectorAll('#prefs details:not([open])').forEach((d) => (!ids || ids.includes(d.dataset.fold)) && d.querySelector('summary').click()), ids);
+  const fold = () => page.evaluate(() => document.querySelectorAll('#prefs details[open] > summary').forEach((s) => s.click()));
   const has = (cls) => page.evaluate((c) => document.body.classList.contains(c), cls);
   // A wait that fails the check with what the page shows instead of throwing, so the rest still runs.
   const until = async (fn, what, arg) => {
@@ -382,10 +385,18 @@ try {
     await open(width, height, side, 120);
     await page.click('#mn');
     await page.waitForSelector('#prefs .sw');
+    const folded = await page.evaluate(() => {
+      const p = document.querySelector('#prefs');
+      return { groups: p.querySelectorAll('details').length, open: p.querySelectorAll('details[open]').length, over: p.scrollHeight - p.clientHeight };
+    });
+    if (folded.groups !== 5 || folded.open) fail(`${tag}: ${folded.open} of ${folded.groups} groups open as the settings open`);
+    if (folded.over > 0) fail(`${tag}: folded, the settings still scroll ${folded.over}px`);
+    await page.screenshot({ path: path.join(shots, `settings-${width}-${side}-folded.png`) });
+    await unfold();
     const m = await page.evaluate(() => {
       const p = document.querySelector('#prefs');
-      const spill = [...p.querySelectorAll('h3, h4, .hint, .opt > span, .who, .seg button, .links button, #remove')].filter((e) => e.scrollWidth > e.clientWidth + 1).map((e) => e.textContent);
-      const small = [...p.querySelectorAll('.seg button, .links button, #remove, .opt')].filter((e) => e.getBoundingClientRect().height < 34).map((e) => e.textContent);
+      const spill = [...p.querySelectorAll('summary, h4, .opt > span, .who, .seg button, .links button, #remove')].filter((e) => e.scrollWidth > e.clientWidth + 1).map((e) => e.textContent);
+      const small = [...p.querySelectorAll('summary, .seg button, .links button, #remove, .opt')].filter((e) => e.getBoundingClientRect().height < 34).map((e) => e.textContent);
       return { sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, sx: p.scrollWidth - p.clientWidth, spill, small, usage: getComputedStyle(document.querySelector('#usage')).display, themes: p.querySelectorAll('.sw').length };
     });
     if (m.sw > m.cw || m.sx > 0) fail(`${tag}: scrolls sideways`);
@@ -401,9 +412,12 @@ try {
       await page.screenshot({ path: path.join(shots, `settings-${width}-${side}-end.png`) });
       await page.$eval('#prefs', (p) => (p.scrollTop = 0));
     }
+    await fold();
     // A tap in the settings keeps the panel open; one outside closes it, and it opens on the numbers next time.
     const inside = await rect(page, '#prefs');
-    await page.mouse.click((inside.l + inside.r) / 2, inside.t + 8);
+    const awake = await page.$eval('#keep-awake', (e) => e.checked);
+    await page.mouse.click((inside.l + inside.r) / 2, inside.b - 3); // the list's bottom padding: the top is the Keep PC awake row
+    if ((await page.$eval('#keep-awake', (e) => e.checked)) !== awake) fail(`${tag}: the tap inside the settings flipped Keep PC awake`);
     await settle();
     if (await has('closing')) fail(`${tag}: a tap inside the settings closed the panel`);
     if (!(await closes(() => page.mouse.click(20, height - 30)))) fail(`${tag}: a tap outside the settings didn't close the panel`);
@@ -606,10 +620,43 @@ try {
     if (await page.$eval('#needs', (n) => !n.hidden)) fail(`${tag}: the note is still there for next time`);
   }
 
+  // When Claude and Codex next bill, in the phone's time, Claude's worked out so "about". A date gone by drops out by
+  // the phone's own clock, as a reading saved while the PC is out of reach would carry it.
+  await open(412, 915, 'right', 120);
+  const bills = () => page.evaluate(() => [...document.querySelectorAll('#sections .renews')].map((e) => e.textContent));
+  const billed = await bills();
+  if (billed.length !== 2 || !/^Renews about [A-Z][a-z]{2} \d{1,2}, \d\d:\d\d · in 9d 16h$/.test(billed[0]) || !/^Renews [A-Z][a-z]{2} \d{1,2}, \d\d:\d\d · in 8d 1h$/.test(billed[1])) fail(`bills: the panel says ${JSON.stringify(billed)}`);
+  await page.evaluate(() => {
+    data.providers[1].renewsAt = Date.now() - 60_000;
+    draw();
+  });
+  if ((await bills()).length !== 1) fail('bills: a date gone by still shows');
+  // Out of reach, the PC's countdown would stand still for days, so only the date shows.
+  answer = 'down';
+  await page.evaluate(() => load());
+  const away = await bills();
+  answer = 'ok';
+  if (away.length !== 1 || away[0].includes(' · ')) fail(`bills: out of reach the panel says ${JSON.stringify(away)}`);
+  await page.evaluate(() => load());
+  if (!(await bills())[0]?.includes(' · in ')) fail('bills: the countdown is not back with the PC');
+  // The This phone line follows a switch flipped inside it.
+  await page.click('#mn');
+  await page.waitForSelector('#prefs .sw');
+  await unfold(['phone']);
+  const phoneLine = () => page.$eval('details[data-fold="phone"] .val', (e) => e.textContent);
+  const lineBefore = await phoneLine();
+  await page.click('#autohide');
+  const lineAfter = await phoneLine();
+  await page.click('#autohide');
+  if (lineBefore !== 'Medium' || lineAfter !== 'Medium, hides at the edge' || (await phoneLine()) !== 'Medium') fail(`prefs: the This phone line said "${lineBefore}", then "${lineAfter}"`);
+  await closes(() => page.mouse.click(20, 885));
+  await resize(small);
+
   // Each change goes to the PC as JSON and comes back as the PC's state.
   await open(412, 915, 'right', 120);
   await page.click('#mn');
   await page.waitForSelector('#prefs .sw');
+  await unfold(['theme', 'providers', 'choices', 'phone']);
   posts.length = 0;
   await page.click('#keep-awake');
   await until(() => document.querySelector('#keep-awake').checked, 'keep-awake: phone enables');
@@ -630,6 +677,9 @@ try {
   await page.click('#prefs [data-theme="paper"]');
   await until(() => document.querySelector('[data-theme="paper"]').getAttribute('aria-pressed') === 'true', 'theme: Paper marked chosen');
   await settle();
+  // The PC's answer redraws the settings; the group being used stays open, and its line names the new theme.
+  const themeFold = await page.$eval('details[data-fold="theme"]', (d) => [d.open, d.querySelector('.val').textContent]);
+  if (!themeFold[0] || themeFold[1] !== 'Paper') fail(`theme: after the redraw the group is ${themeFold[0] ? 'open' : 'folded'}, its line says "${themeFold[1]}"`);
   const painted = await page.evaluate(() => document.documentElement.style.cssText);
   if (!posts.some((p) => p.type === 'application/json' && p.body.theme === 'paper')) fail(`theme: the PC got ${JSON.stringify(posts)}`);
   if (!painted.includes('--bg:') || pc.theme !== 'paper') fail(`theme: the page wears "${painted.slice(0, 40)}", the PC "${pc.theme}"`);
@@ -784,6 +834,7 @@ try {
       await open(width, height, side, wy);
       await page.click('#mn');
       await page.waitForSelector('#prefs [data-size]');
+      await unfold(['phone']);
       for (const z of [1.2, 0.85, 1]) {
         const tag = `size ${z} while open, ${width}x${height} ${side}`;
         await page.click(`#prefs [data-size="${z}"]`);

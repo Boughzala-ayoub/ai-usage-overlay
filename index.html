@@ -471,6 +471,15 @@
       (c.error ? '<p class="status warn">' + esc(c.error).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>' : '');
   }
 
+  // "Renews Nov 23, 04:50 · in 7d 22h", in this PC's time. A date worked out from the day the plan started, rather
+  // than told by the provider, says "about".
+  function renews(p) {
+    if (!Number.isFinite(p.renewsAt)) return '';
+    const d = new Date(p.renewsAt);
+    const when = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    return '<p class="bank renews">Renews ' + (p.renewsGuess ? 'about ' : '') + '<b class="fig">' + esc(when) + '</b>' + (p.renewsIn ? ' · ' + esc(p.renewsIn) : '') + '</p>';
+  }
+
   function section(p) {
     const rows = p.rows || [];
     const lines = [];
@@ -489,7 +498,7 @@
           '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span>' +
           '<span class="rs">' + esc(r.resets) + '</span>' +
         '</div>').join('') +
-      banked(p) + credit(p) +
+      banked(p) + credit(p) + renews(p) +
       // Providers write commands in backticks ("run `claude` to sign in"); show them as code.
       lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
     '</section>';

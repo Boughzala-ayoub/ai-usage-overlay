@@ -156,6 +156,16 @@ puts the capsule back on the right of the primary display.
   in use read first, and the numbers count up with their bars as the panel opens.
 - Banked resets are one line under their provider: `4 banked resets expire Oct 4, 5, 22 and 29`.
   At zero the line is left out.
+- When a plan next bills is one more line, in this PC's time: `Renews Nov 23, 04:50 · in 8d 1h`.
+  Codex's date is ChatGPT's own `renews_at`, from the account check, asked every six hours and again
+  once the date has passed. xAI's is `billingCycleEnd` from Cursor's plan info, which the overlay
+  reads anyway. Claude reports only the day the subscription started, so its line counts whole
+  months from that day and says `Renews about`. That guess is wrong for a yearly plan, or if a plan
+  change moved the billing day. The overlay reads no date for OpenCode Go, so it gets no line, and none for xAI either
+  when it is read from xAI's own endpoints. A date that has gone by drops out until a read brings
+  the next one. A lookup that fails keeps the date already on screen, and signing in to another
+  Codex account drops it until that account's own date comes in. The phone shows the date
+  without its countdown while the PC is out of reach, since only the PC moves the countdown.
 - A provider says so in its own section when it is erroring (in red, with any command set as
   code), showing a fallback, or more than ten minutes stale. A rate limit isn't shown (see Rate limits). The two icons in the
   footer refresh and open the same menu as right-click.
@@ -185,7 +195,9 @@ The `⋯` in the panel's footer opens the settings. The theme (all 96), which pr
 limit each summary number reads are the PC's tray menu, shared both ways: change one on the phone
 and the PC's overlay follows at once, and the other way round. The bubble's size (Small, Medium,
 Large), hiding at the edge when idle, links to each usage page and Remove bubble are the phone's
-own. Hidden at the edge, the tab slides off after 3 seconds untouched and leaves a 12dp lip with
+own. Keep PC awake is a switch at the top. Every other group folds to one line with its current
+setting on the right (`Theme  Navy`, `Providers  5 of 6 on`), and a tap opens it. They all start
+folded, and one you open stays open until you close it or the bubble restarts. Hidden at the edge, the tab slides off after 3 seconds untouched and leaves a 12dp lip with
 one level per provider, as the PC's lip does; a tap on it brings the tab back.
 
 The scissors in the footer snip part of the screen to the phone's clipboard, as Win+Shift+S does on
