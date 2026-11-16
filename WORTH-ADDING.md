@@ -37,12 +37,6 @@ was 2.1.319 on the day of the audit. The endpoint throttles unknown clients firs
 that falls far behind may start to count as one. Bump the string, or read the installed version
 once at startup.
 
-## Single-instance lock, except under `--shot`
-
-`npm start` beside the installed copy gives two overlays on one `state.json`. Both poll Claude's
-endpoint, both keep a link pool, and both can run `tailscale down`. `app.requestSingleInstanceLock()`
-stops that. `--shot` has to stay exempt, since it runs beside the installed copy to verify a change.
-
 ## Stop the phone's stream while its screen is off
 
 The bubble keeps its event stream open all day and hears from the PC every 15 s while CPU or RAM

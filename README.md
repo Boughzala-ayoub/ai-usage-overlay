@@ -169,6 +169,15 @@ puts the capsule back on the right of the primary display.
 - A provider says so in its own section when it is erroring (in red, with any command set as
   code), showing a fallback, or more than ten minutes stale. A rate limit isn't shown (see Rate limits). The two icons in the
   footer refresh and open the same menu as right-click.
+- `Keep PC awake` keeps the PC running with the screen off. While it is on, a hidden PowerShell holds
+  Windows' system-required request and every power plan's plugged-in sleep timer is Never. The
+  request alone kept this laptop up through every screen-off spell on mains on 2026-11-15, yet on
+  2026-11-16 it slept for 38 minutes, hence the timers. Each plan's own timer goes into `state.json`
+  before anything changes, and comes back when the switch goes off, when the overlay quits, when
+  Windows signs out, restarts or shuts down, or at the next start after a crash. A timer changed in
+  Settings meanwhile keeps the new value. Closing the lid
+  still sleeps the PC, and the battery timers stay as they are. Uninstalling with the switch on
+  leaves the timers at Never, so turn it off first.
 - When a limit resets, the capsule beeps and opens for six seconds to say which one. Hovering it
   swaps the notice for the full panel.
 - With Auto-hide on, the capsule slides away and leaves a lip on the edge: one small level per
@@ -231,7 +240,8 @@ its own domain at 127.0.0.1 from reading anything. Settings take `application/js
 form or a no-cors fetch from another page can't send without a CORS preflight that this server never
 answers. There is no pairing token, unlike Loom's phone remote: anyone on your tailnet can read the
 percentages and the PC's CPU and RAM, change the shared settings, and turn Keep PC awake on or off,
-which keeps the PC from sleeping until it is turned off again. Nothing more.
+which keeps the PC from sleeping, and its plugged-in sleep timers at Never, until it is turned off
+again. Nothing more.
 
 After the PC has been on the phone's hotspot, the overlay watches Tailscale's tunnel to the phone
 (`heal` in `link.js`). Tailscale on the PC can come back from the hotspot with a frozen session: the
@@ -298,7 +308,9 @@ came almost for free.
 ## Verifying a change
 
 `--shot=<file>` launches the app, waits for the first data, writes a PNG of the window and quits.
-Put `hover` in the filename and it opens the panel before the capture.
+Put `hover` in the filename and it opens the panel before the capture. Only one copy of the overlay
+runs at a time, and launching it again brings back a hidden one. `--shot` is exempt, so it can run
+beside the installed copy, and it leaves Keep PC awake's sleep timers to that copy.
 
 `npm run test:ui` loads `index.html` in headless Chrome with a fake `window.api` and runs every state
 (loading, error, rate limited, banked resets, a reset notice, a long panel) on all four edges. It

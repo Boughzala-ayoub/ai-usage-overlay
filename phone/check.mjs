@@ -135,7 +135,7 @@ const pcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pc-'));
 const held = { read: async () => ({ rows: [] }) };
 let realHandler = null;
 const realPc = (() => {
-  const electron = { app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on() {}, getPath: () => pcDir }, ipcMain: { on() {}, handle() {} }, globalShortcut: { unregisterAll() {} } };
+  const electron = { app: { commandLine: { appendSwitch() {} }, requestSingleInstanceLock: () => true, whenReady: () => new Promise(() => {}), on() {}, getPath: () => pcDir }, ipcMain: { on() {}, handle() {} }, globalShortcut: { unregisterAll() {} } };
   const fakeHttp = { createServer: (fn) => ((realHandler = fn), { on() { return this; }, listen() { return this; } }) };
   const fakeProviders = { ...requireRoot('./providers'), PROVIDERS: [{ id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 0, read: () => held.read() }] };
   const mod = { exports: {} };

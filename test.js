@@ -648,6 +648,7 @@ configuredProvider.read()
       global.fetch = originalFetch;
     }
   })
+  .then(copyChecks)
   .then(mainChecks)
   .then(sizingChecks)
   .then(linkChecks)
@@ -667,7 +668,7 @@ function sizingChecks() {
   const ipc = {};
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-sizing-'));
   const electron = {
-    app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on() {}, getPath: () => stateDir },
+    app: { commandLine: { appendSwitch() {} }, requestSingleInstanceLock: () => true, whenReady: () => new Promise(() => {}), on() {}, getPath: () => stateDir },
     ipcMain: { on: (ch, fn) => (ipc[ch] = fn), handle() {} },
     screen: {
       getAllDisplays: () => displays,
@@ -745,13 +746,87 @@ function sizingChecks() {
   fs.rmSync(stateDir, { recursive: true, force: true });
 }
 
+// A second copy exits before it opens a window or touches anything: two would fight over port 7430, and the second,
+// holding the sleep timers on its own, could save over the first's record of them. A --shot run, which runs beside
+// the installed copy, asks for no lock and leaves the power settings to that copy, Keep PC awake or not.
+async function copyChecks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-copy-'));
+  const anything = new Proxy(function () {}, {
+    get: (_, k) => (k === Symbol.toPrimitive ? () => 0 : k === 'then' ? undefined : anything),
+    apply: () => anything,
+    construct: () => anything,
+  });
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { setKeepAwake };';
+  const load = (lock, argv = [], powercfg = () => '') => {
+    const seen = { locks: 0, exit: undefined, windows: 0, powercfg: 0 };
+    const handlers = {};
+    let ready;
+    const app = { commandLine: anything, requestSingleInstanceLock: () => (seen.locks++, lock), exit: (code) => (seen.exit = code), whenReady: () => new Promise((r) => (ready = r)), on() {}, getPath: () => dir };
+    // A window that takes any call and keeps what it is asked to listen for.
+    const BrowserWindow = function () {
+      seen.windows++;
+      return new Proxy(anything, { get: (_, k) => (k === 'on' || k === 'once' ? (e, fn) => ((handlers[e] = fn), anything) : anything[k]) });
+    };
+    const deps = {
+      electron: new Proxy({ app, BrowserWindow }, { get: (t, k) => t[k] ?? anything }),
+      http: { createServer: () => anything },
+      './link': anything,
+      './providers': { ...require('./providers'), PROVIDERS: [] }, // no real account is ever asked
+      child_process: { spawn: () => anything, execFileSync: (cmd, args) => (seen.powercfg++, powercfg(args)) },
+    };
+    const argvWas = process.argv;
+    process.argv = [...argvWas, ...argv];
+    const mod = { exports: {} };
+    try {
+      new Function('require', 'module', '__dirname', src)((id) => deps[id] ?? require(id), mod, __dirname);
+    } finally {
+      process.argv = argvWas;
+    }
+    return { seen, handlers, ready, ...mod.exports };
+  };
+  const second = load(false);
+  second.ready();
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(second.seen, { locks: 1, exit: 0, windows: 0, powercfg: 0 }, 'a second copy exits and opens nothing');
+  const shot = load(false, ['--shot=' + path.join(dir, 'shot.png')]);
+  shot.setKeepAwake(true);
+  assert.deepStrictEqual(shot.seen, { locks: 0, exit: undefined, windows: 0, powercfg: 0 }, 'a --shot run takes no lock and leaves the sleep timers alone');
+
+  // Windows ending the session skips will-quit. The window's session-end puts the timer back and saves at once,
+  // with the switch still on for the next start. One plan, 600 s of its own, held at Never by a crashed run.
+  const PERF = '27fa6203-3987-4dcc-918d-748559d549ec';
+  const plan = { ac: 0 };
+  const powercfg = ([verb, , , , value]) =>
+    verb === '/list' ? `GUID: ${PERF}  (Performance) *\r\n`
+    : verb === '/q' ? `0x00000000 0xffffffff 0x00000001 0x${plan.ac.toString(16)} 0x000000f0\r\n`
+    : verb === '/setacvalueindex' ? ((plan.ac = Number(value)), '')
+    : '';
+  await new Promise((r) => setTimeout(r, 500)); // the --shot run's debounced save first
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ keepAwake: true, sleepAc: { [PERF]: 600 } }));
+  const intervalWas = global.setInterval;
+  global.setInterval = () => ({ unref() {} }); // main.js's own timers stand still, and only for a few microtasks
+  try {
+    const first = load(true, [], powercfg);
+    first.ready();
+    for (let i = 0; i < 5; i++) await null; // whenReady's callback runs
+    assert.strictEqual(plan.ac, 0, 'starting with the switch on holds the timer');
+    first.handlers['session-end']();
+  } finally {
+    global.setInterval = intervalWas;
+  }
+  const st = JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+  assert.deepStrictEqual([plan.ac, st.keepAwake, st.sleepAc], [600, true, {}], 'session end puts the timer back and saves that');
+  await new Promise((r) => setTimeout(r, 500)); // its debounced save lands before the folder goes
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 async function mainChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-main-'));
   const on = {};
   const powerCalls = [];
   const beeps = [];
   const electron = {
-    app: { commandLine: { appendSwitch() {} }, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
+    app: { commandLine: { appendSwitch() {} }, requestSingleInstanceLock: () => true, whenReady: () => new Promise(() => {}), on: (e, fn) => (on[e] = fn), getPath: () => dir },
     ipcMain: { on() {}, handle() {} },
     globalShortcut: { unregisterAll() {} },
     Menu: { buildFromTemplate: (template) => template },
@@ -767,7 +842,38 @@ async function mainChecks() {
     const id = powerCalls.filter(([what]) => what === 'start').length;
     powerCalls.push(['start', cmd, args.at(-1).includes('SetThreadExecutionState(0x80000001)') && opts.windowsHide && opts.stdio[0] === 'pipe']);
     return { on() { return this; }, kill: () => powerCalls.push(['stop', id]) };
+  }, execFileSync: (cmd, args, opts) => {
+    cfg.calls.push(args);
+    if (!['/list', '/q', '/setacvalueindex', '/setactive'].includes(args[0])) cfg.unexpected.push(args);
+    if (cfg.hang?.(args)) {
+      // A powercfg that never answers: execFileSync waits out its timeout, here on the stood-in clock.
+      cfg.clock += opts.timeout;
+      throw Object.assign(new Error('spawnSync powercfg ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    }
+    if (cfg.fail?.(args) || cmd !== 'powercfg' || !opts.windowsHide || !(opts.timeout > 0)) throw Object.assign(new Error('Command failed: powercfg'), { status: 1 });
+    return cfg.odd?.(args) ?? powercfg(args);
   } };
+  // powercfg as this PC answers, labels in French with the console's é read as U+FFFD; only GUIDs and hex numbers
+  // mean anything. Each plan holds its plugged-in (ac) and battery (dc) sleep timers in seconds. `odd` stands in
+  // other output for a call, `fail` makes one fail, `hang` makes one time out. Any verb but the four main.js
+  // needs lands in `unexpected`.
+  const cfg = { plans: {}, active: null, calls: [], unexpected: [], fail: null, odd: null, hang: null, clock: 0, wrote: null };
+  const hex = (n) => '0x' + n.toString(16).padStart(8, '0');
+  const powercfg = ([verb, plan, sub, setting, value, ...rest]) => {
+    const failed = () => Object.assign(new Error('Command failed: powercfg'), { status: 1 });
+    if (verb === '/list' && !plan) return "\r\nModes de gestion de l'alimentation existants (* Actif)\r\n-----------------------------------\r\n" + Object.keys(cfg.plans).map((g) => `GUID du mode de gestion de l'alimentation�: ${g}  (Plan)${g === cfg.active ? ' *' : ''}\r\n`).join('');
+    if (verb === '/setactive' && plan === 'SCHEME_CURRENT' && !sub) return '';
+    const p = cfg.plans[plan];
+    if (!p || sub !== 'SUB_SLEEP' || setting !== 'STANDBYIDLE' || rest.length) throw failed();
+    if (verb === '/setacvalueindex' || verb === '/setdcvalueindex') {
+      if (!/^\d+$/.test(value)) throw failed();
+      cfg.wrote?.(plan, Number(value));
+      p[verb === '/setacvalueindex' ? 'ac' : 'dc'] = Number(value);
+      return '';
+    }
+    if (verb !== '/q' || value !== undefined) throw failed();
+    return `GUID du mode de gestion de l'alimentation�: ${plan}  (Plan)\r\n  Alias de GUID�: SCHEME_BALANCED\r\n  GUID du sous-groupe�: 238c9fa8-0aad-41ed-83f4-97be242c8f20  (Veille)\r\n    Alias de GUID�: SUB_SLEEP\r\n    GUID du param�tre d'alimentation�: 29f6c1db-86da-48c5-9fdb-f2b67b1f44da  (Veille apr�s)\r\n      Alias de GUID�: STANDBYIDLE\r\n      Valeur minimale possible�: 0x00000000\r\n      Valeur maximale possible�: 0xffffffff\r\n      Incr�ment possible des param�tres�: 0x00000001\r\n      Unit�s possibles des param�tres�: secondes\r\n    Index actuel du param�tre de courant alternatif�: ${hex(p.ac)}\r\n    Index actuel du param�tre de courant continu�: ${hex(p.dc)}\r\n\r\n`;
+  };
   // The phone's HTTP handler is caught as main.js hands it to http, so no port opens: the installed overlay may hold 7430.
   let phoneHandler = null;
   const http = { createServer: (fn) => ((phoneHandler = fn), { on() { return this; }, listen() { return this; } }) };
@@ -783,7 +889,7 @@ async function mainChecks() {
   const link = { ...require('./link'), secret: () => 'e'.repeat(64) };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched, crash: () => { flushState(); awakeBlocker = null; sleepAc = {}; } };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : id === './link' ? link : require(id)), mod, __dirname);
   const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, savedCache, setWin, fetched } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
@@ -1187,28 +1293,215 @@ async function mainChecks() {
       assert.strictEqual((await ask('POST', '/api/settings', JSON.stringify({ keepAwake: value }))).status, 400);
     }
     assert.deepStrictEqual(powerCalls, [], 'invalid settings never start a blocker');
+    assert.deepStrictEqual(cfg.calls, [], 'or touch a sleep timer');
+    // This PC's three plans, and one already at Never.
+    const [BAL, SIL, PERF, SAVER] = ['381b4222-f694-41f0-9685-ff5bb260df2e', '64a64f24-65b9-4b56-befd-5ec1eaced9b3', '27fa6203-3987-4dcc-918d-748559d549ec', 'a1841308-3541-4fab-bc81-f71556f20b4a'];
+    const own = () => ({ [BAL]: { ac: 300, dc: 180 }, [SIL]: { ac: 300, dc: 180 }, [PERF]: { ac: 600, dc: 240 }, [SAVER]: { ac: 0, dc: 900 } });
+    const timers = () => Object.fromEntries(Object.entries(cfg.plans).map(([plan, p]) => [plan, p.ac]));
+    const writes = () => cfg.calls.filter(([verb]) => verb === '/setacvalueindex');
+    const asOwn = { [BAL]: 300, [SIL]: 300, [PERF]: 600, [SAVER]: 0 };
+    const never = { [BAL]: 0, [SIL]: 0, [PERF]: 0, [SAVER]: 0 };
+    Object.assign(cfg, { plans: own(), active: PERF });
+    const onDisk = [];
+    cfg.wrote = (plan, seconds) => seconds === 0 && onDisk.push(saved().sleepAc?.[plan]);
     for (let i = 0; i < 2; i++) {
       const res = await ask('POST', '/api/settings', '{"keepAwake":true}');
       assert.strictEqual(JSON.parse(res.body).keepAwake, true);
     }
     assert.deepStrictEqual(powerCalls, [['start', 'powershell.exe', true]], 'repeated enable starts one hidden helper holding ES_SYSTEM_REQUIRED on an open stdin');
+    assert.deepStrictEqual(timers(), never, 'every plan sleeps Never on mains');
+    assert.deepStrictEqual(Object.values(cfg.plans).map((p) => p.dc), [180, 180, 240, 900], 'battery timers stay');
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, "each plan's own timer is on disk; one at Never has nothing to put back");
+    assert.deepStrictEqual(onDisk, [300, 300, 600], 'each was on disk before its timer changed');
+    assert.deepStrictEqual(cfg.calls.at(-1), ['/setactive', 'SCHEME_CURRENT'], 'the active plan applies its new timer');
+    assert.strictEqual(writes().length, 3, 'the second enable changed nothing');
     assert.strictEqual(awakeMenu().checked, true, 'phone updates the PC menu');
+    cfg.plans[SIL].ac = 900; // changed in Settings meanwhile
     awakeMenu().click({ checked: false });
     assert.deepStrictEqual(powerCalls.at(-1), ['stop', 0], 'PC toggle releases the same blocker');
+    assert.deepStrictEqual(timers(), { ...asOwn, [SIL]: 900 }, 'switching off puts each timer back and keeps one changed meanwhile');
     assert.deepStrictEqual(powerStates, [false, true, false], 'both controls broadcast the state');
     closePowerStream();
     on['will-quit']();
     assert.strictEqual(saved().keepAwake, false);
+    assert.deepStrictEqual(saved().sleepAc, {}, 'nothing left to put back');
+    Object.assign(cfg, { plans: own() });
     awakeMenu().click({ checked: true });
     on['will-quit']();
     assert.deepStrictEqual(powerCalls.at(-1), ['stop', 1], 'quit releases the blocker');
+    assert.deepStrictEqual(timers(), asOwn, 'and puts the timers back');
     assert.strictEqual(saved().keepAwake, true, 'quit preserves the saved choice');
+    assert.deepStrictEqual(saved().sleepAc, {});
     loadState();
     assert.strictEqual(awakeMenu().checked, true, 'startup restores keep-awake');
+    assert.deepStrictEqual(timers(), never, 'and holds the timers again');
     assert.deepStrictEqual(powerCalls.at(-1), ['start', 'powershell.exe', true]);
     assert.strictEqual(powerCalls.filter(([what]) => what === 'start').length, 3, 'one helper per enable');
     awakeMenu().click({ checked: false });
     on['will-quit']();
+    assert.deepStrictEqual(timers(), asOwn);
+
+    // A crash with the switch on leaves the timers at Never and their own values on disk. The next start holds
+    // them without reading our 0 as theirs, so switching off then puts the real ones back.
+    awakeMenu().click({ checked: true });
+    mod.exports.crash();
+    assert.deepStrictEqual([saved().keepAwake, saved().sleepAc], [true, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }]);
+    loadState();
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'a plan on record that reads our 0 keeps its record');
+    assert.deepStrictEqual(timers(), never);
+    awakeMenu().click({ checked: false });
+    assert.deepStrictEqual(timers(), asOwn, 'the timers from before the crash come back');
+    on['will-quit']();
+
+    // A record left with the switch off (a crash while switching off) is put back at the next start. One that isn't
+    // a lowercase plan GUID with a positive whole number of seconds is ignored.
+    cfg.plans[PERF].ac = 0;
+    cfg.plans[BAL].ac = 0;
+    const statePath = path.join(dir, 'state.json');
+    fs.writeFileSync(statePath, JSON.stringify({ ...saved(), keepAwake: false, sleepAc: { [PERF]: 600, [BAL]: '300', [SIL.toUpperCase()]: 5, [SAVER]: -1, 'x; shutdown /s': 60 } }));
+    mod.exports.crash();
+    cfg.calls = [];
+    loadState();
+    assert.deepStrictEqual(writes(), [['/setacvalueindex', PERF, 'SUB_SLEEP', 'STANDBYIDLE', '600']], 'only the valid record is put back');
+    assert.deepStrictEqual(timers(), { ...asOwn, [BAL]: 0 });
+    assert.strictEqual(awakeMenu().checked, false);
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, {});
+    cfg.plans[BAL].ac = 300;
+
+    // A timer that can't be put back stays on record for quit, and then the next start, to try again.
+    awakeMenu().click({ checked: true });
+    cfg.fail = ([verb]) => verb === '/setacvalueindex';
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'kept on record');
+    cfg.fail = null;
+    loadState();
+    assert.deepStrictEqual(timers(), asOwn, 'put back at the next start');
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, {});
+
+    // A plan deleted while held drops off the record instead of failing every switch-off after.
+    awakeMenu().click({ checked: true });
+    delete cfg.plans[SIL];
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, {}, 'a deleted plan leaves no record');
+    cfg.plans = own();
+
+    // With state.json unwritable, the timers are left alone: nothing on disk could put them back.
+    const before = fs.readFileSync(statePath);
+    fs.rmSync(statePath);
+    fs.mkdirSync(statePath);
+    cfg.calls = [];
+    awakeMenu().click({ checked: true });
+    assert.deepStrictEqual(writes(), [], 'no timer changes without its record on disk');
+    assert.strictEqual(awakeMenu().checked, true, 'the helper still holds');
+    awakeMenu().click({ checked: false });
+    fs.rmdirSync(statePath);
+    fs.writeFileSync(statePath, before);
+    on['will-quit']();
+    assert.deepStrictEqual(timers(), asOwn);
+
+    // With no powercfg at all, the switch, startup and quit still work, on the helper alone.
+    cfg.fail = () => true;
+    awakeMenu().click({ checked: true });
+    assert.strictEqual(awakeMenu().checked, true);
+    on['will-quit']();
+    assert.strictEqual(saved().keepAwake, true, 'quit still flushes');
+    loadState();
+    assert.strictEqual(awakeMenu().checked, true, 'startup still restores the switch');
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
+    cfg.fail = null;
+
+    // A /list with no plan in it, from a powercfg that still exits 0, can't drop the records.
+    awakeMenu().click({ checked: true });
+    cfg.odd = ([verb]) => (verb === '/list' ? 'Rien\r\n' : undefined);
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'an empty plan list keeps the records');
+    cfg.odd = null;
+    loadState();
+    assert.deepStrictEqual(timers(), asOwn);
+    on['will-quit']();
+
+    // A /q cut short, to the minimum, maximum and step, or missing its minimum, so the fourth number is the battery
+    // timer. No timer is taken from either, so none can come back wrong.
+    for (const cut of [(q) => q.split('Unit')[0], (q) => q.replace(/Valeur minimale[^\n]*\n/, '')]) {
+      cfg.odd = (args) => (args[0] === '/q' ? cut(powercfg(args)) : undefined);
+      awakeMenu().click({ checked: true });
+      cfg.odd = null;
+      assert.deepStrictEqual([saved().sleepAc, timers()], [{}, asOwn], 'nothing taken from a short /q, nothing changed');
+      awakeMenu().click({ checked: false });
+      on['will-quit']();
+    }
+
+    // One plan refusing its write stops neither the others nor the active plan applying them.
+    cfg.calls = [];
+    cfg.fail = ([verb, plan]) => verb === '/setacvalueindex' && plan === BAL;
+    awakeMenu().click({ checked: true });
+    assert.deepStrictEqual(timers(), { ...never, [BAL]: 300 }, 'the other plans still go to Never');
+    assert.deepStrictEqual(cfg.calls.at(-1), ['/setactive', 'SCHEME_CURRENT']);
+    cfg.fail = null;
+    awakeMenu().click({ checked: false });
+    assert.deepStrictEqual(timers(), asOwn);
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, {});
+
+    // Timers put back but not applied, because setactive failed, stay on record for quit or the next start.
+    awakeMenu().click({ checked: true });
+    cfg.fail = ([verb]) => verb === '/setactive';
+    awakeMenu().click({ checked: false });
+    on['will-quit']();
+    assert.deepStrictEqual(timers(), asOwn, 'the timers are back');
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'but on record until applied');
+    cfg.fail = null;
+    cfg.calls = [];
+    loadState();
+    assert.deepStrictEqual([cfg.calls.at(-1), writes()], [['/setactive', 'SCHEME_CURRENT'], []], 'the next start applies them, writing nothing');
+    on['will-quit']();
+    assert.deepStrictEqual(saved().sleepAc, {});
+
+    // Nor can such a record bring an old timer back later. A plan that no longer reads 0 has its own timer
+    // again, here one changed in Settings since, and the next switch-on keeps that one. If that plan can't be
+    // read at the next switch-on, it is left as it is rather than held on the old record.
+    for (const unread of [false, true]) {
+      awakeMenu().click({ checked: true });
+      cfg.fail = ([verb]) => verb === '/setactive';
+      awakeMenu().click({ checked: false });
+      cfg.fail = unread ? ([verb, plan]) => verb === '/q' && plan === SIL : null;
+      cfg.plans[SIL].ac = 900;
+      awakeMenu().click({ checked: true });
+      assert.deepStrictEqual(timers(), unread ? { ...never, [SIL]: 900 } : never, unread ? 'a plan that could not be read is not held on an old record' : 'every plan held');
+      cfg.fail = null;
+      awakeMenu().click({ checked: false });
+      assert.deepStrictEqual(timers(), { ...asOwn, [SIL]: 900 }, 'a timer changed after a half-done release comes back, not the old one');
+      on['will-quit']();
+      assert.deepStrictEqual(saved().sleepAc, {});
+      cfg.plans[SIL].ac = 300;
+    }
+
+    // A powercfg that hangs costs a switch, or a quit, 3 s in all rather than 5 s for each call.
+    awakeMenu().click({ checked: true });
+    const clockWas = Date.now;
+    Object.assign(cfg, { hang: ([verb]) => verb !== '/list', clock: 0, calls: [] });
+    Date.now = () => cfg.clock;
+    try {
+      awakeMenu().click({ checked: false });
+      assert.deepStrictEqual([cfg.calls.map(([verb]) => verb), cfg.clock], [['/list', '/q'], 3000], 'switching off gives a hung powercfg 3 s in all');
+      on['will-quit']();
+      assert.strictEqual(cfg.clock, 6000, 'and quit 3 s more');
+    } finally {
+      Date.now = clockWas;
+      cfg.hang = null;
+    }
+    assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'quit still flushed, with the records');
+    loadState();
+    assert.deepStrictEqual(timers(), asOwn);
+    on['will-quit']();
+    assert.deepStrictEqual(cfg.unexpected, [], 'nothing but /list, /q, /setacvalueindex and /setactive, so never a battery timer');
+    cfg.wrote = null;
 
     // The link's secret never goes down the link. A gateway that relays the handshake between this PC and the phone
     // can send its own GO, get a pipe to this port, and say it is a.b.ts.net: the pipe still comes from
@@ -1683,7 +1976,7 @@ async function startChecks() {
       const on = {};
       let exited;
       const exit = new Promise((r) => (exited = r));
-      const app = { commandLine: anything, whenReady: () => Promise.resolve(), on: (e, fn) => (on[e] = fn), getPath: () => dir, quit() {}, exit: exited };
+      const app = { commandLine: anything, requestSingleInstanceLock: () => true, whenReady: () => Promise.resolve(), on: (e, fn) => (on[e] = fn), getPath: () => dir, quit() {}, exit: exited };
       const electron = new Proxy({ app }, { get: (t, k) => t[k] ?? anything });
       const start = (...args) => {
         global.setInterval = (fn, ms) => real.setInterval(ms === 15_000 ? ((watch = fn), () => {}) : fn, ms);

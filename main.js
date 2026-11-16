@@ -1,6 +1,6 @@
 'use strict';
 const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, ipcMain, screen, shell, safeStorage, clipboard, dialog } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -50,6 +50,11 @@ const SHOT = (process.argv.find((a) => a.startsWith('--shot=')) || '').slice(7);
 // and stops painting, so even back on top it shows a stale frame. An overlay is never meant to be
 // hidden by another window, so skip the occlusion tracking outright.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+// One copy at a time. A second would fight the first for port 7430, the link and the hotkey, and, holding the
+// sleep timers on its own, could save over the first's record of them. A second launch shows the first instead.
+// A --shot run is exempt: it runs beside the installed copy to check a change.
+const firstCopy = !!SHOT || app.requestSingleInstanceLock();
+if (!firstCopy) app.exit(0);
 
 let win = null;
 let tray = null;
@@ -60,6 +65,7 @@ let snapTimer = null;
 let visible = true;
 let autoHide = true;
 let awakeBlocker = null;
+let sleepAc = {}; // power plan GUID -> its own plugged-in sleep timer in seconds, while Keep PC awake holds it at 0
 let ignoring = true; // mirrors setIgnoreMouseEvents, so we only call it on a real change
 let revealed = false;
 let open = false; // the capsule is grown into the full panel
@@ -537,8 +543,11 @@ function pollCursor() {
 // Keep PC awake. Electron's powerSaveBlocker can't: its 'prevent-app-suspension' is Windows'
 // PowerRequestExecutionRequired, which means "system required" only on S3 PCs, so this Modern Standby laptop
 // slept on idle anyway; 'prevent-display-sleep' would keep the screen lit. A hidden PowerShell holds
-// ES_SYSTEM_REQUIRED instead until its stdin closes: we kill it, quit, or crash. Windows still sleeps when
-// the lid closes, and on battery it drops the request 5 min after the sleep timeout.
+// ES_SYSTEM_REQUIRED instead until its stdin closes: we kill it, quit, or crash. That kept every plugged-in
+// screen-off spell of 2026-11-15 running (Kernel-Power 507: SleepEntered false), yet on 2026-11-16 the PC
+// slept 38 min on mains with the switch on. So while it is on, every power plan's plugged-in sleep timer is
+// Never too (holdSleep). Windows still sleeps when the lid closes, and on battery, where the timers stay,
+// it drops the request 5 min after the sleep timeout.
 const AWAKE_PS = `Add-Type -Namespace W -Name P -MemberDefinition '[DllImport("kernel32.dll")] public static extern int SetThreadExecutionState(int f);'; [void][W.P]::SetThreadExecutionState(0x80000001); [void][Console]::In.ReadToEnd()`;
 
 function holdAwake() {
@@ -549,6 +558,87 @@ function holdAwake() {
   return child;
 }
 
+// powercfg's labels are in the PC's language, so only GUIDs and hex numbers are read. /q of one setting has
+// five numbers, minimum, maximum, step, plugged-in and battery; anything else is refused, never guessed at.
+// No elevation needed, for any plan. The calls run on the main thread, so one hold or release gets 3 s in all
+// (a call takes ~16 ms here), not 5 s for each call a hung powercfg would time out.
+const PLAN = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/gi;
+let powercfgUntil = 0;
+function powercfg(...args) {
+  const left = powercfgUntil - Date.now();
+  if (left <= 0) throw new Error('powercfg out of time');
+  return execFileSync('powercfg', args, { windowsHide: true, encoding: 'utf8', timeout: left, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+function plans() {
+  const found = powercfg('/list').match(PLAN);
+  if (!found) throw new Error('no power plans in powercfg /list');
+  return found.map((p) => p.toLowerCase());
+}
+const setAcSleep = (plan, seconds) => powercfg('/setacvalueindex', plan, 'SUB_SLEEP', 'STANDBYIDLE', String(seconds));
+function acSleep(plan) {
+  const numbers = powercfg('/q', plan, 'SUB_SLEEP', 'STANDBYIDLE').match(/0x[0-9a-f]{1,8}\b/gi) || [];
+  if (numbers.length !== 5) throw new Error(`no sleep timer in powercfg /q ${plan}`);
+  return parseInt(numbers[3], 16);
+}
+const each = (list, fn) => list.forEach((x) => {
+  try {
+    fn(x);
+  } catch (e) {
+    console.error('keep awake:', e.message);
+  }
+});
+
+// Each plan's own timer goes to disk before any changes. A plan on record that reads 0 is ours from before a
+// crash, so its record stands; one that reads anything else has its own timer again (put back by a release
+// that couldn't finish, or changed in Settings since), and that is the one to keep. A plan at Never and not
+// on record has nothing to put back. Only a plan read just now goes to Never: one whose read failed may
+// hold a timer its record doesn't know, so it is left alone, record and all.
+// ponytail: plans are listed once per switch-on; one created while it is on keeps its own timer.
+function holdSleep() {
+  const read = [];
+  each(plans(), (plan) => {
+    const seconds = acSleep(plan);
+    if (seconds > 0) sleepAc[plan] = seconds;
+    read.push(plan);
+  });
+  saveState({ sleepAc: { ...sleepAc } });
+  flushState();
+  if (Object.keys(pending).length) throw new Error('state.json not written, sleep timers left alone');
+  each(read.filter((plan) => Object.hasOwn(sleepAc, plan)), (plan) => setAcSleep(plan, 0));
+  powercfg('/setactive', 'SCHEME_CURRENT'); // the active plan's timers apply only once it is set active again
+}
+
+// A timer that no longer reads 0 was changed by someone else meanwhile and keeps their value. A deleted
+// plan drops off. The rest stay on record until they are back and the active plan applied them, for the next
+// switch-off, quit or start to finish.
+function releaseSleep() {
+  const now = plans();
+  const back = [];
+  each(Object.entries(sleepAc), ([plan, seconds]) => {
+    if (now.includes(plan) && acSleep(plan) === 0) setAcSleep(plan, seconds);
+    back.push(plan);
+  });
+  try {
+    powercfg('/setactive', 'SCHEME_CURRENT');
+    for (const plan of back) delete sleepAc[plan];
+  } finally {
+    saveState({ sleepAc: { ...sleepAc } });
+  }
+}
+
+// powercfg missing, hung or answering oddly must not stop startup, a switch, or quit's flush. A --shot run
+// beside the installed copy leaves the power settings to that copy.
+function keepSleep(hold) {
+  if (SHOT) return;
+  powercfgUntil = Date.now() + 3000;
+  try {
+    if (hold) holdSleep();
+    else if (Object.keys(sleepAc).length) releaseSleep();
+  } catch (e) {
+    console.error('keep awake:', e.message);
+  }
+}
+
 function setKeepAwake(next) {
   if (typeof next !== 'boolean' || next === (awakeBlocker !== null)) return;
   if (next) awakeBlocker = holdAwake();
@@ -556,6 +646,7 @@ function setKeepAwake(next) {
     awakeBlocker.kill();
     awakeBlocker = null;
   }
+  keepSleep(next);
   saveState({ keepAwake: next });
   tray?.setContextMenu(menu());
   tellPhones();
@@ -746,6 +837,10 @@ function loadState() {
   if (THEMES.some(([id]) => id === st.theme)) theme = st.theme;
   if (SIZES.some(([, k]) => k === st.scale)) scale = st.scale;
   if (typeof st.autoHide === 'boolean') autoHide = st.autoHide;
+  // Timers a crashed run left at Never: put back unless the switch is still on.
+  const held = st.sleepAc && typeof st.sleepAc === 'object' ? st.sleepAc : {};
+  sleepAc = Object.fromEntries(Object.entries(held).filter(([plan, s]) => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(plan) && Number.isInteger(s) && s > 0));
+  if (st.keepAwake !== true) keepSleep(false);
   setKeepAwake(st.keepAwake === true);
   if (EDGES.includes(st.edge)) edge = st.edge;
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
@@ -779,6 +874,12 @@ function createWindow() {
     hasShadow: false,
     show: false,
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
+  });
+  // A Windows sign-out, restart or shutdown skips will-quit, so the sleep timers go back here, or they would
+  // stay at Never in a session with no overlay to put them back. The next start holds them again if it is on.
+  win.on('session-end', () => {
+    keepSleep(false);
+    flushState();
   });
   win.setAlwaysOnTop(true, 'screen-saver'); // above fullscreen apps, unlike the plain alwaysOnTop flag
   win.setVisibleOnAllWorkspaces(true);
@@ -821,13 +922,15 @@ function captureAndQuit() {
   }, 1200);
 }
 
+app.on('second-instance', () => alive() && !visible && toggle());
 app.whenReady().then(() => {
+  if (!firstCopy) return;
   createWindow();
   tray = new Tray(nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray.png'))); // tray@2x.png is picked up on HiDPI
   tray.setToolTip('AI Usage Overlay v3');
   tray.setContextMenu(menu());
   tray.on('click', () => tray.popUpContextMenu());
-  globalShortcut.register(HOTKEY, toggle); // false when another copy already holds it; the menu still works
+  globalShortcut.register(HOTKEY, toggle); // false when another app already holds it; the menu still works
   timer = setInterval(tick, TICK_MS);
   cursorTimer = setInterval(pollCursor, CURSOR_MS);
   watchDisplays();
@@ -884,6 +987,7 @@ app.on('will-quit', (e) => {
     awakeBlocker.kill();
     awakeBlocker = null;
   }
+  keepSleep(false); // the timers go back with the overlay; the next start holds them again if the switch is on
   clearInterval(timer);
   clearInterval(cursorTimer);
   clearInterval(snapTimer);
