@@ -1,6 +1,9 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<!-- The page asks the phone link on its own origin and nothing else, redirects included: the link's key rides in a
+     cookie that a browser sends to localhost on any port (Link.java, Bubble.java). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' http://localhost:7430; font-src 'self' http://localhost:7430; img-src data:; base-uri 'none'; form-action 'none'" />
 <title>AI usage bubble</title>
 <style>
   /* Loaded from the PC, which the page's base URL points at. Away from it, the phone's own font stands in. */
@@ -204,6 +207,7 @@
   #prefs .err { padding-top: 12px; color: var(--hot); font-size: 12.5px; }
   /* Each group folds to one line, with what it's set to now on the right. */
   #prefs .awake { margin-top: 6px; }
+  #prefs .awake small { display: block; padding: 2px 0 4px; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   #prefs details { border-top: 1px solid var(--line); }
   #prefs details[open] { padding-bottom: 12px; }
   #prefs summary { display: flex; align-items: center; gap: 10px; min-height: 48px; list-style: none; font-size: 14px; font-weight: 600; color: var(--soft); }
@@ -493,7 +497,8 @@
       // A group stays as it was left across redraws: a stream snapshot redraws the settings every few seconds.
       const fold = (id, title, value, inner) => '<details data-fold="' + id + '"' + (opened.has(id) ? ' open' : '') + '><summary>' + title + '<span class="val">' + esc(value) + '</span></summary>' + inner + '</details>';
       html = (prefsError ? '<p class="err">' + esc(prefsError) + '</p>' : '') +
-        '<label class="opt awake"><span>Keep PC awake</span><input type="checkbox" role="switch" id="keep-awake"' + (data?.keepAwake === true ? ' checked' : '') + (!reached || typeof data?.keepAwake !== 'boolean' ? ' disabled' : '') + '></label>' +
+        // Switched off while Windows still has the sleep timers at Never: the PC tries again by itself until they're back.
+        '<label class="opt awake"><span>Keep PC awake' + (data?.restoringSleep === true ? '<small>Sleep timers still at Never, retrying</small>' : '') + '</span><input type="checkbox" role="switch" id="keep-awake"' + (data?.keepAwake === true ? ' checked' : '') + (!reached || typeof data?.keepAwake !== 'boolean' ? ' disabled' : '') + '></label>' +
         fold('theme', 'Theme', theme, options.themes.map(([group, list]) => '<h4>' + esc(group) + '</h4><div class="swatches">' +
           list.map(([id, label, css]) => '<button class="sw" data-theme="' + esc(id) + '" aria-pressed="' + (data?.theme === id) + '"><i style="' + esc(css || NOIR) + '">Aa</i><span>' + esc(label) + '</span></button>').join('') +
         '</div>').join('')) +

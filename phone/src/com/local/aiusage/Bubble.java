@@ -34,10 +34,15 @@ import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
 import android.view.animation.DecelerateInterpolator;
+import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -67,6 +72,7 @@ public class Bubble extends Service {
   int restX, restY; // where the tab sits while the panel is open
   volatile String side = "right"; // the edge it docks on; the page asks as it loads
   volatile int roomDp = 600; // the screen's height less its bars, in dp: the page fits the tab in it
+  int starts; // every start and the end: a cookie set for an earlier one loads nothing
   final Runnable hide = this::peek;
 
   static String server(Context c) {
@@ -83,12 +89,12 @@ public class Bubble extends Service {
   static final int PORT = 7430;
 
   /** Starts the phone link (Link.java) for the PC the bubble reads; its secret is kept with the app's settings. */
-  static void link(Context c) {
+  static Link link(Context c) {
     SharedPreferences store = c.getSharedPreferences("link", MODE_PRIVATE);
     Uri server = Uri.parse(server(c));
     // The overlay, as the link carries it. `tailscale serve`'s port for it is the address's own, 443 if it has none.
     Link.App overlay = new Link.App("overlay", PORT, server.getPort() == -1 ? 443 : server.getPort());
-    Link.start(server.getHost() == null ? "" : server.getHost(), new Link.Store() {
+    return Link.start(server.getHost() == null ? "" : server.getHost(), new Link.Store() {
       @Override public String get(String key) { return store.getString(key, null); }
 
       @Override public void put(String key, String value) { store.edit().putString(key, value).apply(); }
@@ -120,12 +126,32 @@ public class Bubble extends Service {
     }
     // Again on every start, so a new address from the launcher screen takes effect. The page reads the PC
     // through the link on this phone: over Tailscale, or the hotspot while Tailscale can't reach the PC there.
-    link(this);
-    try (InputStream in = getAssets().open("bubble.html")) {
-      web.loadDataWithBaseURL("http://localhost:" + PORT + "/", new String(in.readAllBytes(), StandardCharsets.UTF_8), "text/html", "utf-8", null);
-    } catch (IOException e) {
-      throw new IllegalStateException("bubble.html missing from the APK", e);
+    // The link's key goes in a cookie of this app's own WebView, kept in the app's private storage, which every
+    // request the page makes to the link carries and the page's script can't read. Another app on the phone reaches
+    // the link's port, and is refused. But an app holding that port on either loopback address would be the page's
+    // origin, and read the key in its requests: then nothing is set or loaded, and the bubble goes. Otherwise the page
+    // loads, or reloads with the new link's key, once the cookie is set, so its first requests carry it.
+    int start = ++starts;
+    Link link = link(this);
+    if (!link.serving) {
+      Link.end();
+      Toast.makeText(this, "Another app on this phone holds port " + PORT + ", so the bubble can't show. Show it again once that app has let go.", Toast.LENGTH_LONG).show();
+      stopSelf();
+      return START_NOT_STICKY;
     }
+    CookieManager.getInstance().setCookie("http://localhost:" + PORT, Link.COOKIE + "=" + link.key + "; Path=/; HttpOnly", set -> {
+      if (start != starts) return; // a later start, or the bubble went, while it was set
+      if (!Boolean.TRUE.equals(set)) {
+        Toast.makeText(this, "The bubble couldn't keep its key to the link, so it can't show.", Toast.LENGTH_LONG).show();
+        stopSelf();
+        return;
+      }
+      try (InputStream in = getAssets().open("bubble.html")) {
+        web.loadDataWithBaseURL("http://localhost:" + PORT + "/", new String(in.readAllBytes(), StandardCharsets.UTF_8), "text/html", "utf-8", null);
+      } catch (IOException e) {
+        throw new IllegalStateException("bubble.html missing from the APK", e);
+      }
+    });
     return START_STICKY;
   }
 
@@ -161,6 +187,20 @@ public class Bubble extends Service {
     web.getSettings().setJavaScriptEnabled(true);
     web.getSettings().setDomStorageEnabled(true); // the page keeps the last numbers for when the PC is away
     web.getSettings().setTextZoom(100); // the tab is a fixed size, and a large system font would spill it
+    // The page from the APK is all this WebView shows, and the link all it asks. A cookie goes to localhost on any
+    // port, and the bridge below to any page shown here, so an answer that sends the WebView anywhere else (a
+    // redirect, a link, a form) must not take the link's key or the bridge with it. bubble.html's own policy holds
+    // its requests to its origin as well, redirects included; this stops navigation, which that policy can't.
+    web.setWebViewClient(new WebViewClient() {
+      @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { return true; } // usage pages leave through open()
+
+      @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+        Uri u = r.getUrl();
+        boolean link = "http".equals(u.getScheme()) && "localhost".equals(u.getHost()) && u.getPort() == PORT;
+        if (link || "data".equals(u.getScheme()) || "blob".equals(u.getScheme())) return null;
+        return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", null, new ByteArrayInputStream(new byte[0]));
+      }
+    });
     web.addJavascriptInterface(this, "Android");
     root = new FrameLayout(this) {
       float sx, sy;
@@ -467,6 +507,7 @@ public class Bubble extends Service {
   }
 
   @Override public void onDestroy() {
+    starts++;
     Link.end();
     if (gliding != null) gliding.cancel();
     if (root != null) {

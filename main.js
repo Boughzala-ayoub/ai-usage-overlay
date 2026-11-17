@@ -46,6 +46,15 @@ const SIZES = [
   ['Extra large', 1.25],
 ];
 const SHOT = (process.argv.find((a) => a.startsWith('--shot=')) || '').slice(7);
+// A --shot run beside the installed copy only reads that copy's profile: its state.json, for the settings and the last
+// numbers. It saves nothing there, and Chromium keeps its own files (caches, storage, network state) in a folder of
+// its own, set before ready as Electron requires.
+const LIVE_DATA = app.getPath('userData');
+if (SHOT) {
+  const own = path.join(require('os').tmpdir(), 'ai-usage-overlay-shot');
+  fs.mkdirSync(own, { recursive: true });
+  for (const name of ['userData', 'sessionData']) app.setPath(name, own);
+}
 // Something outside the app can knock the capsule out of the topmost band; Chromium then sees it covered
 // and stops painting, so even back on top it shows a stale frame. An overlay is never meant to be
 // hidden by another window, so skip the occlusion tracking outright.
@@ -90,12 +99,13 @@ const last = new Map(); // id -> last good { plan, rows, updatedAt }
 const fetched = new Map(); // id -> ms of the last read attempt
 const gate = new Map(); // id -> ms before which we must not ask again (a 429's Retry-After)
 const inflight = new Map(); // id -> the read in progress; a second refresh joins it rather than racing it
+const signedIn = new Map(); // id -> last confirmed account (renewsFor), saved separately from unverified readings
 let cache = {}; // id -> last good reading, as saved. Kept here: building it from disk loses readings that land within one save debounce.
 
 // ---- state
 // v3 keeps its own state beside v2's. Its first save copies v2's settings and last readings, which are
 // only ever read, so installing v3 starts where v2 was without touching v2.
-const statePath = () => path.join(app.getPath('userData'), 'state.json');
+const statePath = () => path.join(LIVE_DATA, 'state.json');
 const legacyPath = () => path.join(app.getPath('appData'), 'ai-usage-overlay', 'state.json');
 function readState() {
   for (const file of [statePath(), legacyPath()]) {
@@ -111,6 +121,9 @@ function readState() {
 let saveTimer = null;
 let pending = {};
 function saveState(patch) {
+  // A --shot run started from the same state.json as the installed copy, which may have saved since: anything it wrote
+  // back would be older, as a Keep PC awake it read on and the installed copy has since switched off.
+  if (SHOT) return;
   Object.assign(pending, patch);
   clearTimeout(saveTimer);
   saveTimer = setTimeout(flushState, 400);
@@ -162,6 +175,7 @@ function snapshot() {
       // or from before a restart) says nothing about the next one, so it goes.
       ...(d.renewsAt > now ? { renewsIn: fmtReset(d.renewsAt, now) } : { renewsAt: undefined, renewsGuess: undefined }),
       renewsFor: undefined, // the account a date belongs to: main's to check, not the screens'
+      accountUnknown: undefined,
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
       rows: (d.rows || []).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
@@ -196,6 +210,9 @@ function readOne(p, force) {
 }
 
 async function readFresh(p, force) {
+  // A --shot run paints the numbers the installed copy saved, and asks no provider: a read can renew a token on disk or
+  // draw a 429 that every client of the account then waits out. CPU and RAM are this PC's, read as always.
+  if (SHOT && !p.local) return;
   const now = Date.now();
   // The gate is the whole rate-limit answer: a 429's Retry-After stops every later request,
   // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint. Meanwhile, and between
@@ -204,19 +221,12 @@ async function readFresh(p, force) {
   if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
   fetched.set(p.id, now);
   const res = await p.read();
-  let prev = last.get(p.id);
-  // Signed in to another account since: the next bill on hand was the last one's, whatever else this read brings or
-  // keeps (a failure or an older fallback keeps the reading on screen). A reading that can't tell whose it is (no
-  // sign-in to read) says nothing either way.
-  const otherAccount = (r) => r?.renewsFor && res.renewsFor && r.renewsFor !== res.renewsFor;
-  if (otherAccount(prev)) {
-    const forget = ({ renewsAt, renewsGuess, ...rest }) => ({ ...rest, renewsFor: res.renewsFor });
-    last.set(p.id, (prev = forget(prev)));
-    if (otherAccount(cache[p.id])) {
-      cache[p.id] = forget(cache[p.id]);
-      saveState({ cache });
-    }
-  }
+  if (res.renewsFor && !res.accountUnknown) signedIn.set(p.id, res.renewsFor);
+  // One that knows no account leaves the last one known, which after a restart is the reading on hand's, before it goes.
+  else if (res.accountUnknown && !signedIn.has(p.id) && !last.get(p.id)?.accountUnknown && last.get(p.id)?.renewsFor) signedIn.set(p.id, last.get(p.id).renewsFor);
+  if (res.renewsFor) saveState({ signedIn: Object.fromEntries(signedIn) });
+  forgetAccount(p, res.renewsFor);
+  const prev = last.get(p.id);
   // A 429's Retry-After, whether or not a reading came with it: nothing is asked before it, and the read is due
   // again the moment it lifts rather than a whole cadence later, so the numbers fall behind as little as they can.
   if (res.retryAfter) {
@@ -243,10 +253,36 @@ async function readFresh(p, force) {
     Object.assign(res, { renewsAt: prev.renewsAt, renewsGuess: prev.renewsGuess, renewsFor: prev.renewsFor });
   }
   last.set(p.id, res);
-  // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use.
+  // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use. Nor is one
+  // Claude account's usage falling below another's.
+  // ponytail: Codex keeps its old behaviour, so a Codex account switch can still beep; drop the id check to cover it.
   if (!res.error && !p.local) {
-    showResetNotice(p, resetRows(prev?.rows, res.rows));
+    if (!(p.id === 'claude' && otherAccount(p, prev, res.renewsFor))) showResetNotice(p, resetRows(prev?.rows, res.rows));
     cache[p.id] = res;
+    saveState({ cache });
+  }
+}
+
+// Whether a reading on hand is another account's than the one a read or local copy names. A reading that can't tell
+// whose it is (no sign-in to read) says nothing either way, but Claude's saved before readings named theirs can't be
+// shown to be this account's, so they count as another's.
+const otherAccount = (p, r, account) => !!(r && account && (r.renewsFor ? r.renewsFor !== account : p.id === 'claude'));
+
+// Drop metadata that belongs to a different account. The reading keeps its account so a reset or local copy
+// never compares usage from different accounts.
+function forgetAccount(p, account) {
+  const fields = ['renewsAt', 'renewsGuess'];
+  if (p.id === 'claude') fields.push('plan', 'bankedResets', 'bankedResetExpiries');
+  const forget = (r) => {
+    if (!otherAccount(p, r, account) || !fields.some((field) => Object.hasOwn(r, field))) return r;
+    const rest = { ...r };
+    for (const field of fields) delete rest[field];
+    return rest;
+  };
+  if (last.has(p.id)) last.set(p.id, forget(last.get(p.id)));
+  const kept = forget(cache[p.id]);
+  if (kept !== cache[p.id]) {
+    cache[p.id] = kept;
     saveState({ cache });
   }
 }
@@ -274,10 +310,20 @@ function laterLine(mine, theirs, now = Date.now()) {
 // stale, so then the lines that moved land, and the reading keeps its age and note. Only the usage moves: the plan,
 // the API credit and the banked resets stay as last read. A drop can only be a new period, so it is announced as a
 // reset, as from the endpoint.
+// A copy counts only for the account signed in: the one the last read that knew it named, or before any the reading's own. Any
+// other (Claude Code's record of who signed in can lag its token) is left alone, and never takes the plan away. A copy
+// for that account, with a reading still on hand from another (the read that named it failed), replaces that reading
+// but for its API credit: its lines are never weighed against another account's, nor its drop announced as a reset.
 function takeLocal(p) {
   const local = p.readLocal?.();
-  const prev = last.get(p.id);
-  if (!local || (prev?.rows?.length && !(local.updatedAt > (prev.updatedAt ?? -Infinity)))) return;
+  if (!local) return;
+  let prev = last.get(p.id);
+  const account = signedIn.get(p.id) ?? prev?.renewsFor;
+  if (account !== undefined && local.renewsFor !== account) return;
+  // A live reading no account vouches for yet may well be this one's, so only a newer copy displaces it.
+  if (prev?.accountUnknown && !(local.updatedAt > (prev.updatedAt ?? -Infinity))) return;
+  if (otherAccount(p, prev, local.renewsFor)) prev = prev.apiCredit ? { apiCredit: prev.apiCredit } : undefined; // the Console key's, not the account's
+  if (prev?.rows?.length && !(local.updatedAt > (prev.updatedAt ?? -Infinity))) return;
   const now = Date.now();
   const current = (r) => Date.parse(r.resetsAt) > now || (!r.resetsAt && r.percent === 0);
   const theirs = new Map(local.rows.map((r) => [r.label, r]));
@@ -296,7 +342,7 @@ function takeLocal(p) {
   if (added.length) changed = true;
   if (!rows.length || (!changed && unverified)) return; // nothing it says is newer than ours
   const { note, error, ...rest } = prev || {};
-  const next = unverified ? { ...prev, rows } : { ...rest, rows, updatedAt: local.updatedAt };
+  const next = unverified ? { ...prev, rows } : { ...rest, rows, updatedAt: local.updatedAt, ...(local.renewsFor ? { renewsFor: local.renewsFor } : {}) };
   last.set(p.id, next);
   showResetNotice(p, resetRows(prev?.rows, next.rows));
   cache[p.id] = next;
@@ -323,7 +369,8 @@ const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 let snapshots = 0;
 function phoneState() {
   const t = THEMES.find(([id]) => id === theme);
-  return { css: t ? t[2] : '', theme, enabled, choices, keepAwake: awakeBlocker !== null, providers: snapshot() };
+  // restoringSleep: switched off, and Windows still has some plugged-in sleep timers at Never (restoreLater).
+  return { css: t ? t[2] : '', theme, enabled, choices, keepAwake: awakeBlocker !== null, restoringSleep: restoring(), providers: snapshot() };
 }
 const numbered = (state) => JSON.stringify({ ...state, run, rev: ++snapshots });
 function phonePayload() {
@@ -639,14 +686,40 @@ function keepSleep(hold) {
   }
 }
 
+// Switched off with timers still on record, because powercfg refused or ran out of time: Windows keeps them at Never
+// until a release goes through, though the switch says off. So the release is tried again by itself, a minute on,
+// then 2, 4 and so on up to every 30 (a hung powercfg costs the main thread its 3 s each time), until Windows has them
+// all; the menu and the phone say so meanwhile. A try is the same release as a switch-off's, so a timer changed in
+// Settings since keeps the new value. Switching on or quitting cancels the next try, which also checks it is still off.
+let restoreTimer = null;
+let restoreDelay = 0;
+const restoring = () => !SHOT && awakeBlocker === null && Object.keys(sleepAc).length > 0;
+function restoreLater(first) {
+  clearTimeout(restoreTimer);
+  restoreTimer = null;
+  if (!restoring()) return;
+  restoreDelay = first ? 60_000 : Math.min(2 * restoreDelay, 30 * 60_000);
+  restoreTimer = setTimeout(() => {
+    restoreTimer = null;
+    if (awakeBlocker !== null) return;
+    keepSleep(false);
+    restoreLater(false);
+    tray?.setContextMenu(menu());
+    tellPhones();
+  }, restoreDelay);
+  restoreTimer.unref?.();
+}
+
 function setKeepAwake(next) {
-  if (typeof next !== 'boolean' || next === (awakeBlocker !== null)) return;
+  // A --shot run leaves keeping the PC awake to the installed copy: no helper, no timers, nothing saved.
+  if (SHOT || typeof next !== 'boolean' || next === (awakeBlocker !== null)) return;
   if (next) awakeBlocker = holdAwake();
   else {
     awakeBlocker.kill();
     awakeBlocker = null;
   }
   keepSleep(next);
+  restoreLater(true);
   saveState({ keepAwake: next });
   tray?.setContextMenu(menu());
   tellPhones();
@@ -776,6 +849,7 @@ function menu() {
       },
     },
     { label: 'Keep PC awake', type: 'checkbox', checked: awakeBlocker !== null, click: (item) => setKeepAwake(item.checked) },
+    ...(restoring() ? [{ label: 'Sleep timers still at Never, retrying', enabled: false }] : []),
     { type: 'separator' },
     { label: 'Drag the pill to any screen edge', enabled: false },
     {
@@ -842,12 +916,14 @@ function loadState() {
   sleepAc = Object.fromEntries(Object.entries(held).filter(([plan, s]) => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(plan) && Number.isInteger(s) && s > 0));
   if (st.keepAwake !== true) keepSleep(false);
   setKeepAwake(st.keepAwake === true);
+  restoreLater(true); // off already, so the switch above changed nothing: a release that failed just now tries again
   if (EDGES.includes(st.edge)) edge = st.edge;
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
   displayId = screen.getAllDisplays().some((d) => d.id === st.displayId) ? st.displayId : screen.getPrimaryDisplay().id;
   // Last good numbers, so a restart paints real levels before the first request comes back.
   if (st.cache && typeof st.cache === 'object') cache = Object.fromEntries(Object.entries(st.cache).map(([id, v]) => [id, savedReading(v)]));
   for (const [id, v] of Object.entries(cache)) last.set(id, v);
+  for (const [id, account] of Object.entries(st.signedIn || {})) if (typeof account === 'string') signedIn.set(id, account);
   for (const [id, v] of Object.entries(st.gate || {})) if (v > Date.now()) gate.set(id, v);
   try {
     if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')), cache.claude?.apiCredit);
@@ -988,6 +1064,7 @@ app.on('will-quit', (e) => {
     awakeBlocker = null;
   }
   keepSleep(false); // the timers go back with the overlay; the next start holds them again if the switch is on
+  clearTimeout(restoreTimer); // what's left on record is the next start's to put back
   clearInterval(timer);
   clearInterval(cursorTimer);
   clearInterval(snapTimer);

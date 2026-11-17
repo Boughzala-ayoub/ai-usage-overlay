@@ -89,8 +89,10 @@ one fetches, the others reuse it for a minute and, when the endpoint says no, fa
 to an hour. Between its own reads, and whenever the endpoint is throttling, the overlay reads that
 copy too, at no request, and shows it when it is newer than its own reading.
 
-The copy counts only for the account signed in now, by account id. One over an hour old, written
-halfway, or changed in shape counts as no copy.
+The copy counts only for the account the overlay's last read named, by account and organization.
+Claude Code can update its record of who signed in later than its token, so a copy for any other
+account is left alone. Until the first read, the account of the reading on screen counts. One over
+an hour old, written halfway, or changed in shape counts as no copy.
 
 A copy's date need not hold for every line in it, so each line is judged on its own. A line from
 the copy counts only when its reset time is still ahead. One from a period that has ended, or with
@@ -164,7 +166,11 @@ puts the capsule back on the right of the primary display.
   change moved the billing day. The overlay reads no date for OpenCode Go, so it gets no line, and none for xAI either
   when it is read from xAI's own endpoints. A date that has gone by drops out until a read brings
   the next one. A lookup that fails keeps the date already on screen, and signing in to another
-  Codex account drops it until that account's own date comes in. The phone shows the date
+  Codex account drops it until that account's own date comes in. Claude's plan and date belong to the
+  account and organization that Claude's `/profile` names for the token signed in now. Claude Code
+  writes its token and its record of who signed in separately, so neither file alone says whose a
+  token is. Each new token, the same account's every few hours included, costs one more `/profile`
+  request, and until it answers no plan or date shows. The phone shows the date
   without its countdown while the PC is out of reach, since only the PC moves the countdown.
 - A provider says so in its own section when it is erroring (in red, with any command set as
   code), showing a fallback, or more than ten minutes stale. A rate limit isn't shown (see Rate limits). The two icons in the
@@ -175,7 +181,11 @@ puts the capsule back on the right of the primary display.
   2026-11-16 it slept for 38 minutes, hence the timers. Each plan's own timer goes into `state.json`
   before anything changes, and comes back when the switch goes off, when the overlay quits, when
   Windows signs out, restarts or shuts down, or at the next start after a crash. A timer changed in
-  Settings meanwhile keeps the new value. Closing the lid
+  Settings meanwhile keeps the new value. If powercfg refuses or hangs while the switch goes off, the
+  timers stay at Never, so the overlay tries again a minute later, then after 2, 4 and so on up to
+  every 30 minutes, until Windows has them all back. Until then the tray menu says `Sleep timers still
+  at Never, retrying` under the switch, and so do the phone's settings. Switching it back on or
+  quitting cancels the next try. Closing the lid
   still sleeps the PC, and the battery timers stay as they are. Uninstalling with the switch on
   leaves the timers at Never, so turn it off first.
 - When a limit resets, the capsule beeps and opens for six seconds to say which one. Hovering it
@@ -242,6 +252,22 @@ answers. There is no pairing token, unlike Loom's phone remote: anyone on your t
 percentages and the PC's CPU and RAM, change the shared settings, and turn Keep PC awake on or off,
 which keeps the PC from sleeping, and its plugged-in sleep timers at Never, until it is turned off
 again. Nothing more.
+
+On the phone, the bubble's page talks to `localhost:7430`, the phone link in `Link.java`, which any
+other app on the phone can reach too. The link carries those requests to the PC over Tailscale or the
+hotspot, and the hotspot way needs no Tailscale on the asking app. So the link passes on a request only
+when it carries the link's key in a cookie, and checks every request on a reused connection. The link
+makes a new key each time it starts, and only the bubble's own WebView holds that cookie, in the app's
+private storage, where the page's script can't read it. The link takes the key out before the request
+goes on, so the PC never sees it. Anything else gets a 403 and never reaches the PC. A cookie goes to
+localhost on any port, so the WebView loads nothing but the bubble's page, and the page's
+Content-Security-Policy lets it ask only its own origin, redirects included.
+
+The bubble sets that cookie and loads its page only once the link holds port 7430 on both loopback
+addresses. An app holding one of them would be the page's origin and could read the key, so then
+the bubble says so and closes. The page loads after the cookie is set, so its first requests carry
+it. A connection has 5 s to send its first request, and at most 32 can wait at once. The link closes
+the rest without an answer.
 
 After the PC has been on the phone's hotspot, the overlay watches Tailscale's tunnel to the phone
 (`heal` in `link.js`). Tailscale on the PC can come back from the hotspot with a frozen session: the
@@ -310,7 +336,11 @@ came almost for free.
 `--shot=<file>` launches the app, waits for the first data, writes a PNG of the window and quits.
 Put `hover` in the filename and it opens the panel before the capture. Only one copy of the overlay
 runs at a time, and launching it again brings back a hidden one. `--shot` is exempt, so it can run
-beside the installed copy, and it leaves Keep PC awake's sleep timers to that copy.
+beside the installed copy. It only reads that copy's profile: the settings and last numbers in its
+`state.json`, which it never writes. It asks no provider, so the capture shows those saved numbers with
+live CPU and RAM. It leaves Keep PC awake and the sleep timers to the installed copy, and Chromium
+keeps its caches in `%TEMP%\ai-usage-overlay-shot` instead of the profile. Add
+`--user-data-dir=<folder>` to read a profile of your own instead.
 
 `npm run test:ui` loads `index.html` in headless Chrome with a fake `window.api` and runs every state
 (loading, error, rate limited, banked resets, a reset notice, a long panel) on all four edges. It

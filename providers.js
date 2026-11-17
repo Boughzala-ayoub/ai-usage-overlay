@@ -156,7 +156,21 @@ function shapeClaude(usage, profile) {
   };
 }
 
-let claudeProfile = null; // plan tier can't change mid-process; fetched once, halves every later refresh
+// An account as a reading names it (renewsFor): hashed, so main can keep a date on hand only for the account it belongs to.
+const accountKey = (id) => crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 12);
+
+// A Claude account as ~/.claude.json names it (oauthAccount) and as /profile does: the account, and the organization
+// whose plan it uses, since one login can belong to several. null when it names none.
+const claudeKey = (oauth) => (oauth?.accountUuid ? accountKey(oauth.accountUuid + '/' + (oauth.organizationUuid || '')) : null);
+
+// The plan tier, the day the subscription started and whose they are, as /profile answered for the token signed in now.
+// Claude Code replaces its token (.credentials.json) and its record of who signed in (~/.claude.json) separately, so
+// neither file says whose a token is; /profile, asked with it, does. So every new token is asked once, a sign-in or the
+// same account's rotated in place every few hours: one request more each time. The token is kept only as a hash, here.
+// Until /profile answers, a read names a marker of its own, which no plan or date on hand shares, so main shows neither.
+// A profile that names no account keeps its marker too: its plan shows, and no other reading is taken for the same account.
+const claudeSlot = (token) => ({ token, marker: crypto.randomBytes(6).toString('hex'), profile: null, account: null });
+let claudeProfile = claudeSlot(null);
 
 // ---- Claude's numbers as Claude Code last saw them, read from its file for nothing. Every Claude Code session asks the
 // same /usage endpoint with the same account, which throttles hard (Max accounts see a 429 after a single request), so
@@ -172,7 +186,7 @@ function readClaudeLocal(now = Date.now()) {
     const age = now - copy?.fetchedAtMs;
     if (!copy?.accountUuid || copy.accountUuid !== config.oauthAccount?.accountUuid || !Array.isArray(copy.utilization?.limits) || !(age >= 0 && age < HOUR)) return null;
     const { rows } = shapeClaude(copy.utilization);
-    return rows.length ? { rows, updatedAt: copy.fetchedAtMs } : null;
+    return rows.length ? { rows, updatedAt: copy.fetchedAtMs, renewsFor: claudeKey(config.oauthAccount) } : null; // as readClaude names it
   } catch {
     return null; // missing, or caught halfway through a write
   }
@@ -255,20 +269,33 @@ async function readClaude() {
   };
   const get = (p) => fetchJson(CLAUDE_API + p, headers);
   const session = consoleSession;
+  const token = accountKey(creds.accessToken);
+  if (claudeProfile.token !== token) claudeProfile = claudeSlot(token);
+  const known = claudeProfile; // a profile answering after the token changed again fills only its own token's slot
+  const profiled = known.profile
+    ? null
+    : get('/profile').then((p) => {
+      known.profile = p;
+      known.account = claudeKey({ accountUuid: p?.account?.uuid, organizationUuid: p?.organization?.uuid });
+    }).catch(() => {});
+  // For main, on a failure too, as Codex's.
+  const whose = () => ({ renewsFor: known.account || known.marker });
   try {
-    const [usage, apiCredit] = await Promise.all([
-      get('/usage?cedar_ember=1'),
-      readApiCredit(),
-      claudeProfile ? null : get('/profile').then((p) => (claudeProfile = p)).catch(() => {}),
-    ]);
+    const [usage, apiCredit] = await Promise.all([get('/usage?cedar_ember=1'), readApiCredit(), profiled]);
     // Usage can answer after the key changed under a credit that was already in.
     const credit = session === consoleSession && apiCredit;
-    return { ...shapeClaude(usage, claudeProfile), ...(credit ? { apiCredit: credit } : {}), updatedAt: Date.now() };
+    // With no profile, only the marker: main goes on taking copies for the account it last knew. A profile that names
+    // no account is one of its own (claudeSlot).
+    const unknown = known.profile ? {} : { accountUnknown: true };
+    return { ...shapeClaude(usage, known.profile), ...whose(), ...unknown, ...(credit ? { apiCredit: credit } : {}), updatedAt: Date.now() };
   } catch (e) {
+    await profiled; // a profile that answers names the account even when the usage doesn't; it never throws
     // Main keeps the last numbers on screen through a 429, waits out its Retry-After, and meanwhile takes the
-    // newest numbers other clients have (readClaudeLocal).
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
-    return { error: e.message || 'Request failed', soft: !!e.soft };
+    // newest numbers other clients have (readClaudeLocal). With only the marker to go on (accountUnknown), it still
+    // drops the plan and date on hand, but goes on taking copies for the account it last knew.
+    const failed = { ...whose(), ...(known.account ? {} : { accountUnknown: true }) };
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60, ...failed };
+    return { error: e.message || 'Request failed', soft: !!e.soft, ...failed };
   }
 }
 
@@ -434,7 +461,7 @@ async function readCodex() {
   if (tokens.account_id) headers['ChatGPT-Account-Id'] = tokens.account_id;
   // Another sign-in has its own next bill, asked for at once. The account goes out hashed, so main keeps a date on hand
   // only for the account it belongs to.
-  const account = crypto.createHash('sha256').update(String(tokens.account_id || tokens.access_token)).digest('hex').slice(0, 12);
+  const account = accountKey(tokens.account_id || tokens.access_token);
   if (codexRenewal.account !== account) codexRenewal = { account, at: undefined, due: 0 };
   // What this run knows: a date, null for none ahead, or nothing yet (its lookup failed), when main keeps the one on hand.
   const renewal = () => ({ renewsFor: account, ...(codexRenewal.at !== undefined ? { renewsAt: codexRenewal.at > Date.now() ? codexRenewal.at : null } : {}) });

@@ -648,6 +648,126 @@ configuredProvider.read()
       global.fetch = originalFetch;
     }
   })
+  .then(async () => {
+    // Whose a Claude reading is, and so its plan and next bill, is what /profile says, asked with the token signed in
+    // now. Claude Code replaces its token and ~/.claude.json, its record of who signed in, separately, so a new token
+    // under a record that still names the last account, or none, is that new token's alone: no plan or bill until its
+    // own profile comes. Each new token, rotated in place or not, asks once. Synthetic sign-ins only.
+    loadCodex(codexHome, codexHome);
+    const claude = require('./providers').PROVIDERS.find((p) => p.id === 'claude');
+    const config = path.join(codexHome, '.claude.json');
+    const creds = path.join(codexHome, '.claude', '.credentials.json');
+    const credsWas = fs.readFileSync(creds);
+    const useToken = (token) => fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: token } }));
+    const signIn = (account, token, organization) => {
+      fs.writeFileSync(config, JSON.stringify({ oauthAccount: { accountUuid: account, ...(organization ? { organizationUuid: organization } : {}) } }));
+      useToken(token);
+    };
+    // token -> [account, organization, tier, subscription start], as /profile answers for it
+    const who = { a: ['acct-a', undefined, 'default_claude_max_5x', '2026-01-05T10:00:00Z'], b: ['acct-b', undefined, 'default_claude_pro', '2026-03-20T08:00:00Z'], bt: ['acct-b', 'org-team', 'default_claude_max_20x', '2026-02-01T09:00:00Z'] };
+    who.a2 = who.a; // A's token, rotated
+    const asked = [];
+    let fails = false;
+    let usageFails = false;
+    let hold = null; // a profile request held until let go
+    const originalFetch = global.fetch;
+    global.fetch = async (url, options) => {
+      const token = options.headers.Authorization.slice('Bearer token-'.length);
+      if (!url.endsWith('/profile')) return usageFails ? { ok: false, status: 503, headers: new Headers() } : { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: token[0] === 'b' ? 70 : 10 }] }) };
+      asked.push(token);
+      if (hold) await new Promise((r) => (hold = r));
+      if (fails) return { ok: false, status: 503, headers: new Headers() };
+      const [account, organization, tier, since] = who[token];
+      return { ok: true, json: async () => ({ account: { uuid: account }, organization: { ...(organization ? { uuid: organization } : {}), rate_limit_tier: tier, billing_type: 'stripe_subscription', subscription_status: 'active', subscription_created_at: since } }) };
+    };
+    const plan = (r) => [r.plan, r.renewsAt, r.rows[0].percent];
+    const hashed = (r) => /^[0-9a-f]{12}$/.test(r.renewsFor);
+    try {
+      signIn('acct-a', 'token-a');
+      const a = await claude.read();
+      assert.deepStrictEqual(plan(a), ['Max', nextMonthly(who.a[3]), 10], "account A's plan and next bill");
+      useToken('token-a2');
+      const rotated = await claude.read();
+      assert.deepStrictEqual([plan(rotated), rotated.renewsFor, asked], [plan(a), a.renewsFor, ['a', 'a2']], 'a token rotated in place asks for its profile once, which names the same account');
+      await claude.read();
+      assert.deepStrictEqual(asked, ['a', 'a2'], 'and only once');
+
+      // B's token while ~/.claude.json still names A, then while it names nobody, with B's profile failing: B's usage,
+      // and neither A's plan nor a next bill, named so that main drops the ones on hand. A failed read too.
+      fails = true;
+      useToken('token-b');
+      const stale = await claude.read();
+      assert.deepStrictEqual([stale.plan, 'renewsAt' in stale, stale.rows[0].percent, stale.accountUnknown], ['', false, 70, true], "B's usage, with no plan or next bill while ~/.claude.json still names A and B's profile fails, and no account known");
+      assert.ok(hashed(stale) && stale.renewsFor !== a.renewsFor, 'named as no account on hand');
+      fs.rmSync(config);
+      const missing = await claude.read();
+      assert.deepStrictEqual([missing.plan, 'renewsAt' in missing, missing.renewsFor], ['', false, stale.renewsFor], 'the same with no ~/.claude.json');
+      usageFails = true;
+      const failed = await claude.read();
+      assert.deepStrictEqual([failed.soft, failed.renewsFor, failed.accountUnknown], [true, stale.renewsFor, true], 'and a failed read says so too, and that it knows no account');
+      usageFails = false;
+      assert.deepStrictEqual(asked.filter((t) => t === 'b').length, 3, 'its profile asked at every read until it answers');
+      fails = false;
+      const b = await claude.read();
+      assert.deepStrictEqual(plan(b), ['Pro', nextMonthly(who.b[3]), 70], "then B's own, though ~/.claude.json still names nobody");
+      assert.ok(hashed(b) && b.renewsFor !== a.renewsFor && b.renewsFor !== stale.renewsFor, "named as B's, hashed");
+      // B's own copy in ~/.claude.json names B as its live read does, or main would leave it alone.
+      const now = Date.now();
+      fs.writeFileSync(config, JSON.stringify({ oauthAccount: { accountUuid: 'acct-b' }, cachedUsageUtilization: { fetchedAtMs: now, accountUuid: 'acct-b', utilization: { limits: [{ kind: 'session', percent: 70 }] } } }));
+      assert.strictEqual(require('./providers').readClaudeLocal(now).renewsFor, b.renewsFor, 'the local copy names the same account');
+      // ~/.claude.json still naming A after B's profile came changes nothing either.
+      const sofar = asked.length;
+      signIn('acct-a', 'token-b');
+      assert.deepStrictEqual([plan(await claude.read()), asked.length], [plan(b), sofar], "~/.claude.json naming A leaves B's plan, and asks nothing more");
+
+      // A's profile answering late, after a switch back to B, fills only the read that asked for it.
+      signIn('acct-a', 'token-a');
+      hold = true;
+      const late = claude.read();
+      for (let i = 0; i < 100 && hold === true; i++) await new Promise((r) => setTimeout(r, 5));
+      const release = hold;
+      hold = null;
+      signIn('acct-b', 'token-b');
+      assert.deepStrictEqual(plan(await claude.read()), ['Pro', nextMonthly(who.b[3]), 70], 'B signed in again, while A\'s profile is still out');
+      release();
+      const lateRead = await late;
+      assert.deepStrictEqual([lateRead.plan, lateRead.renewsFor], ['Max', a.renewsFor], "A's late profile is A's read's");
+      assert.deepStrictEqual(plan(await claude.read()), ['Pro', nextMonthly(who.b[3]), 70], 'and never lands on B');
+      // One login in another organization has that organization's plan, and its copy names it as the live read does.
+      const before = asked.length;
+      signIn('acct-b', 'token-bt', 'org-team');
+      const team = await claude.read();
+      assert.ok(asked.length === before + 1 && team.plan === 'Ultra' && team.renewsFor !== b.renewsFor, "the same login in another organization has that one's profile");
+      fs.writeFileSync(config, JSON.stringify({ oauthAccount: { accountUuid: 'acct-b', organizationUuid: 'org-team' }, cachedUsageUtilization: { fetchedAtMs: now, accountUuid: 'acct-b', utilization: { limits: [{ kind: 'session', percent: 70 }] } } }));
+      assert.strictEqual(require('./providers').readClaudeLocal(now).renewsFor, team.renewsFor, 'and its copy names it the same');
+      fs.writeFileSync(config, '{"oauthAccount": {"accou');
+      const unknown = await claude.read();
+      assert.deepStrictEqual([unknown.plan, unknown.renewsFor], ['Ultra', team.renewsFor], '~/.claude.json caught mid-write changes nothing');
+
+      // A 429: a profile that answers says whose, one that doesn't says it's no account on hand.
+      signIn('acct-b', 'token-b');
+      let profile = () => new Promise((r) => setTimeout(r, 20, { ok: true, json: async () => ({ account: { uuid: 'acct-b' } }) })); // after the 429
+      global.fetch = async (url) => (url.endsWith('/profile') ? profile() : { ok: false, status: 429, headers: new Headers({ 'retry-after': '30' }) });
+      const known = await claude.read();
+      assert.deepStrictEqual([known.renewsFor, 'accountUnknown' in known], [b.renewsFor, false], 'a 429 says whose too, for main');
+      useToken('token-a3');
+      profile = () => ({ ok: false, status: 429, headers: new Headers() });
+      const gated = await claude.read();
+      assert.ok(gated.retryAfter && gated.accountUnknown && hashed(gated) && gated.renewsFor !== a.renewsFor && gated.renewsFor !== b.renewsFor, "and a new token's with no profile, none on hand");
+      // A profile that names no account: its plan, under a name no other token's reading shares.
+      profile = () => ({ ok: true, json: async () => ({ organization: { rate_limit_tier: 'default_claude_pro' } }) });
+      global.fetch = async (url) => (url.endsWith('/profile') ? profile() : { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: 5 }] }) });
+      useToken('token-n1');
+      const nameless = await claude.read();
+      useToken('token-n2');
+      const next = await claude.read();
+      assert.deepStrictEqual([nameless.plan, next.plan, hashed(nameless), nameless.renewsFor === next.renewsFor, 'accountUnknown' in nameless], ['Pro', 'Pro', true, false, false], 'a profile that names no account names each token apart, as an account of its own');
+    } finally {
+      global.fetch = originalFetch;
+      fs.writeFileSync(creds, credsWas);
+      fs.rmSync(config, { force: true });
+    }
+  })
   .then(copyChecks)
   .then(mainChecks)
   .then(sizingChecks)
@@ -748,7 +868,8 @@ function sizingChecks() {
 
 // A second copy exits before it opens a window or touches anything: two would fight over port 7430, and the second,
 // holding the sleep timers on its own, could save over the first's record of them. A --shot run, which runs beside
-// the installed copy, asks for no lock and leaves the power settings to that copy, Keep PC awake or not.
+// the installed copy, asks for no lock, leaves the power settings to that copy, Keep PC awake or not, and only reads
+// that copy's profile.
 async function copyChecks() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-overlay-copy-'));
   const anything = new Proxy(function () {}, {
@@ -756,12 +877,13 @@ async function copyChecks() {
     apply: () => anything,
     construct: () => anything,
   });
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { setKeepAwake };';
-  const load = (lock, argv = [], powercfg = () => '') => {
-    const seen = { locks: 0, exit: undefined, windows: 0, powercfg: 0 };
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\nmodule.exports = { setKeepAwake, tick, last };';
+  const load = (lock, argv = [], powercfg = () => '', providers = []) => {
+    const seen = { locks: 0, exit: undefined, windows: 0, powercfg: 0, helpers: 0 };
     const handlers = {};
+    const paths = {};
     let ready;
-    const app = { commandLine: anything, requestSingleInstanceLock: () => (seen.locks++, lock), exit: (code) => (seen.exit = code), whenReady: () => new Promise((r) => (ready = r)), on() {}, getPath: () => dir };
+    const app = { commandLine: anything, requestSingleInstanceLock: () => (seen.locks++, lock), exit: (code) => (seen.exit = code), whenReady: () => new Promise((r) => (ready = r)), on() {}, getPath: () => dir, setPath: (name, to) => (paths[name] = to) };
     // A window that takes any call and keeps what it is asked to listen for.
     const BrowserWindow = function () {
       seen.windows++;
@@ -771,8 +893,8 @@ async function copyChecks() {
       electron: new Proxy({ app, BrowserWindow }, { get: (t, k) => t[k] ?? anything }),
       http: { createServer: () => anything },
       './link': anything,
-      './providers': { ...require('./providers'), PROVIDERS: [] }, // no real account is ever asked
-      child_process: { spawn: () => anything, execFileSync: (cmd, args) => (seen.powercfg++, powercfg(args)) },
+      './providers': { ...require('./providers'), PROVIDERS: providers }, // no real account is ever asked
+      child_process: { spawn: () => (seen.helpers++, anything), execFileSync: (cmd, args) => (seen.powercfg++, powercfg(args)) },
     };
     const argvWas = process.argv;
     process.argv = [...argvWas, ...argv];
@@ -782,15 +904,42 @@ async function copyChecks() {
     } finally {
       process.argv = argvWas;
     }
-    return { seen, handlers, ready, ...mod.exports };
+    return { seen, handlers, paths, ready, ...mod.exports };
   };
   const second = load(false);
   second.ready();
   await new Promise((r) => setImmediate(r));
-  assert.deepStrictEqual(second.seen, { locks: 1, exit: 0, windows: 0, powercfg: 0 }, 'a second copy exits and opens nothing');
-  const shot = load(false, ['--shot=' + path.join(dir, 'shot.png')]);
-  shot.setKeepAwake(true);
-  assert.deepStrictEqual(shot.seen, { locks: 0, exit: undefined, windows: 0, powercfg: 0 }, 'a --shot run takes no lock and leaves the sleep timers alone');
+  assert.deepStrictEqual(second.seen, { locks: 1, exit: 0, windows: 0, powercfg: 0, helpers: 0 }, 'a second copy exits and opens nothing');
+
+  // A --shot run starts from the installed copy's state.json, with Keep PC awake on and a saved Claude reading. The
+  // installed copy then switches it off, as it did when a shot that saved its old "on" back made the next start hold
+  // the timers at Never again. The shot paints the saved numbers and the CPU's, asks no account, starts no helper,
+  // writes nothing there, flushing at a session end too, and keeps Chromium's own files out of that profile.
+  const statePath = path.join(dir, 'state.json');
+  fs.writeFileSync(statePath, JSON.stringify({ keepAwake: true, sleepAc: { '27fa6203-3987-4dcc-918d-748559d549ec': 600 }, cache: { claude: { plan: 'Max', rows: [{ label: 'Session', percent: 42 }], updatedAt: 1 } } }));
+  const asked = [];
+  const shot = load(false, ['--shot=' + path.join(dir, 'shot.png')], undefined, [
+    { id: 'claude', name: 'Claude', everyMs: 0, read: async () => (asked.push('claude'), { rows: [{ label: 'Session', percent: 99 }], updatedAt: Date.now() }) },
+    { id: 'cpu', name: 'CPU', everyMs: 0, local: true, read: async () => (asked.push('cpu'), { rows: [{ label: 'Load', percent: 7 }], updatedAt: Date.now() }) },
+  ]);
+  const intervalWas = global.setInterval;
+  global.setInterval = () => ({ unref() {} }); // main.js's own timers stand still, and only for a few microtasks
+  try {
+    shot.ready();
+    for (let i = 0; i < 5; i++) await null; // whenReady's callback runs: the window, loadState, the tray
+    const switchedOff = JSON.stringify({ keepAwake: false });
+    fs.writeFileSync(statePath, switchedOff);
+    shot.setKeepAwake(true);
+    await shot.tick(true);
+    shot.handlers['session-end']();
+    await new Promise((r) => setTimeout(r, 500)); // past any debounced save
+    assert.deepStrictEqual(shot.seen, { locks: 0, exit: undefined, windows: 1, powercfg: 0, helpers: 0 }, 'a --shot run takes no lock and leaves keep-awake and the sleep timers alone');
+    assert.strictEqual(fs.readFileSync(statePath, 'utf8'), switchedOff, "and writes nothing over the installed copy's state");
+    assert.deepStrictEqual([asked, shot.last.get('claude').rows[0].percent, shot.last.get('cpu').rows[0].percent], [['cpu'], 42, 7], 'it paints the saved numbers and asks no account');
+    assert.ok(shot.paths.userData === shot.paths.sessionData && path.relative(dir, shot.paths.userData).startsWith('..'), "Chromium's own files go to a folder outside the profile");
+  } finally {
+    global.setInterval = intervalWas;
+  }
 
   // Windows ending the session skips will-quit. The window's session-end puts the timer back and saves at once,
   // with the switch still on for the next start. One plan, 600 s of its own, held at Never by a crashed run.
@@ -801,10 +950,8 @@ async function copyChecks() {
     : verb === '/q' ? `0x00000000 0xffffffff 0x00000001 0x${plan.ac.toString(16)} 0x000000f0\r\n`
     : verb === '/setacvalueindex' ? ((plan.ac = Number(value)), '')
     : '';
-  await new Promise((r) => setTimeout(r, 500)); // the --shot run's debounced save first
   fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ keepAwake: true, sleepAc: { [PERF]: 600 } }));
-  const intervalWas = global.setInterval;
-  global.setInterval = () => ({ unref() {} }); // main.js's own timers stand still, and only for a few microtasks
+  global.setInterval = () => ({ unref() {} });
   try {
     const first = load(true, [], powercfg);
     first.ready();
@@ -889,9 +1036,9 @@ async function mainChecks() {
   const link = { ...require('./link'), secret: () => 'e'.repeat(64) };
   const mod = { exports: {} };
   // The tray only exists once the window does, which the fake app never gets to; its menu is rebuilt into nothing.
-  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched, crash: () => { flushState(); awakeBlocker = null; sleepAc = {}; } };';
+  const src = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8') + '\ntray = { setContextMenu() {} };\nmodule.exports = { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, menu, savedCache: () => cache, setWin: (w) => (win = w), fetched, signedIn, crash: () => { flushState(); awakeBlocker = null; sleepAc = {}; } };';
   new Function('require', 'module', '__dirname', src)((id) => (id === 'electron' ? electron : id === 'http' ? http : id === 'child_process' ? childProcess : id === './providers' ? providers : id === './link' ? link : require(id)), mod, __dirname);
-  const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, savedCache, setWin, fetched } = mod.exports;
+  const { readOne, tick, saveState, gate, last, servePhone, useConsoleKey, pasteConsoleKey, snapshot, loadState, savedReading, savedCache, setWin, fetched, signedIn } = mod.exports;
   const saved = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   const reading = (id, percent, wait = 0) => ({ id, everyMs: 0, read: async () => {
     await new Promise((r) => setTimeout(r, wait));
@@ -1463,6 +1610,82 @@ async function mainChecks() {
     on['will-quit']();
     assert.deepStrictEqual(saved().sleepAc, {});
 
+    // A switch-off whose writes powercfg refuses leaves Windows at Never while the switch says off. The menu and the
+    // phone say so, and the release is tried again by itself, a minute on, then twice as long each time up to every 30,
+    // until Windows has the timers. A try starts no helper, keeps a timer changed in Settings meanwhile, and a switch-on,
+    // a quit or a start that puts them back cancels the next one.
+    {
+      const timeoutWas = global.setTimeout;
+      const clearWas = global.clearTimeout;
+      const tries = []; // restoreLater's waits, run by hand
+      global.setTimeout = (fn, ms, ...rest) => (ms >= 60_000 ? (tries.push({ fn, ms, live: true, unref() {} }), tries.at(-1)) : timeoutWas(fn, ms, ...rest));
+      global.clearTimeout = (t) => (tries.includes(t) ? (t.live = false) : clearWas(t));
+      const waits = () => tries.filter((t) => t.live).map((t) => t.ms);
+      const retry = () => {
+        const t = tries.find((x) => x.live);
+        t.live = false;
+        t.fn();
+      };
+      const said = async () => [mod.exports.menu().some((item) => /^Sleep timers still at Never/.test(item.label)), JSON.parse((await ask('POST', '/api/settings', '{}')).body).restoringSleep];
+      const helpers = () => powerCalls.filter(([what]) => what === 'start').length;
+      try {
+        awakeMenu().click({ checked: true });
+        assert.deepStrictEqual(await said(), [false, false], 'nothing to say while it is on');
+        const started = helpers();
+        cfg.fail = ([verb]) => verb === '/setacvalueindex';
+        awakeMenu().click({ checked: false });
+        assert.deepStrictEqual([awakeMenu().checked, timers()], [false, never], 'off, with the timers still at Never');
+        assert.deepStrictEqual(await said(), [true, true], 'the menu and the phone say they are not back yet');
+        assert.deepStrictEqual(waits(), [60_000], 'tried again a minute on');
+        const delays = [];
+        for (let i = 0; i < 7; i++) {
+          retry();
+          delays.push(...waits());
+        }
+        assert.deepStrictEqual(delays, [120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000, 1_800_000], 'then twice as long each time, up to every 30 minutes');
+        await new Promise((r) => timeoutWas(r, 450)); // the tries' debounced saves land
+        assert.deepStrictEqual(saved().sleepAc, { [BAL]: 300, [SIL]: 300, [PERF]: 600 }, 'each plan\'s own timer stays on disk meanwhile');
+        cfg.fail = null;
+        cfg.plans[SIL].ac = 900; // changed in Settings meanwhile
+        retry();
+        assert.deepStrictEqual(timers(), { ...asOwn, [SIL]: 900 }, 'a try that goes through puts them back, and keeps one changed meanwhile');
+        assert.deepStrictEqual([waits(), await said(), helpers()], [[], [false, false], started], 'then stops, says nothing more, and never started the helper again');
+        cfg.plans[SIL].ac = 300;
+
+        // A switch-on cancels the next try, and a try already under way when it fires finds the switch on and does
+        // nothing, so it can't put back timers the switch now holds.
+        awakeMenu().click({ checked: true });
+        cfg.fail = ([verb]) => verb === '/setacvalueindex';
+        awakeMenu().click({ checked: false });
+        const stale = tries.find((t) => t.live);
+        cfg.fail = null;
+        awakeMenu().click({ checked: true });
+        assert.deepStrictEqual([waits(), stale.live], [[], false], 'a switch-on cancels the next try');
+        cfg.calls = [];
+        stale.fn();
+        assert.deepStrictEqual([timers(), writes(), awakeMenu().checked, helpers()], [never, [], true, started + 2], 'and a late one changes nothing');
+        awakeMenu().click({ checked: false });
+        assert.deepStrictEqual([timers(), waits()], [asOwn, []]);
+
+        // A quit cancels it too, leaving the records for the next start. A start that can't put them back tries again.
+        awakeMenu().click({ checked: true });
+        cfg.fail = ([verb]) => verb === '/setacvalueindex';
+        awakeMenu().click({ checked: false });
+        on['will-quit']();
+        assert.deepStrictEqual([waits(), saved().sleepAc], [[], { [BAL]: 300, [SIL]: 300, [PERF]: 600 }], 'a quit cancels the next try and keeps the records');
+        loadState();
+        assert.deepStrictEqual([waits(), awakeMenu().checked, await said()], [[60_000], false, [true, true]], 'a start that still can\'t put them back tries again');
+        cfg.fail = null;
+        retry();
+        assert.deepStrictEqual([timers(), waits(), await said()], [asOwn, [], [false, false]]);
+        on['will-quit']();
+        assert.deepStrictEqual(saved().sleepAc, {});
+      } finally {
+        Object.assign(global, { setTimeout: timeoutWas, clearTimeout: clearWas });
+        cfg.fail = null;
+      }
+    }
+
     // Nor can such a record bring an old timer back later. A plan that no longer reads 0 has its own timer
     // again, here one changed in Settings since, and the next switch-on keeps that one. If that plan can't be
     // read at the next switch-on, it is left as it is rather than held on the old record.
@@ -1673,20 +1896,172 @@ async function mainChecks() {
     assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a' }, { renewsFor: 'b' }), undefined, 'not for another');
     assert.strictEqual(await carried({ renewsAt: ahead }, { renewsAt: null }), null, 'a read that says there is none drops it');
     assert.strictEqual(await carried({ renewsAt: deadline - 1 }, {}), undefined, 'a date gone by is not kept');
-    // Signed in to another account, the date on hand goes even when the read keeps the reading on screen (a failure, an
-    // older fallback), and from the saved cache too. A read that can't tell whose it is (no sign-in to read) keeps it.
-    // On disk too: account A's date saved, B's read fails, and the next start finds no date.
-    last.set('claude', { ...lapsing, renewsAt: ahead, renewsFor: 'a' });
+    // Signed in to another account, the plan and date on hand go even when the read keeps the reading on screen (a
+    // failure, an older fallback), and from the saved cache too. A read that can't tell whose it is (no sign-in to read)
+    // keeps them. On disk too: account A's saved, B's read fails, and the next start finds neither.
+    last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead, renewsFor: 'a', bankedResets: 1, bankedResetExpiries: [ahead] });
     savedCache().claude = last.get('claude');
     saveState({ cache: savedCache() });
     on['will-quit']();
     held.read = async () => ({ error: 'HTTP 503', soft: true, renewsFor: 'b' });
     await readOne(claude, true);
-    assert.strictEqual(last.get('claude').renewsAt, undefined, 'another account\'s failed read');
+    assert.deepStrictEqual([last.get('claude').plan, last.get('claude').renewsAt], [undefined, undefined], 'another account\'s failed read');
+    assert.deepStrictEqual([shownClaude().bankedResets, shownClaude().bankedResetExpiries, savedCache().claude.bankedResets], [undefined, undefined, undefined], 'the previous account\'s banked resets are gone too');
     on['will-quit']();
     last.clear();
     loadState();
-    assert.deepStrictEqual([last.get('claude')?.rows?.[0]?.percent, last.get('claude')?.renewsAt], [40, undefined], 'and not after a restart');
+    assert.deepStrictEqual([last.get('claude')?.rows?.[0]?.percent, last.get('claude')?.plan, last.get('claude')?.renewsAt], [40, undefined, undefined], 'and not after a restart');
+    // Claude Code's own copy for the account the last read named, B, between reads or while gated: its usage replaces
+    // A's still on screen (that read failed) rather than mixing with it, and A's plan and date stay gone.
+    const soon = new Date(Date.now() + 3_600_000).toISOString();
+    last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead, renewsFor: 'a' });
+    gate.set('claude', Date.now() + 60_000);
+    let copy = { rows: [{ label: 'Weekly', percent: 55, resetsAt: soon }], updatedAt: Date.now(), renewsFor: 'b' };
+    claude.readLocal = () => copy;
+    try {
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt, last.get('claude').renewsFor, last.get('claude').apiCredit], [55, undefined, undefined, 'b', lapsing.apiCredit], "the signed-in account's local copy, with the Console's credit still");
+      last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead, renewsFor: 'b' });
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt], [55, 'Max', ahead], 'the same account\'s keeps them');
+      // A copy for anyone else (~/.claude.json still names A after B's token came) is left alone: B's plan, date and
+      // numbers stay. Before any read, the reading's own account is the one signed in.
+      last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead, renewsFor: 'b' });
+      copy = { rows: [{ label: 'Weekly', percent: 90, resetsAt: soon }], updatedAt: Date.now(), renewsFor: 'a' };
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt, last.get('claude').renewsFor], [40, 'Max', ahead, 'b'], "a copy for an account not signed in changes nothing");
+      signedIn.delete('claude'); // as at a start
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan], [40, 'Max'], 'nor before any read');
+      // A reading saved before readings named their account (an upgrade) can't be shown to be the copy's: replaced.
+      last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead });
+      copy = { rows: [{ label: 'Weekly', percent: 55, resetsAt: soon }], updatedAt: Date.now(), renewsFor: 'b' };
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt, last.get('claude').renewsFor], [55, undefined, undefined, 'b'], 'an untagged reading gives way to a copy that names its account');
+      assert.strictEqual(savedCache().claude.plan, undefined, 'on disk too');
+
+      // Signed in to B since A's 90% of the same week: B's 20% is never merged up to 90, nor announced as a reset,
+      // whether B's read answers or fails and B's copy lands. A reset within one account still beeps.
+      gate.delete('claude');
+      const sent = [];
+      setWin({ isDestroyed: () => false, webContents: { send: (ch, v) => sent.push([ch, v]) } });
+      beeps.length = 0;
+      const week = (percent, resetsAt = soon) => ({ rows: [{ label: 'Weekly', percent, resetsAt }], updatedAt: Date.now() });
+      last.set('claude', { ...week(90), plan: 'Max', renewsFor: 'a' });
+      held.read = async () => ({ error: 'HTTP 503', soft: true, renewsFor: 'b' });
+      copy = { ...week(20), renewsFor: 'b' };
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').renewsFor, beeps.length], [20, 'b', 0], "B's failed read: B's copy, not A's higher number, and no reset");
+      last.set('claude', { ...week(90), plan: 'Max', renewsFor: 'a' });
+      held.read = async () => ({ ...week(20), plan: 'Pro', renewsFor: 'b' });
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, beeps.length], [20, 'Pro', 0], "B's read: no reset from A's 90% to B's 20%");
+      held.read = async () => ({ ...week(1, new Date(Date.now() + 7 * 86_400_000).toISOString()), plan: 'Pro', renewsFor: 'b' });
+      await readOne(claude, true);
+      assert.strictEqual(beeps.length, 1, "B's own new week is a reset");
+      // A new token whose usage and profile both fail (accountUnknown): the plan and date go, but copies for the account
+      // last known go on landing, as they must through a 429 when Claude Code rotates the token.
+      last.set('claude', { ...week(30), plan: 'Pro', renewsFor: 'b' });
+      held.read = async () => ({ error: 'Rate limited', soft: true, retryAfter: 30, renewsFor: 'm', accountUnknown: true });
+      copy = { ...week(35), updatedAt: Date.now() + 1, renewsFor: 'b' };
+      await readOne(claude, true);
+      assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, signedIn.get('claude')], [35, undefined, 'b'], 'a read that knows no account leaves the copies to the last one known');
+      gate.delete('claude');
+      setWin(null);
+
+      // The same rotation with the usage answering and only the profile failing, through the real provider and Claude
+      // Code's file: the usage shows without the plan or date, and between reads a newer copy for the account last
+      // confirmed lands, while an older one or another account's doesn't. After a restart the reading saved names that
+      // account. Fresh tokens and module, so no profile is on hand from the checks above.
+      loadCodex(codexHome, codexHome);
+      const real = require('./providers').PROVIDERS.find((p) => p.id === 'claude');
+      const creds = path.join(codexHome, '.claude', '.credentials.json');
+      const config = path.join(codexHome, '.claude.json');
+      const credsWas = fs.readFileSync(creds);
+      const fetchWas = global.fetch;
+      let t = deadline;
+      Date.now = () => t;
+      let usage = 10;
+      let profileUp = true;
+      global.fetch = async (url) => {
+        if (!url.endsWith('/profile')) return { ok: true, json: async () => ({ limits: [{ kind: 'session', percent: usage, resets_at: soon }] }) };
+        if (!profileUp) return { ok: false, status: 503, headers: new Headers() };
+        return { ok: true, json: async () => ({ account: { uuid: 'account-a' }, organization: { uuid: 'org-a', rate_limit_tier: 'default_claude_max_5x', billing_type: 'stripe_subscription', subscription_status: 'active', subscription_created_at: '2026-01-05T10:00:00Z' } }) };
+      };
+      const useToken = (token) => fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: token } }));
+      const localCopy = (account, percent, at) => fs.writeFileSync(config, JSON.stringify({ oauthAccount: { accountUuid: account, organizationUuid: 'org-a' }, cachedUsageUtilization: { fetchedAtMs: at, accountUuid: account, utilization: { limits: [{ kind: 'session', percent, resets_at: soon }] } } }));
+      const shows = () => [last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt];
+      try {
+        held.read = real.read;
+        claude.readLocal = real.readLocal;
+        claude.everyMs = 5 * 60_000;
+        last.delete('claude');
+        signedIn.delete('claude');
+        useToken('token-rotating-1');
+        await readOne(claude, true);
+        const a = last.get('claude');
+        assert.ok(a.rows[0].percent === 10 && a.plan === 'Max' && a.renewsAt > t && signedIn.get('claude') === a.renewsFor, "A's token, its profile confirmed");
+        t += 60_000;
+        useToken('token-rotating-2');
+        profileUp = false;
+        usage = 20;
+        await readOne(claude, true);
+        assert.deepStrictEqual([...shows(), signedIn.get('claude'), shownClaude().accountUnknown], [20, '', undefined, a.renewsFor, undefined], "the rotated token's usage without A's plan or date, and A still signed in");
+        on['will-quit']();
+        assert.strictEqual(saved().cache.claude.accountUnknown, true, 'the unverified reading reaches disk');
+        last.clear();
+        signedIn.clear();
+        loadState();
+        assert.deepStrictEqual([shows()[0], signedIn.get('claude')], [20, a.renewsFor], 'a saved unverified reading keeps the last confirmed identity through loadState');
+        useToken('token-rotating-after-restart');
+        await readOne(claude, true);
+        localCopy('account-a', 15, t - 30_000);
+        await readOne(claude);
+        assert.strictEqual(shows()[0], 20, "A's copy from before that read doesn't roll it back");
+        t += 60_000;
+        localCopy('account-b', 90, t);
+        await readOne(claude);
+        assert.strictEqual(shows()[0], 20, "another account's copy stays out, though newer");
+        localCopy('account-a', 30, t);
+        await readOne(claude);
+        assert.deepStrictEqual([...shows(), last.get('claude').renewsFor], [30, undefined, undefined, a.renewsFor], "A's newer copy lands between reads");
+        signedIn.delete('claude'); // a restart, with A's reading saved
+        useToken('token-rotating-3');
+        usage = 25;
+        await readOne(claude, true);
+        t += 60_000;
+        localCopy('account-a', 35, t);
+        await readOne(claude);
+        assert.deepStrictEqual([shows()[0], signedIn.get('claude')], [35, a.renewsFor], 'after a restart too');
+        profileUp = true;
+        await readOne(claude, true);
+        assert.deepStrictEqual([shows()[1], signedIn.get('claude')], ['Max', a.renewsFor], 'until the profile answers');
+      } finally {
+        global.fetch = fetchWas;
+        fs.writeFileSync(creds, credsWas);
+        fs.rmSync(config, { force: true });
+        claude.everyMs = 0;
+        Date.now = () => deadline;
+      }
+    } finally {
+      claude.readLocal = undefined;
+      setWin(null);
+    }
+    // A reading saved before readings named their account: a read that names one and fails (a 429 here) drops its
+    // plan and date, on screen and on disk, since they can't be shown to be this account's. Codex's stay, as before.
+    gate.delete('claude');
+    last.set('claude', { ...lapsing, plan: 'Max', renewsAt: ahead });
+    savedCache().claude = last.get('claude');
+    held.read = async () => ({ error: 'Rate limited', soft: true, retryAfter: 30, renewsFor: 'b' });
+    await readOne(claude, true);
+    assert.deepStrictEqual([last.get('claude').rows[0].percent, last.get('claude').plan, last.get('claude').renewsAt, savedCache().claude.plan, savedCache().claude.renewsAt], [40, undefined, undefined, undefined, undefined], 'an untagged reading loses its plan and date to a failed read that names an account');
+    gate.delete('claude');
+    const codex = { id: 'codex', name: 'Codex', everyMs: 0, read: async () => ({ error: 'HTTP 503', soft: true, renewsFor: 'b' }) };
+    last.set('codex', { rows: [{ label: 'Weekly', percent: 12 }], plan: 'Plus', renewsAt: ahead, updatedAt: 1 });
+    await readOne(codex, true);
+    assert.deepStrictEqual([last.get('codex').plan, last.get('codex').renewsAt], ['Plus', ahead], "an untagged Codex reading keeps them");
+    last.delete('codex');
+
     gate.delete('claude');
     assert.strictEqual(await carried({ renewsAt: ahead, renewsFor: 'a', updatedAt: 10 }, { why: 'Live refresh failed.', updatedAt: 5, renewsFor: 'b' }), undefined, 'another account\'s older fallback');
     assert.strictEqual(last.get('claude').updatedAt, 10, 'which still keeps the newer numbers');

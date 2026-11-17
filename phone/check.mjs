@@ -178,6 +178,8 @@ const small = windowFor(1);
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail('page error: ' + e.message));
+  // The page's own Content-Security-Policy must let through everything it asks for: a blocked font only swaps quietly.
+  page.on('console', (m) => /Content Security Policy/.test(m.text()) && fail('CSP: ' + m.text()));
   await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   const settle = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   // Every animation that ends, run to its end. Two frames aren't enough: on a loaded machine the panel's pull can
@@ -375,8 +377,10 @@ try {
     }
   }
 
-  // ---- settings: the PC's menu and the phone's own, at every width
+  // ---- settings: the PC's menu and the phone's own, at every width. Keep PC awake carries its longest state: switched
+  // off, with the PC still putting the sleep timers back.
   answer = 'ok';
+  pc.restoringSleep = true;
   await page.setViewport(small);
   await page.goto(url, { waitUntil: 'load' });
   await page.waitForFunction((n) => document.querySelectorAll('#cells .cell .dial').length === n, {}, COUNT);
@@ -404,6 +408,7 @@ try {
     if (m.small.length) fail(`${tag}: under 34px to tap: ${m.small.join(' | ')}`);
     if (m.usage !== 'none') fail(`${tag}: the numbers still show under the settings`);
     if (m.themes !== THEME_GROUPS.flatMap(([, l]) => l).length) fail(`${tag}: ${m.themes} themes on offer`);
+    if (!(await page.$eval('#prefs .awake', (e) => /Sleep timers still at Never, retrying/.test(e.textContent)))) fail(`${tag}: no word that the sleep timers aren't back`);
     const off = await outOfView();
     if (off.length) fail(`${tag}: off screen: ${off.slice(0, 4).join(' | ')}`);
     await page.screenshot({ path: path.join(shots, `settings-${width}-${side}.png`) });
@@ -424,6 +429,9 @@ try {
     await resize(small);
     if (await has('prefs')) fail(`${tag}: the panel will open on the settings next time`);
   }
+  pc.restoringSleep = false;
+  tell();
+  await until(() => data.restoringSleep === false, 'keep-awake: the timers back, the note goes');
 
   // ---- snipping at every width. The scissors put the panel and the tab away under a dim and a cue; a drag
   // marks a rectangle that goes to Bubble.java as fractions of the screen, and the click that ends the drag
@@ -946,6 +954,7 @@ try {
   const fresh = await browser.createBrowserContext(); // nothing saved from the stand-in's pages
   const phone = await fresh.newPage();
   phone.on('pageerror', (e) => fail('page error against main.js: ' + e.message));
+  phone.on('console', (m) => /Content Security Policy/.test(m.text()) && fail('CSP against main.js: ' + m.text()));
   await phone.setViewport(small);
   await phone.goto(realUrl, { waitUntil: 'load' });
   const percent = () => phone.evaluate(() => ({ percent: data?.providers?.[0]?.rows?.[0]?.percent, stream: es?.readyState, rev: data?.rev }));

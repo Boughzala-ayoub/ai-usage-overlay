@@ -30,11 +30,12 @@ public class LinkMain {
     if (System.getenv("LINK_LOG") != null) Link.log = System.err::println;
     m.put("secret", a[1]);
     Link.App[] apps = { new Link.App("overlay", 7430, 8443), new Link.App("loom-dev", 7421, 0) };
-    new Link(a[0].equals("-") ? "" : a[0], new Link.Store() {
+    Link link = new Link(a[0].equals("-") ? "" : a[0], new Link.Store() {
       public String get(String k) { return m.get(k); }
       public void put(String k, String v) { m.put(k, v); }
-    }, apps, 7499, ${OFFSET}).open();
-    System.out.println("ready");
+    }, apps, 7499, ${OFFSET});
+    link.open();
+    System.out.println("ready " + link.key); // the page's key, which the bubble's WebView holds as a cookie
     System.out.flush();
     Thread.sleep(Long.MAX_VALUE);
   }
@@ -60,19 +61,35 @@ public class LinkChecks {
     check(Link.line(s).equals(Link.hmac(SECRET, "phone|overlay|" + nonce + "|" + mine)), "the link proves itself to the PC");
     return s;
   }
-  /** A page's connection piped over the hotspot, once a byte has crossed each way: the page's end and the PC's. */
+  /** A request as the bubble's WebView sends it, with the link's key in its cookie unless it's null. */
+  static void send(Socket s, String start, String key, String more, String body) throws IOException {
+    String cookie = key == null ? "" : "Cookie: " + Link.COOKIE + "=" + key + "\\r\\n";
+    s.getOutputStream().write((start + " HTTP/1.1\\r\\nHost: localhost:7430\\r\\n" + cookie + more + "Content-Length: " + body.length() + "\\r\\n\\r\\n" + body).getBytes("ISO-8859-1"));
+  }
+  /** What reached the PC: a request's head through its blank line, then n bytes of body. */
+  static String got(Socket pc, int n) throws IOException {
+    StringBuilder b = new StringBuilder();
+    for (String l; !(l = Link.line(pc)).equals("\\r");) b.append(l, 0, l.length() - 1).append('\\n'); // less its \\r
+    for (int i = 0; i < n; i++) b.append((char) pc.getInputStream().read());
+    return b.toString();
+  }
+  /** The PC on the hotspot, waiting, and a page's connection that sent a request with the key and took it. */
   static Socket[] piped(Link link, int page, int pcPort) throws Exception {
     Socket pc = pc(pcPort);
     for (int i = 0; i < 500 && link.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
     Socket p = new Socket(InetAddress.getLoopbackAddress(), page);
     p.setSoTimeout(5000);
-    check("GO".equals(Link.line(pc)), "a page's connection takes the PC's waiting one");
+    send(p, "GET /api/usage", link.key, "", "");
+    check("GO".equals(Link.line(pc)), "a page's request takes the PC's waiting connection");
     Link.write(pc, "OK");
-    p.getOutputStream().write('x');
-    check(pc.getInputStream().read() == 'x', "the page reaches the PC");
+    check(got(pc, 0).equals("GET /api/usage HTTP/1.1\\nHost: localhost:7430\\nContent-Length: 0\\n"), "the page's request reaches the PC, without the key");
     pc.getOutputStream().write('y');
     check(p.getInputStream().read() == 'y', "the PC reaches the page");
     return new Socket[] { p, pc };
+  }
+  /** The link answered 403 and closed the connection (readAllBytes runs to its end, or throws after 5 s). */
+  static boolean refused(Socket p) throws IOException {
+    return Link.line(p).startsWith("HTTP/1.1 403 ") && new String(p.getInputStream().readAllBytes(), "ISO-8859-1").endsWith("\\r\\n\\r\\n");
   }
   /** The link let go of this connection: EOF or a reset, not a read that waits. */
   static boolean ended(Socket s) {
@@ -220,12 +237,147 @@ public class LinkChecks {
     for (int i = 0; i < 500 && left.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
     left.tailnetDown.add("overlay");
     Socket p = new Socket(InetAddress.getLoopbackAddress(), left.apps[0].port());
+    send(p, "GET /api/usage", left.key, "", "");
     check("GO".equals(Link.line(gone)), "the hotspot first, while Tailscale is down there");
     long t0 = System.currentTimeMillis();
     back.accept().close(); // throws past 5 s: the link gave up on the hotspot and never tried Tailscale
     check(System.currentTimeMillis() - t0 < 3500, "Tailscale within the GO's 2 s");
     p.close();
     left.stop();
+
+    // Another app on this phone reaches the page's port as well. Without the link's key, the first request on a
+    // connection or any later one, nothing reaches the PC by either way, and the PC never sees the key itself.
+    ServerSocket ts = serve(); // Tailscale's stand-in: a request that goes on dials it first
+    Link guard = new Link("localhost", store, new Link.App[] { new Link.App("overlay", free(), ts.getLocalPort()) }, free(), 0);
+    guard.open();
+    int port = guard.apps[0].port();
+    Socket waiting = pc(guard.pcPort);
+    for (int i = 0; i < 500 && guard.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
+    Socket spare = new Socket(InetAddress.getLoopbackAddress(), port); // a connection that never sends a request
+    String[][] strangers = {
+      { "GET /api/usage", null, "" },
+      { "POST /api/settings", "0".repeat(64), "Content-Type: application/json\\r\\n" }, // a key, not this link's
+      { "GET /api/usage", null, "Cookie: x" + Link.COOKIE + "=" + guard.key + "\\r\\n" }, // the key under another name
+      { "POST /api/settings", guard.key, "Transfer-Encoding: chunked\\r\\n" }, // a body of no stated length
+      { "GET /api/events", guard.key, "Upgrade: websocket\\r\\n" },
+    };
+    for (String[] r : strangers) {
+      Socket s = new Socket(InetAddress.getLoopbackAddress(), port);
+      s.setSoTimeout(5000);
+      send(s, r[0], r[1], r[2], "");
+      check(refused(s), "refused: " + String.join(" ", r[0], String.valueOf(r[1]), r[2]));
+    }
+    ts.setSoTimeout(500);
+    try {
+      ts.accept().close();
+      check(false, "a request without the key dialled Tailscale");
+    } catch (SocketTimeoutException e) {
+      // nobody dialled
+    }
+    check(guard.idle.get("overlay").size() == 1, "nor took the PC's waiting connection on the hotspot");
+    spare.close();
+    // With the key: its body whole, its other cookies kept, the key taken out. The next request on the same
+    // connection needs the key too: without it, both ends close and none of it reaches the PC.
+    guard.tailnetDown.add("overlay"); // straight to the hotspot, where the PC's end shows what went on
+    Socket web = new Socket(InetAddress.getLoopbackAddress(), port);
+    web.setSoTimeout(5000);
+    String body = "{\\"keepAwake\\":false}";
+    send(web, "POST /api/settings", null, "Cookie: a=1; " + Link.COOKIE + "=" + guard.key + "; b=2\\r\\nContent-Type: application/json\\r\\n", body);
+    check("GO".equals(Link.line(waiting)), "a request with the key goes on");
+    Link.write(waiting, "OK");
+    check(got(waiting, body.length()).equals("POST /api/settings HTTP/1.1\\nHost: localhost:7430\\nCookie: a=1; b=2\\nContent-Type: application/json\\nContent-Length: " + body.length() + "\\n" + body), "whole, with its other cookies, without the key");
+    waiting.getOutputStream().write("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok".getBytes("ISO-8859-1"));
+    check(Link.line(web).equals("HTTP/1.1 200 OK\\r") && got(web, 2).equals("Content-Length: 2\\nok"), "the PC's answer comes back untouched");
+    send(web, "GET /api/events", guard.key, "", "");
+    check(got(waiting, 0).equals("GET /api/events HTTP/1.1\\nHost: localhost:7430\\nContent-Length: 0\\n"), "the next request with the key goes on, on the same connection");
+    send(web, "GET /api/usage", null, "", "");
+    check(ended(waiting) && ended(web), "one without it ends the connection, and none of it reaches the PC");
+    guard.stop();
+
+    // An app that took one loopback address of the page port first would get the WebView's requests there, key and
+    // all, to replay on the other. So then the link serves the page on neither.
+    for (String taken : new String[] { "127.0.0.1", "::1" }) {
+      String other = taken.equals("::1") ? "127.0.0.1" : "::1";
+      try (ServerSocket squatter = new ServerSocket(0, 50, InetAddress.getByName(taken))) {
+        int held = squatter.getLocalPort();
+        Link squatted = new Link("localhost", store, new Link.App[] { new Link.App("overlay", held, 0) }, free(), 0);
+        squatted.open();
+        boolean served;
+        try (Socket s = new Socket(InetAddress.getByName(other), held)) {
+          served = true;
+        } catch (IOException e) {
+          served = false;
+        }
+        check(!served, "with " + taken + " taken by another app, the page isn't served on " + other);
+        check(!squatted.serving, "and the link says so, so the bubble hands out no key");
+        squatted.stop();
+      }
+    }
+    // Link.start never keeps a link that couldn't take its page ports: the next start, once the app lets go, tries again.
+    {
+      ServerSocket squatter = new ServerSocket(0, 50, InetAddress.getByName("::1"));
+      Link.App[] squatted = { new Link.App("overlay", squatter.getLocalPort(), 0) };
+      int pcs = free();
+      Link refused = Link.start("localhost", store, squatted, pcs);
+      check(!refused.serving, "a start with the page port taken serves nothing");
+      squatter.close();
+      Link again = Link.start("localhost", store, squatted, pcs);
+      check(again != refused && refused.stopped && again.serving, "the next start takes the port once it's free");
+      Link.end();
+    }
+
+    // Any app can open the page's port. A connection that hasn't shown the key takes one of the link's places, for
+    // FIRST_MS at most: past them, one is closed as it comes, and none waits on a thread. One that never sends, or
+    // drips its head, is closed at that deadline, unanswered, and its place comes back. A connection that showed the
+    // key keeps going past it, idle between requests as the page's event stream is.
+    ServerSocket ts2 = serve();
+    Link busy = new Link("localhost", store, new Link.App[] { new Link.App("overlay", free(), ts2.getLocalPort()) }, free(), 0);
+    busy.open();
+    int bp = busy.apps[0].port(), places = busy.unproven.availablePermits();
+    Socket bpc = pc(busy.pcPort);
+    for (int i = 0; i < 500 && busy.idle.get("overlay").isEmpty(); i++) Thread.sleep(10);
+    busy.tailnetDown.add("overlay"); // straight to the hotspot
+    Socket keyed = new Socket(InetAddress.getLoopbackAddress(), bp);
+    keyed.setSoTimeout(8000);
+    send(keyed, "GET /api/events", busy.key, "", "");
+    check("GO".equals(Link.line(bpc)), "a request with the key goes on");
+    Link.write(bpc, "OK");
+    check(got(bpc, 0).startsWith("GET /api/events "), "and reaches the PC");
+    long opened = System.currentTimeMillis();
+    Socket[] idle = new Socket[places];
+    for (int i = 0; i < places; i++) {
+      idle[i] = new Socket(InetAddress.getLoopbackAddress(), bp);
+      idle[i].setSoTimeout(8000);
+    }
+    Socket drip = idle[0];
+    Thread dripping = new Thread(() -> {
+      try {
+        drip.getOutputStream().write("GET /api/usage HTTP/1.1\\r\\n".getBytes("ISO-8859-1"));
+        for (int i = 0; i < 20; i++) {
+          Thread.sleep(400);
+          drip.getOutputStream().write("X: y\\r\\n".getBytes("ISO-8859-1"));
+        }
+      } catch (Exception e) {
+        // closed by the link
+      }
+    });
+    dripping.setDaemon(true);
+    dripping.start();
+    for (int i = 0; i < 500 && busy.unproven.availablePermits() > 0; i++) Thread.sleep(10);
+    check(busy.unproven.availablePermits() == 0, places + " connections without the key hold every place");
+    Socket over = new Socket(InetAddress.getLoopbackAddress(), bp);
+    over.setSoTimeout(1000);
+    check(ended(over), "one more is closed as it comes");
+    check(ended(drip), "a head that drips in is closed, unanswered");
+    long took = System.currentTimeMillis() - opened;
+    check(took >= Link.FIRST_MS - 500 && took < Link.FIRST_MS + 2500, "at the deadline, however it drips: " + took + " ms");
+    for (Socket s : idle) check(ended(s), "a connection that never sent a request is closed, unanswered");
+    for (int i = 0; i < 500 && busy.unproven.availablePermits() < places; i++) Thread.sleep(10);
+    check(busy.unproven.availablePermits() == places, "and every place comes back");
+    send(keyed, "GET /api/usage", busy.key, "", "");
+    check(got(bpc, 0).startsWith("GET /api/usage "), "the connection that showed the key takes its next request past the deadline");
+    busy.stop();
+    ts2.close();
   }
 }`);
 execFileSync('javac', ['--release', '17', '-d', classes, path.join(here, 'src', 'com', 'local', 'aiusage', 'Link.java'), main, checks], { stdio: 'inherit' });
@@ -237,6 +389,7 @@ try {
 }
 if (offline) process.exit(console.log('link-check: offline checks passed'));
 let phone = null;
+let pageKey = ''; // the running phone half's key, as the bubble's WebView holds it in a cookie
 // `java` on PATH may be Oracle's launcher, which runs the JVM as its child: end the whole tree.
 const kill = (p) => p && p.exitCode === null && execFileSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
 async function startPhone(host, secret) {
@@ -247,7 +400,12 @@ async function startPhone(host, secret) {
   }
   phone = spawn('java', ['-cp', classes, 'com.local.aiusage.LinkMain', host || '-', secret], { stdio: ['ignore', 'pipe', 'inherit'] });
   await new Promise((resolve, reject) => {
-    phone.stdout.on('data', (d) => String(d).includes('ready') && resolve());
+    phone.stdout.on('data', (d) => {
+      const ready = /ready ([0-9a-f]{64})/.exec(String(d));
+      if (!ready) return;
+      pageKey = ready[1];
+      resolve();
+    });
     phone.on('exit', (code) => reject(new Error(`the phone's half exited (${code})`)));
   });
 }
@@ -260,7 +418,7 @@ const app = http.createServer((req, res) => {
 await new Promise((r) => app.listen(0, '127.0.0.1', r));
 
 const get = (port, p, { method = 'GET', body } = {}) => new Promise((resolve, reject) => {
-  const req = http.request({ host: 'localhost', port, path: p, method, agent: false }, (res) => {
+  const req = http.request({ host: 'localhost', port, path: p, method, agent: false, headers: { cookie: `link=${pageKey}` } }, (res) => {
     let text = '';
     res.on('data', (c) => (text += c)).on('end', () => resolve({ status: res.statusCode, text }));
   });
