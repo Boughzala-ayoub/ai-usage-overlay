@@ -951,11 +951,22 @@ async function readAntigravityCreds() {
   return readCredFile(ANTIGRAVITY_AUTH);
 }
 
+// Whitespace-only token hashes that an earlier build could have linked across distinct accounts before blank tokens
+// were rejected. Any saved alias group, cache entry, or gate origin touching one is invalidated on restore.
+const BLANK_TOKEN_KEYS = new Set([
+  '\t', '\n', '\r', '\r\n', ' \t', '\t ',
+  ...Array.from({ length: 64 }, (_, i) => ' '.repeat(i + 1)),
+].flatMap((s) => {
+  const h = accountKey(s);
+  return [h, `tok:${h}`];
+}));
+const hasBlankTokenKey = (keys) => Array.isArray(keys) && keys.some((k) => BLANK_TOKEN_KEYS.has(k));
+
 function antigravityIdentity(raw) {
   const tok = raw?.token || raw;
   const email = typeof raw?.id_token_email === 'string' && raw.id_token_email.trim().toLowerCase();
-  const refresh = typeof tok?.refresh_token === 'string' && tok.refresh_token;
-  const access = typeof tok?.access_token === 'string' && tok.access_token;
+  const refresh = typeof tok?.refresh_token === 'string' && tok.refresh_token.trim() ? tok.refresh_token : '';
+  const access = typeof tok?.access_token === 'string' && tok.access_token.trim() ? tok.access_token : '';
   const tokenHash = access ? accountKey(access) : null;
   const refreshHash = refresh ? accountKey(refresh) : null;
   const strong = email || refresh;
@@ -963,14 +974,14 @@ function antigravityIdentity(raw) {
     const account = accountKey(strong);
     // Include the hashed refresh token alongside email so rotating the bearer when email is absent/added still matches Retry-After.
     const gateKeys = [...new Set([account, ...(refreshHash ? [refreshHash] : []), ...(tokenHash ? [`tok:${tokenHash}`] : [])])];
-    return { account, gateKey: account, gateKeys, tokenHash, identityWeak: false };
+    return { account, gateKey: account, gateKeys, tokenHash, hasRefresh: !!refresh, identityWeak: false };
   }
   if (access) {
     // Access-token-only credentials cannot distinguish rotation from account switch, so 429 gating is conservative,
     // and carrying the hashed bearer token preserves backoff if refresh_token/email is later added to the same token.
-    return { account: tokenHash, gateKey: '__weak__', gateKeys: ['__weak__', `tok:${tokenHash}`], tokenHash, identityWeak: true };
+    return { account: tokenHash, gateKey: '__weak__', gateKeys: ['__weak__', `tok:${tokenHash}`], tokenHash, hasRefresh: false, identityWeak: true };
   }
-  return { account: null, gateKey: null, gateKeys: [], tokenHash: null, identityWeak: true };
+  return { account: null, gateKey: null, gateKeys: [], tokenHash: null, hasRefresh: false, identityWeak: true };
 }
 
 // Which backoff keys belong to one account. An email, a refresh token and a bearer each name a single account, so every
@@ -1073,11 +1084,53 @@ const gateList = (raw, now = Date.now()) => (Array.isArray(raw) ? raw : Object.e
   .map((g) => ({ until: g.until, keys: [...g.keys], origin: [...g.origin] }));
 // A restart's links, from what state.json kept: the saved groups, the saved reading's keys, and the origin of each saved
 // wait that names an account, quota's and loadCodeAssist's. A bare bearer that only waited under `__weak__` is in `keys`,
-// never linked. A saved key that isn't a hash (a hand-edited file) links nothing.
+// never linked. A saved key that isn't a hash (a hand-edited file) links nothing. Any saved group, gate origin, or
+// reading linked through a blank-token hash from an older build is discarded, and returns true if `reading` is tainted.
 function restoreAntigravityLinks(reading, gates, links) {
-  if (Array.isArray(links)) for (const g of links) if (isKeyList(g)) linkAntigravityKeys(g.filter((k) => /^(?:tok:)?[0-9a-f]{12}$/.test(k)));
-  if (isKeyList(reading?.gateKeys)) linkAntigravityKeys(reading.gateKeys);
-  for (const g of [...gates, ...tierGates]) if (namesAccount(g.origin)) linkAntigravityKeys(g.origin);
+  const tainted = new Set(BLANK_TOKEN_KEYS);
+  const addTainted = (ks) => { for (const k of ks) if (typeof k === 'string') tainted.add(k); };
+  let dirty = false;
+  const cleanLinks = [];
+  if (Array.isArray(links)) {
+    for (const g of links) {
+      if (!isKeyList(g)) continue;
+      if (hasBlankTokenKey(g)) {
+        addTainted(g);
+        dirty = true;
+      } else cleanLinks.push(g);
+    }
+  }
+  const cleanGates = [];
+  const purgeGates = (list) => {
+    for (let i = list.length; i--;) {
+      const g = list[i];
+      if (hasBlankTokenKey(g.origin) || hasBlankTokenKey(g.keys)) {
+        addTainted(g.origin);
+        addTainted(g.keys);
+        list.splice(i, 1);
+        dirty = true;
+      } else {
+        cleanGates.push({ list, gate: g });
+      }
+    }
+  };
+  purgeGates(gates);
+  purgeGates(tierGates);
+  const readingTainted = !!(reading && (tainted.has(reading.renewsFor) || (isKeyList(reading.gateKeys) && reading.gateKeys.some((k) => tainted.has(k)))));
+  if (readingTainted && isKeyList(reading?.gateKeys)) addTainted(reading.gateKeys);
+  for (const g of cleanLinks) {
+    if (g.some((k) => tainted.has(k))) dirty = true;
+    else linkAntigravityKeys(g.filter((k) => /^(?:tok:)?[0-9a-f]{12}$/.test(k)));
+  }
+  if (!readingTainted && isKeyList(reading?.gateKeys)) linkAntigravityKeys(reading.gateKeys);
+  for (const { list, gate } of cleanGates) {
+    if (gate.origin.some((k) => tainted.has(k)) || gate.keys.some((k) => tainted.has(k))) {
+      const idx = list.indexOf(gate);
+      if (idx >= 0) list.splice(idx, 1);
+      dirty = true;
+    } else if (namesAccount(gate.origin)) linkAntigravityKeys(gate.origin);
+  }
+  return { readingTainted, dirty: dirty || readingTainted };
 }
 
 function parseTierObj(tier) {
@@ -1402,12 +1455,12 @@ async function peekAntigravityCred() {
     return { status: 'signed_out', error: 'Antigravity credentials unreadable — open Antigravity to sign in.', signedOut: true };
   }
   const tok = cred.status === 'ok' ? (cred.data?.token || cred.data) : null;
-  const accessToken = typeof tok?.access_token === 'string' && tok.access_token;
+  const accessToken = typeof tok?.access_token === 'string' && tok.access_token.trim() ? tok.access_token : '';
   if (!accessToken) {
     if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
     return { status: 'signed_out', error: 'No Antigravity credentials — open Antigravity to sign in.', signedOut: true };
   }
-  const { account, gateKey, gateKeys, tokenHash, identityWeak } = antigravityIdentity(cred.data);
+  const { account, gateKey, gateKeys, tokenHash, hasRefresh, identityWeak } = antigravityIdentity(cred.data);
   // A date or epoch ms. Anything else (null, an object) is no expiry: never coerced, which can throw or read null as 1970.
   const expiry = typeof tok.expiry === 'string' ? Date.parse(tok.expiry) : typeof tok.expiry === 'number' ? tok.expiry : NaN;
   const expired = Number.isFinite(expiry) && expiry <= Date.now();
@@ -1418,7 +1471,7 @@ async function peekAntigravityCred() {
   for (const out of antigravityOut) if (seen.some((k) => out.includes(k))) out.push(...gateKeys.filter((k) => !out.includes(k)));
   // Every key the account shows joins its loadCodeAssist wait at once, as quota's does in main.js, so a restart finds it.
   if (gateUntil(tierGates, gateKeys).changed) tierGatesChanged?.();
-  return { status: 'ok', account, gateKey, gateKeys, tokenHash, identityWeak, accessToken, expiry, expired, linked };
+  return { status: 'ok', account, gateKey, gateKeys, tokenHash, identityWeak, hasRefresh, accessToken, expiry, expired, linked };
 }
 
 const isAntigravityAuthError = (e) =>
@@ -1439,8 +1492,12 @@ async function readAntigravity(preCred, opts = {}) {
     if (!preCred) clearTierPlans();
     return { error: cred.error, signedOut: true };
   }
-  const { account, gateKey, gateKeys, accessToken, expiry } = cred;
-  if (Number.isFinite(expiry) && expiry <= Date.now()) return { error: 'Session expired — open Antigravity.', authError: true, tokenHash: cred.tokenHash, renewsFor: account, gateFor: gateKey, gateKeys };
+  const { account, gateKey, gateKeys, accessToken, expiry, hasRefresh } = cred;
+  if (Number.isFinite(expiry) && expiry <= Date.now()) {
+    return hasRefresh
+      ? { error: 'Session expired — open Antigravity.', authError: true, soft: true, renewsFor: account, gateFor: gateKey, gateKeys }
+      : { error: 'Session expired — open Antigravity.', authError: true, tokenHash: cred.tokenHash, renewsFor: account, gateFor: gateKey, gateKeys };
+  }
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
@@ -1482,11 +1539,19 @@ async function readAntigravity(preCred, opts = {}) {
     }
     const hasRetry = Number.isFinite(e.retryAfter) && e.retryAfter >= 0;
     const whose = { renewsFor: account, gateFor: gateKey, ...(hasRetry ? { retryAfter: e.retryAfter, gateKeys: out } : { gateKeys }) };
-    // The bearer refused, so main can tell a replacement from it (main strips it before any screen) and any pending
-    // loadCodeAssist transport retry for this bearer is called off.
+    // The bearer refused, so main can sequence and record the refusal before its post-fetch check (main strips
+    // tokenHash before any screen) and any pending loadCodeAssist transport retry for this bearer is called off.
+    // With a refresh_token on disk the 1-hour access token simply lapsed while Antigravity sat idle, so return soft
+    // to keep the last good numbers on screen unless a newer check drops refresh_token.
     if (isAntigravityAuthError(e)) {
       answered(true);
-      return { error: 'Session expired — open Antigravity.', authError: true, tokenHash: cred.tokenHash, ...whose };
+      return {
+        error: 'Session expired — open Antigravity.',
+        authError: true,
+        tokenHash: cred.tokenHash,
+        ...(hasRefresh ? { soft: true } : {}),
+        ...whose,
+      };
     }
     if (e.status === 403) {
       answered(false);

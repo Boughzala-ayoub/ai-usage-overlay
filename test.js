@@ -1323,12 +1323,30 @@ configuredProvider.read()
       assert.deepStrictEqual([limited.soft, limited.retryAfter, !!limited.renewsFor], [true, 75, true]);
       quotaStatus = 200;
 
-      // Expired token fails without hitting the network, still naming its account.
+      // Expired token without refresh_token fails hard without hitting the network; with refresh_token it returns soft.
       sentAuth.length = 0;
       fs.writeFileSync(agAuthFile, JSON.stringify({ id_token_email: 'c@example.com', token: { access_token: 'ag-tok-3', expiry: '2020-01-01T00:00:00Z' } }));
       const exp = await ag.read();
       assert.match(exp.error, /Session expired/);
-      assert.ok(exp.renewsFor && sentAuth.length === 0, 'expired token makes no request');
+      assert.ok(!exp.soft && exp.renewsFor && sentAuth.length === 0, 'expired token makes no request');
+      fs.writeFileSync(agAuthFile, JSON.stringify({ id_token_email: 'c@example.com', token: { access_token: 'ag-tok-3', refresh_token: 'ag-rt-3', expiry: '2020-01-01T00:00:00Z' } }));
+      const expSoft = await ag.read();
+      assert.ok(expSoft.soft && expSoft.authError && !expSoft.tokenHash && expSoft.renewsFor && sentAuth.length === 0, 'expired refreshable token is soft and makes no request');
+      // 401 / auth-403 on a refreshable token returns soft (still carrying tokenHash for main.js sequencing); plain 403 stays hard.
+      fs.writeFileSync(agAuthFile, JSON.stringify({ id_token_email: 'c@example.com', token: { access_token: 'ag-tok-3b', refresh_token: 'ag-rt-3', expiry: new Date(clock + 3600_000).toISOString() } }));
+      quotaStatus = 401;
+      const unauthSoft = await ag.read();
+      assert.ok(unauthSoft.soft && unauthSoft.authError && unauthSoft.tokenHash && unauthSoft.renewsFor, '401 on refreshable token is soft and carries tokenHash');
+      quotaStatus = 403;
+      quotaBodyText = JSON.stringify({ error: { status: 'UNAUTHENTICATED', details: [{ reason: 'ACCESS_TOKEN_EXPIRED' }] } });
+      const auth403Soft = await ag.read();
+      assert.ok(auth403Soft.soft && auth403Soft.authError && auth403Soft.tokenHash, 'auth-403 on refreshable token is soft and carries tokenHash');
+      quotaBodyText = JSON.stringify({ error: { status: 'PERMISSION_DENIED', details: [{ reason: 'SUBSCRIPTION_REQUIRED' }] } });
+      const perm403Hard = await ag.read();
+      assert.ok(!perm403Hard.soft && !perm403Hard.authError && perm403Hard.tokenHash && /access denied/i.test(perm403Hard.error), 'plain 403 on refreshable token stays hard');
+      quotaBodyText = null;
+      quotaStatus = 200;
+      sentAuth.length = 0;
 
       // Missing or broken credentials mark signedOut cleanly without hitting the network.
       for (const body of ['{}', 'bad json', null]) {
@@ -3166,7 +3184,7 @@ async function antigravityMainChecks() {
           await inst.readOne(wrappedAg, true);
           quotaAnswer = quota429;
           await inst.readOne(wrappedAg, true);
-          writeAg('r13-ren@example.com', 'r13-ren-t1', { refresh_token: 'r13-ren-rt', expiry: '2020-01-01T00:00:00Z' });
+          writeAg('r13-ren@example.com', 'r13-ren-t1', { expiry: '2020-01-01T00:00:00Z' });
           await inst.readOne(wrappedAg, true);
           assert.match(shown(inst).error, /Session expired/);
           writeBare({ access_token: 'r13-ren-t2', refresh_token: 'r13-ren-rt' });
@@ -6963,6 +6981,607 @@ async function antigravityMainChecks() {
             assert.strictEqual(asked(sentBearers, 'r55-b-1'), 1, 'automatic poll at +15s respects B five-minute polling floor even when gate was already cleared');
             inst.on['will-quit']();
           } finally {
+            Date.now = clockWas;
+            quotaAnswer = quotaAt(0.5);
+          }
+        }
+
+        // Refreshable Antigravity tokens (refresh_token present): 1-hour access token expiry stays quiet (keeps last
+        // good quota bars without "Session expired"), paces credential checks on the 5-minute cadence, releases cached
+        // rows across restarts for the same account (never leaking across accounts), retries on mid-flight rotation,
+        // and still surfaces 403 permission denials and respects 429 cooldowns.
+        {
+          let clock = clockWas();
+          Date.now = () => clock;
+          const permBody = JSON.stringify({ error: { status: 'PERMISSION_DENIED', details: [{ reason: 'SUBSCRIPTION_REQUIRED' }] } });
+          try {
+            // 1. Idle 1h expiry keeps cached rows quietly, makes 0 network calls, paces cred checks (no 15s spin), and
+            // resumes live polling as soon as Antigravity rotates the token.
+            {
+              let inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-idle@example.com', 'rf-idle-1', { refresh_token: 'rf-idle-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: initial 30%`);
+              }
+
+              // Advance past 1h expiry: next tick sees expired refreshable token, makes 0 quota calls, keeps 30% quietly.
+              let peeks = 0;
+              peekHook = (orig) => (peeks++, orig());
+              clock += 3600_000 + 60_000;
+              const sentBefore = sentBearers.length;
+              await inst.readOne(wrappedAg, false);
+              assert.deepStrictEqual([peeks, sentBearers.length], [1, sentBefore], 'checks cred once and sends no quota request');
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent, s.waitMs], [undefined, 30, 0], `${where}: keeps 30% with no Session expired`);
+              }
+
+              // Subsequent 15s ticks must NOT spin peekCred while still inside the 5-minute cadence.
+              clock += 15_000;
+              await inst.readOne(wrappedAg, false);
+              clock += 60_000;
+              await inst.readOne(wrappedAg, false);
+              assert.strictEqual(peeks, 1, 'no credential lookup spin between 5-minute checks');
+
+              // After restart with the same expired refreshable token, cached 30% is released (not hidden, not Session expired).
+              phone.close();
+              inst.flushState();
+              inst.on['will-quit']();
+              providersMod.clearAntigravityAliases();
+              providersMod.clearAntigravityTierGates();
+              wrappedAg.onSignedOut();
+              inst = loadInstance();
+              inst.loadState();
+              const phone2 = phoneSees(inst);
+              await inst.readOne(wrappedAg, false);
+              assert.strictEqual(sentBearers.length, sentBefore, 'restart with expired refreshable token makes no quota request');
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone2.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: restart releases cached 30% quietly`);
+              }
+
+              // Antigravity rotates token after 5 minutes -> next automatic tick immediately fetches live 45%.
+              writeAg('rf-idle@example.com', 'rf-idle-2', { refresh_token: 'rf-idle-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.55);
+              clock += wrappedAg.everyMs;
+              await inst.readOne(wrappedAg, false);
+              assert.strictEqual(sentBearers.at(-1), 'Bearer rf-idle-2', 'resumes live quota read once token rotates');
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone2.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 45], `${where}: updates to live 45%`);
+              }
+
+              // Switching to another account B whose token is already expired (with refresh_token) drops A's 45% without
+              // showing Session expired.
+              writeAg('rf-other@example.com', 'rf-other-1', { refresh_token: 'rf-other-rt', expiry: '2020-01-01T00:00:00Z' });
+              await inst.readOne(wrappedAg, true);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone2.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows.length], [undefined, 0], `${where}: account switch drops old rows without Session expired`);
+              }
+              peekHook = null;
+              phone2.close();
+              inst.on['will-quit']();
+            }
+
+            // 2. Server 401 on a refreshable token stays quiet; mid-flight token rotation immediately retries with the
+            // replacement bearer; mid-flight refresh_token addition/removal aligns with post-fetch credential state.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-401@example.com', 'rf-401-1', { refresh_token: 'rf-401-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+
+              // Same bearer gets 401 -> stays quiet, keeps 30%.
+              quotaAnswer = () => ({ ok: false, status: 401, headers: new Headers() });
+              await inst.readOne(wrappedAg, true);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: 401 on refreshable token stays quiet`);
+              }
+
+              // Mid-flight rotation while 401 is out -> immediately retries once with rf-401-2 and publishes 60%!
+              const h401 = holdOnce('rf-401-1', () => ({ ok: false, status: 401, headers: new Headers() }));
+              quotaAnswer = quotaAt(0.4);
+              const reqRot = inst.readOne(wrappedAg, true);
+              await until(() => h401.release);
+              writeAg('rf-401@example.com', 'rf-401-2', { refresh_token: 'rf-401-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              h401.release();
+              await reqRot;
+              assert.strictEqual(sentBearers.at(-1), 'Bearer rf-401-2', 'retries once with rotated bearer after soft 401');
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 60], `${where}: rotated bearer publishes 60%`);
+              }
+
+              // Mid-flight refresh_token removal on same bearer while 401 is out -> promotes to hard Session expired.
+              const hRem = holdOnce('rf-401-2', () => ({ ok: false, status: 401, headers: new Headers() }));
+              const reqRem = inst.readOne(wrappedAg, true);
+              await until(() => hRem.release);
+              writeAg('rf-401@example.com', 'rf-401-2', { expiry: new Date(clock + 3600_000).toISOString() });
+              hRem.release();
+              await reqRem;
+              assert.match(shown(inst).error || '', /Session expired/, 'removing refresh_token mid-flight promotes 401 to Session expired');
+
+              // Mid-flight refresh_token addition on same bearer while 401 is out -> softens and lifts Session expired.
+              const hAdd = holdOnce('rf-401-2', () => ({ ok: false, status: 401, headers: new Headers() }));
+              const reqAdd = inst.readOne(wrappedAg, true);
+              await until(() => hAdd.release);
+              writeAg('rf-401@example.com', 'rf-401-2', { refresh_token: 'rf-401-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              hAdd.release();
+              await reqAdd;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 60], `${where}: adding refresh_token mid-flight softens 401 and restores 60%`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 3. 403 Permission Denied still surfaces and survives local expiry on the same bearer; 429 cooldown holds
+            // beside cached rows on local expiry and resumes right as cooldown lifts; lookup error after expiry stays quiet.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-perm@example.com', 'rf-perm-1', { refresh_token: 'rf-perm-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+
+              // Lookup failure after local expiry of a refreshable token must NOT replace 30% with Session expired!
+              clock += 15_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+              await inst.readOne(wrappedAg, true);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: failed lookup past refreshable expiry keeps 30%`);
+              }
+
+              // Fresh token gets 403 Permission Denied -> stays shown even after that bearer expires locally.
+              writeAg('rf-perm@example.com', 'rf-perm-2', { refresh_token: 'rf-perm-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = () => ({ ok: false, status: 403, headers: new Headers(), text: async () => permBody });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /access denied/i, '403 permission denial shows on refreshable token');
+              clock += 15_000;
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /access denied/i, '403 permission denial persists when same bearer expires');
+
+              // Rotating to another expired refreshable bearer lifts the old bearer's 403 and restores cached 30%.
+              writeAg('rf-perm@example.com', 'rf-perm-3', { refresh_token: 'rf-perm-rt', expiry: '2020-01-01T00:00:00Z' });
+              await inst.readOne(wrappedAg, true);
+              assert.deepStrictEqual([shown(inst).error, shown(inst).rows[0]?.percent], [undefined, 30], 'new bearer lifts old bearer 403');
+
+              // 429 cooldown with expired refreshable token keeps 30% + waitMs > 0, and checks immediately when cooldown lifts.
+              writeAg('rf-perm@example.com', 'rf-perm-4', { refresh_token: 'rf-perm-rt', expiry: new Date(clock + 30_000).toISOString() });
+              quotaAnswer = quota429; // 120s Retry-After
+              await inst.readOne(wrappedAg, true);
+              clock += 60_000; // past 30s expiry, still inside 120s cooldown
+              await inst.readOne(wrappedAg, false);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent, s.waitMs > 0], [undefined, 30, true], `${where}: expired refreshable token during 429 keeps 30% and waitMs`);
+              }
+              writeAg('rf-perm@example.com', 'rf-perm-5', { refresh_token: 'rf-perm-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.2);
+              clock += 60_000; // cooldown just lifted (only 60s since last check, well under 5m!)
+              await inst.readOne(wrappedAg, false);
+              assert.strictEqual(sentBearers.at(-1), 'Bearer rf-perm-5', 'checks immediately as 429 lifts and fetches with rotated token');
+              assert.deepStrictEqual([shown(inst).error, shown(inst).rows[0]?.percent, shown(inst).waitMs], [undefined, 80, 0]);
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 4. Review fix 1: soft 401s record & sequence bearer rejection before post-fetch lookup, preserve existing
+            // 403 permission denials behind newer soft 401s, block older delayed 403s after A -> B -> A, and surface
+            // Session expired (including across restart) if refresh_token was removed by a joining check before post-fetch fails.
+            {
+              // 4a. Hold 401 + Retry-After: 600 on refreshable bearer, remove refresh_token + joining check, fail post-fetch.
+              let inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r1a@example.com', 'rf-r1a-1', { refresh_token: 'rf-r1a-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+
+              const h401 = holdOnce('rf-r1a-1', () => ({ ok: false, status: 401, headers: new Headers({ 'retry-after': '600' }) }));
+              const req = inst.readOne(wrappedAg, true);
+              await until(() => h401.release);
+              writeAg('rf-r1a@example.com', 'rf-r1a-1', { expiry: new Date(clock + 3600_000).toISOString() });
+              const join = inst.readOne(wrappedAg, true);
+              await settle();
+              peekHook = async () => ({ status: 'error', error: 'lookup failed', soft: true });
+              h401.release();
+              await Promise.all([req, join]);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.ok(/Session expired/i.test(s.error || '') && !s.rows.length && s.waitMs === 0, `${where}: surfaces Session expired when refresh_token removed before failed post-fetch`);
+              }
+              // Survives restart during the 600s cooldown:
+              phone.close();
+              inst.flushState();
+              inst.on['will-quit']();
+              providersMod.clearAntigravityAliases();
+              providersMod.clearAntigravityTierGates();
+              wrappedAg.onSignedOut();
+              inst = loadInstance();
+              inst.loadState();
+              await inst.readOne(wrappedAg, false);
+              assert.ok(/Session expired/i.test(shown(inst).error || '') && !shown(inst).rows.length, 'persists Session expired across restart during cooldown');
+              inst.on['will-quit']();
+
+              // 4b. Delayed 403 permission denial after A -> B -> A cannot overwrite a newer soft 401; existing 403
+              // before a newer soft 401 IS preserved.
+              const inst2 = fresh();
+              writeAg('rf-r1b@example.com', 'rf-r1b-a1', { refresh_token: 'rf-r1b-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst2.readOne(wrappedAg, true);
+              const hOld403 = holdOnce('rf-r1b-a1', () => ({ ok: false, status: 403, headers: new Headers(), text: async () => permBody }));
+              const reqOld403 = inst2.readOne(wrappedAg, true);
+              await until(() => hOld403.release);
+              // Rotate A1 -> A2 -> A1 and get a newer soft 401 on A1:
+              writeAg('rf-r1b@example.com', 'rf-r1b-a2', { refresh_token: 'rf-r1b-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.6);
+              await inst2.readOne(wrappedAg, true);
+              writeAg('rf-r1b@example.com', 'rf-r1b-a1', { refresh_token: 'rf-r1b-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = () => ({ ok: false, status: 401, headers: new Headers() });
+              await inst2.readOne(wrappedAg, true);
+              // Release delayed older 403: must NOT overwrite newer soft 401!
+              hOld403.release();
+              await reqOld403;
+              assert.deepStrictEqual([shown(inst2).error, shown(inst2).rows[0]?.percent], [undefined, 40], 'older delayed 403 cannot overwrite newer soft 401');
+              // Existing 403 followed by a newer soft 401 preserves the 403 permission denial:
+              quotaAnswer = () => ({ ok: false, status: 403, headers: new Headers(), text: async () => permBody });
+              await inst2.readOne(wrappedAg, true);
+              assert.match(shown(inst2).error || '', /access denied/i);
+              quotaAnswer = () => ({ ok: false, status: 401, headers: new Headers() });
+              await inst2.readOne(wrappedAg, true);
+              assert.match(shown(inst2).error || '', /access denied/i, 'newer soft 401 preserves existing 403 permission denial');
+              inst2.on['will-quit']();
+            }
+
+            // 5. Review fix 2: retain verified bearer & refresh flag through soft expiry so late 403 reconciles
+            // immediately and late 401 after failed lookups does not fall back to pre-join non-refreshable cred.
+            {
+              // 5a. Hold 403, let refreshable bearer expire, force check before releasing 403 -> surfaces 403 immediately.
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r2a@example.com', 'rf-r2a-1', { refresh_token: 'rf-r2a-rt', expiry: new Date(clock + 5_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+              const h403 = holdOnce('rf-r2a-1', () => ({ ok: false, status: 403, headers: new Headers(), text: async () => permBody }));
+              const req403 = inst.readOne(wrappedAg, true);
+              await until(() => h403.release);
+              clock += 10_000;
+              await inst.readOne(wrappedAg, true); // soft expiry runs applyExpired
+              assert.deepStrictEqual([shown(inst).error, shown(inst).rows[0]?.percent], [undefined, 30]);
+              h403.release();
+              await req403;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.ok(/access denied/i.test(s.error || '') && !s.rows.length, `${where}: late 403 reconciles immediately after soft expiry`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+
+              // 5b. Start without refresh_token, add refresh_token via joining check, expire, fail next two lookups -> late 401 stays quiet!
+              const inst2 = fresh();
+              const phone2 = phoneSees(inst2);
+              writeAg('rf-r2b@example.com', 'rf-r2b-1', { expiry: new Date(clock + 5_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst2.readOne(wrappedAg, true);
+              const h401 = holdOnce('rf-r2b-1', () => ({ ok: false, status: 401, headers: new Headers() }));
+              const req401 = inst2.readOne(wrappedAg, true);
+              await until(() => h401.release);
+              writeAg('rf-r2b@example.com', 'rf-r2b-1', { refresh_token: 'rf-r2b-rt', expiry: new Date(clock + 5_000).toISOString() });
+              const join = inst2.readOne(wrappedAg, true);
+              await settle();
+              clock += 10_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup failed', soft: true });
+              const fail1 = inst2.readOne(wrappedAg, true);
+              await settle();
+              h401.release();
+              await Promise.all([req401, join, fail1]);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst2)], ['desktop', desk(inst2)], ['phone', phone2.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: late 401 after failed lookups honors joined refresh_token`);
+              }
+              phone2.close();
+              inst2.on['will-quit']();
+            }
+
+            // 6. Review fix 3: adding refresh_token mid-flight lifts obsolete Session expired even when the quota
+            // response is a 503 with Retry-After, restoring cached bars and cooldown countdown.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r3@example.com', 'rf-r3-1', { expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+              quotaAnswer = () => ({ ok: false, status: 401, headers: new Headers() });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /Session expired/);
+
+              const h503 = holdOnce('rf-r3-1', () => ({ ok: false, status: 503, headers: new Headers({ 'retry-after': '120' }) }));
+              const req503 = inst.readOne(wrappedAg, true);
+              await until(() => h503.release);
+              writeAg('rf-r3@example.com', 'rf-r3-1', { refresh_token: 'rf-r3-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              h503.release();
+              await req503;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent, s.waitMs > 0], [undefined, 30, true], `${where}: 503 with Retry-After after adding refresh_token lifts Session expired and shows cooldown`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 7. Review fix 4: prior non-bearer error ("No usage windows reported.") restores verified same-account
+            // cache on both soft-expiry paths (HTTP 401 and local expiry).
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r4@example.com', 'rf-r4-1', { refresh_token: 'rf-r4-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+
+              // Empty groups -> "No usage windows reported.", then soft HTTP 401 -> restores cached 30%!
+              quotaAnswer = () => ({ ok: true, json: async () => ({ groups: [] }) });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /No usage windows/);
+              quotaAnswer = () => ({ ok: false, status: 401, headers: new Headers() });
+              await inst.readOne(wrappedAg, true);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: soft 401 restores same-account cache over empty-groups error`);
+              }
+
+              // Empty groups again, then local expiry -> restores cached 30%!
+              quotaAnswer = () => ({ ok: true, json: async () => ({ groups: [] }) });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /No usage windows/);
+              clock += 15_000;
+              await inst.readOne(wrappedAg, true);
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: local soft expiry restores same-account cache over empty-groups error`);
+              }
+
+              // Re-check fix 1a: failed credential lookup after refreshable bearer expires also restores cached 30% over empty-groups error.
+              writeAg('rf-r4@example.com', 'rf-r4-2', { refresh_token: 'rf-r4-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = () => ({ ok: true, json: async () => ({ groups: [] }) });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /No usage windows/);
+              clock += 15_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+              await inst.readOne(wrappedAg, true);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: failed lookup past refreshable expiry restores same-account cache over empty-groups error`);
+              }
+
+              // Re-check fix 1b: in-flight 503 with Retry-After whose post-fetch lookup fails after refreshable expiry
+              // restores cached 30% over empty-groups error and shows cooldown.
+              writeAg('rf-r4@example.com', 'rf-r4-3', { refresh_token: 'rf-r4-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = () => ({ ok: true, json: async () => ({ groups: [] }) });
+              await inst.readOne(wrappedAg, true);
+              assert.match(shown(inst).error || '', /No usage windows/);
+              const h503 = holdOnce('rf-r4-3', () => ({ ok: false, status: 503, headers: new Headers({ 'retry-after': '120' }) }));
+              const req503 = inst.readOne(wrappedAg, true);
+              await until(() => h503.release);
+              clock += 15_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+              h503.release();
+              await req503;
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent, s.waitMs > 0], [undefined, 30, true], `${where}: 503 + failed post-fetch past refreshable expiry restores cache and arms cooldown`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 8. Re-check fix 2: skipping a duplicate quota request after another read just published still saves
+            // newly verified refresh_token metadata onto activeToken so later expiry + lookup timeout stays quiet.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r8@example.com', 'rf-r8-1', { expiry: new Date(clock + 10_000).toISOString() });
+              const h200 = holdOnce('rf-r8-1', quotaAt(0.7));
+              const req1 = inst.readOne(wrappedAg, true);
+              await until(() => h200.release);
+
+              // Start a manual refresh whose first peekCred is held while req1 finishes and publishes 30%.
+              let releasePeek1;
+              let peekCount = 0;
+              peekHook = (orig) => {
+                peekCount++;
+                if (peekCount === 1) return new Promise((r) => (releasePeek1 = () => r(orig())));
+                return orig();
+              };
+              const req2 = inst.readOne(wrappedAg, true);
+              await until(() => releasePeek1);
+              h200.release();
+              await req1;
+              // Add refresh_token before req2 rechecks (attempt 1) and skips duplicate fetch:
+              writeAg('rf-r8@example.com', 'rf-r8-1', { refresh_token: 'rf-r8-rt', expiry: new Date(clock + 10_000).toISOString() });
+              releasePeek1();
+              await req2;
+              peekHook = null;
+
+              // Expire the bearer and fail the next lookup -> must keep 30%, NOT show Session expired!
+              clock += 15_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+              await inst.readOne(wrappedAg, true);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows[0]?.percent], [undefined, 30], `${where}: duplicate-skip refresh saves newly verified refresh_token`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 9. Round 3 fix 1: late 503 with failed post-fetch lookup must NOT undo confirmed hard Session expired
+            // after refresh_token was removed via a joining check and a failed lookup triggered expireActiveToken.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-r9@example.com', 'rf-r9-1', { refresh_token: 'rf-r9-rt', expiry: new Date(clock + 10_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+
+              // Hold 503 + Retry-After: 120, remove refresh_token, force joining check to record hasRefresh: false:
+              const h503 = holdOnce('rf-r9-1', () => ({ ok: false, status: 503, headers: new Headers({ 'retry-after': '120' }) }));
+              const req503 = inst.readOne(wrappedAg, true);
+              await until(() => h503.release);
+              writeAg('rf-r9@example.com', 'rf-r9-1', { expiry: new Date(clock + 10_000).toISOString() });
+              const join = inst.readOne(wrappedAg, true);
+              await settle();
+
+              // Advance past expiry and fail another lookup -> UI shows hard Session expired:
+              clock += 15_000;
+              peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+              const failExp = inst.readOne(wrappedAg, true);
+              await until(() => /Session expired/i.test(shown(inst).error || ''));
+              assert.ok(/Session expired/i.test(shown(inst).error || '') && !shown(inst).rows.length && shown(inst).waitMs === 0);
+
+              // Release 503 with post-fetch lookup also failing -> must STAY Session expired with waitMs === 0!
+              h503.release();
+              await Promise.all([req503, join, failExp]);
+              peekHook = null;
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.ok(/Session expired/i.test(s.error || '') && !s.rows.length && s.waitMs === 0, `${where}: late 503 with failed post-fetch does not undo confirmed hard Session expired`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+
+            // 10. Round 3 fix 2: blank/whitespace refresh_token never links distinct accounts or leaks cached quota,
+            // and saved state.json alias groups / cache entries tainted by a blank-token key are invalidated on load.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              writeAg('rf-blank-a@example.com', 'rf-blank-a1', { refresh_token: ' ', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+              writeAg('rf-blank-b@example.com', 'rf-blank-b1', { refresh_token: ' ', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.4);
+              await inst.readOne(wrappedAg, true);
+              writeAg('rf-blank-a@example.com', 'rf-blank-a1', { refresh_token: ' ', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.7);
+              await inst.readOne(wrappedAg, true);
+              assert.strictEqual(shown(inst).rows[0]?.percent, 30, 'A quota cached at 30%');
+
+              // Switch to B with a real refresh_token and an already-expired expiry: must NOT show A's 30%!
+              writeAg('rf-blank-b@example.com', 'rf-blank-b1', { refresh_token: 'rf-blank-b-rt', expiry: '2020-01-01T00:00:00Z' });
+              const sentBefore = sentBearers.length;
+              await inst.readOne(wrappedAg, true);
+              assert.strictEqual(sentBearers.length, sentBefore, 'expired refreshable B makes no network call');
+              for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                assert.deepStrictEqual([s.error, s.rows.length], [undefined, 0], `${where}: B does not inherit A quota through blank refresh_token`);
+              }
+              phone.close();
+              inst.on['will-quit']();
+
+              // Round 4 fixes 1 & 2: legacy state.json (no antigravityIdentityVersion) with arbitrary whitespace-only
+              // refresh token (" \t ") linking A and B plus A's cached quota and quota/tier cooldowns discards all
+              // legacy Antigravity cache, identity links, and cooldowns on upgrade so B neither inherits A's bars nor
+              // waits on A's cooldowns.
+              const hashA = keyOf('rf-leg-a@example.com');
+              const hashB = keyOf('rf-leg-b@example.com');
+              const hashWeirdBlank = keyOf(' \t ');
+              const { antigravityIdentityVersion: _v, ...legacyBase } = clean;
+              const legacyState = {
+                ...legacyBase,
+                cache: { antigravity: { plan: 'AI Pro', rows: [{ label: 'Gemini 5h', percent: 30, resetsAt: null }], renewsFor: hashA, gateKeys: [hashA, hashWeirdBlank, `tok:${keyOf('rf-leg-a1')}`, hashB, `tok:${keyOf('rf-leg-b1')}`], updatedAt: clock } },
+                accountLinks: { antigravity: [[hashA, hashWeirdBlank, `tok:${keyOf('rf-leg-a1')}`, hashB, `tok:${keyOf('rf-leg-b1')}`]] },
+                accountGates: { antigravity: [{ until: clock + 600_000, keys: [hashA, hashWeirdBlank, hashB, `tok:${keyOf('rf-leg-b1')}`], origin: [hashA, hashWeirdBlank, hashB] }] },
+                tierGates: { antigravity: [{ until: clock + 600_000, keys: [hashA, hashWeirdBlank, hashB, `tok:${keyOf('rf-leg-b1')}`], origin: [hashA, hashWeirdBlank, hashB] }] },
+                signedIn: { antigravity: hashA },
+              };
+              fs.writeFileSync(statePathR15, JSON.stringify(legacyState));
+              providersMod.clearAntigravityAliases();
+              providersMod.clearAntigravityTierGates();
+              wrappedAg.onSignedOut();
+              const inst2 = loadInstance();
+              inst2.loadState();
+              writeAg('rf-leg-b@example.com', 'rf-leg-b1', { refresh_token: 'rf-leg-b-rt', expiry: '2020-01-01T00:00:00Z' });
+              await inst2.readOne(wrappedAg, true);
+              assert.deepStrictEqual([shown(inst2).error, shown(inst2).rows.length, shown(inst2).waitMs], [undefined, 0, 0], 'legacy arbitrary-whitespace cache, links, and cooldowns are discarded on upgrade');
+              // Valid B token immediately queries quota AND tier without being held by A's old cooldowns:
+              writeAg('rf-leg-b@example.com', 'rf-leg-b2', { refresh_token: 'rf-leg-b-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              quotaAnswer = quotaAt(0.5);
+              const tierBeforeLeg = tierBearers.length;
+              await inst2.readOne(wrappedAg, true);
+              await settle();
+              assert.strictEqual(sentBearers.at(-1), 'Bearer rf-leg-b2', 'B is not blocked by legacy A quota cooldown');
+              assert.strictEqual(tierBearers.length, tierBeforeLeg + 1, 'B is not blocked by legacy A tier cooldown');
+              inst2.on['will-quit']();
+
+              // Defense in depth on v2 state: a cooldown record contaminated by a blank-token key (" ") is completely
+              // removed from both quota and tier cooldown lists instead of becoming an ownerless gate that blocks B.
+              const hashSpace = keyOf(' ');
+              const v2Contam = {
+                ...clean,
+                antigravityIdentityVersion: 2,
+                accountLinks: { antigravity: [[hashA, hashSpace, hashB]] },
+                accountGates: { antigravity: [{ until: clock + 600_000, keys: [hashA, hashSpace, hashB, `tok:${keyOf('rf-v2-b1')}`], origin: [hashA, hashSpace, hashB] }] },
+                tierGates: { antigravity: [{ until: clock + 600_000, keys: [hashA, hashSpace, hashB, `tok:${keyOf('rf-v2-b1')}`], origin: [hashA, hashSpace, hashB] }] },
+              };
+              fs.writeFileSync(statePathR15, JSON.stringify(v2Contam));
+              providersMod.clearAntigravityAliases();
+              providersMod.clearAntigravityTierGates();
+              wrappedAg.onSignedOut();
+              const inst3 = loadInstance();
+              inst3.loadState();
+              writeAg('rf-leg-b@example.com', 'rf-v2-b1', { refresh_token: 'rf-v2-b-rt', expiry: new Date(clock + 3600_000).toISOString() });
+              const tierBeforeV2 = tierBearers.length;
+              await inst3.readOne(wrappedAg, true);
+              await settle();
+              assert.strictEqual(sentBearers.at(-1), 'Bearer rf-v2-b1', 'purged blank-token quota cooldown does not block B');
+              assert.strictEqual(tierBearers.length, tierBeforeV2 + 1, 'purged blank-token tier cooldown does not block B');
+              assert.strictEqual(shown(inst3).waitMs, 0);
+              inst3.on['will-quit']();
+            }
+
+            // 11. Round 3 fix 3 & Round 4 fix 3: an unexpired joining check immediately clears a local Session expired
+            // note, restores verified same-account cached bars, and renames cache so a background tier upgrade folds in
+            // immediately even when the joining credential drops id_token_email.
+            {
+              const inst = fresh();
+              const phone = phoneSees(inst);
+              const savedTierAns = tierAnswer;
+              try {
+                tierAnswer = () => ({ ok: true, json: async () => ({ paidTier: { id: 'g1-pro-tier', name: 'Google AI Pro' } }) });
+                writeAg('rf-r11@example.com', 'rf-r11-0', { refresh_token: 'rf-r11-rt', expiry: new Date(clock + 3600_000).toISOString() });
+                quotaAnswer = quotaAt(0.7);
+                await inst.readOne(wrappedAg, true);
+                await settle();
+                await inst.readOne(wrappedAg, false);
+                assert.strictEqual(shown(inst).plan, 'AI Pro', 'initial cached plan is AI Pro');
+
+                // Rotate bearer (without refresh_token), hold quota request, and let its tier lookup return AI Ultra:
+                tierAnswer = () => ({ ok: true, json: async () => ({ paidTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' } }) });
+                writeAg('rf-r11@example.com', 'rf-r11-1', { expiry: new Date(clock + 10_000).toISOString() });
+                const hSlow = holdOnce('rf-r11-1', quotaAt(0.5));
+                const reqSlow = inst.readOne(wrappedAg, true);
+                await until(() => hSlow.release);
+                await settle(); // background loadCodeAssist settles with AI Ultra while quota is still held
+
+                // Let bearer expire, fail refresh lookup -> local Session expired shows:
+                clock += 15_000;
+                peekHook = async () => ({ status: 'error', error: 'lookup timed out', soft: true });
+                const reqFail = inst.readOne(wrappedAg, true);
+                await until(() => /Session expired/i.test(shown(inst).error || ''));
+                peekHook = null;
+
+                // Update same bearer with future expiry + refresh_token and NO email -> joining check immediately clears
+                // Session expired, restores cached 30%, AND folds AI Ultra BEFORE hSlow is released!
+                writeBare({ access_token: 'rf-r11-1', refresh_token: 'rf-r11-rt', expiry: new Date(clock + 3600_000).toISOString() });
+                const reqJoin = inst.readOne(wrappedAg, true);
+                await until(() => !shown(inst).error && shown(inst).rows[0]?.percent === 30);
+                for (const [where, s] of [['snapshot', shown(inst)], ['desktop', desk(inst)], ['phone', phone.last()]]) {
+                  assert.deepStrictEqual([s.error, s.rows[0]?.percent, s.plan], [undefined, 30, 'AI Ultra'], `${where}: unexpired email-less join clears Session expired and folds AI Ultra immediately`);
+                }
+                hSlow.release();
+                await Promise.all([reqSlow, reqFail, reqJoin]);
+              } finally {
+                tierAnswer = savedTierAns;
+              }
+              phone.close();
+              inst.on['will-quit']();
+            }
+          } finally {
+            peekHook = null;
             Date.now = clockWas;
             quotaAnswer = quotaAt(0.5);
           }

@@ -71,6 +71,9 @@ It queries `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummar
 and weekly buckets across both model groups (`Gemini 5h`, `Gemini wk`, `Other 5h`, `Other wk`),
 converting `remainingFraction` into percentage used, and reads the subscription tier once per token
 from `v1internal:loadCodeAssist`. Like Claude, the overlay never mutates Antigravity's credentials.
+When a `refresh_token` is present and the 1-hour access token lapses while Antigravity is idle, the
+overlay keeps the account's last known numbers quietly (showing only the normal age note past ten
+minutes) and resumes live reads once Antigravity rotates the token.
 
 CPU and RAM are this PC, so the phone can see them too. CPU is the load across every core since the
 last read, so the first read samples half a second. It is Windows' "% Processor Time", and Task

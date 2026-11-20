@@ -119,7 +119,8 @@ const inflightToken = new Map(); // id -> bearer token hash the in-flight read w
 let publishSeq = 0;
 const publishedQuota = new Map(); // id -> { seq, tokenHash } of the last confirmed non-error quota publish
 const activeKeys = new Map(); // id -> backoff keys of the credential the last accepted check found
-const activeToken = new Map(); // id -> { tokenHash, expiry } of the last verified unexpired credential
+const activeToken = new Map(); // id -> { tokenHash, expiry, hasRefresh } of the last verified unexpired credential
+const expiredCred = new Set(); // providers whose refreshable token is locally expired (paces cred checks without surfacing an error)
 const accountGen = new Map(); // id -> incremented on account switch/sign-out so abandoned in-flight responses are discarded
 // id -> how many times it was switched off. A lookup begun before one never retries, though it is back on by then: the
 // credential check after the switch-on may still be out, and the bearer the lookup carries may be another account's.
@@ -150,6 +151,7 @@ function readState() {
   }
   return {};
 }
+const ANTIGRAVITY_IDENTITY_VERSION = 2; // v2 rejects whitespace-only refresh/access tokens in identity, links & gates
 let saveTimer = null;
 let pending = {};
 function saveState(patch) {
@@ -169,7 +171,7 @@ function flushState() {
   const tmp = statePath() + '.tmp';
   try {
     fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify({ ...readState(), ...pending }), { flush: true });
+    fs.writeFileSync(tmp, JSON.stringify({ ...readState(), ...pending, antigravityIdentityVersion: ANTIGRAVITY_IDENTITY_VERSION }), { flush: true });
     fs.renameSync(tmp, statePath());
     pending = {};
   } catch {
@@ -330,7 +332,11 @@ function bumpGen(id) {
 const authRejectedState = () => Object.fromEntries(
   [...authRejected]
     .filter(([, m]) => m.size)
-    .map(([id, m]) => [id, Object.fromEntries([...m].map(([h, v]) => [h, { error: v.error, ...(v.authError ? { authError: true } : {}) }]))]),
+    .map(([id, m]) => [id, Object.fromEntries([...m].map(([h, v]) => [h, {
+      error: v.error,
+      ...(v.authError ? { authError: true } : {}),
+      ...(v.fallbackError ? { fallbackError: v.fallbackError } : {}),
+    }]))]),
 );
 const rejectedReading = (rej, tokenHash, account, gateKeys) => ({
   error: rej.error,
@@ -353,9 +359,13 @@ function setAuthRejected(id, tokenHash, error, seq, authError = false) {
   let m = authRejected.get(id);
   if (!m) authRejected.set(id, (m = new Map()));
   const cur = m.get(tokenHash);
-  if (cur && cur.error === error && !!cur.authError === !!authError && [...m.keys()].at(-1) === tokenHash) return true;
+  // Preserve an existing non-auth permission denial behind a newer auth refusal so a soft 401 on a refreshable
+  // bearer keeps the permission denial visible while a non-refreshable bearer still shows Session expired.
+  const fallbackError = authError ? (cur && !cur.authError ? cur.error : cur?.fallbackError) : undefined;
+  const next = { error, authError: !!authError, ...(fallbackError ? { fallbackError } : {}) };
+  if (cur && cur.error === next.error && !!cur.authError === next.authError && cur.fallbackError === next.fallbackError && [...m.keys()].at(-1) === tokenHash) return true;
   m.delete(tokenHash);
-  m.set(tokenHash, { error, authError: !!authError });
+  m.set(tokenHash, next);
   while (m.size > 20) m.delete(m.keys().next().value);
   saveState({ authRejected: authRejectedState() });
   return true;
@@ -370,12 +380,41 @@ function clearAuthRejected(id, tokenHash, seq) {
   return true;
 }
 
+// A 401/auth-403 rejection stored for a bearer is hidden while the credential carries a refresh_token (its 1-hour
+// access token only needs Antigravity to rotate it when next used), while any preserved 403 permission denial stays visible.
+function bearerRejection(id, cred) {
+  const rej = authRejected.get(id)?.get(cred.tokenHash);
+  if (!rej) return null;
+  if (cred.hasRefresh && rej.authError) {
+    return rej.fallbackError ? { error: rej.fallbackError, authError: false } : null;
+  }
+  return rej;
+}
+
+function restoreAccountCache(p, account, gateKeys) {
+  const saved = cache[p.id];
+  if (saved && !otherAccount(p, saved, account, gateKeys)) {
+    const mergedKeys = p.gateAliases ? provenKeys(p, saved.gateKeys, gateKeys) : saved.gateKeys;
+    const renamed = account && (saved.renewsFor !== account || (mergedKeys && !sameSet(mergedKeys, saved.gateKeys)))
+      ? { ...saved, renewsFor: account, ...(mergedKeys ? { gateKeys: mergedKeys } : {}) }
+      : saved;
+    if (renamed !== saved) {
+      cache[p.id] = renamed;
+      saveState({ cache });
+    }
+    last.set(p.id, renamed);
+  } else {
+    last.delete(p.id);
+  }
+}
+
 function applySignedOut(p, error, now = Date.now()) {
   bumpGen(p.id);
   p.onSignedOut?.();
   publishedQuota.delete(p.id);
   activeKeys.delete(p.id);
   activeToken.delete(p.id);
+  expiredCred.delete(p.id);
   rateCleared.delete(p.id);
   fetched.delete(p.id);
   fetchedFor.delete(p.id);
@@ -392,17 +431,39 @@ function applySignedOut(p, error, now = Date.now()) {
   push();
 }
 
-// The credential's token has run out: the sign-in note, under the account's keys so a replacement under its other name
-// (an email gone) still counts as this account. Reached before a request, from a refresh that would have joined one,
-// and after one, whose answer then goes unshown and unsaved. A 429's wait still holds the provider, off screen (snapshot), and
-// paces the looks for a valid token (readFresh), so one installed meanwhile is found the moment the wait lifts.
+// The credential's token has run out. When a refresh_token is present the session is still signed in and the 1-hour
+// access token simply lapsed while Antigravity sat idle, so keep this account's last good numbers quietly (preserving
+// any 403 permission denial and active cooldown) and pace credential checks on the normal cadence. Without a
+// refresh_token the bearer cannot self-renew, so surface the sign-in note, under the account's keys so a replacement
+// under its other name (an email gone) still counts as this account.
 function applyExpired(p, cred, now = Date.now()) {
   bumpGen(p.id);
-  activeToken.delete(p.id);
-  clearResetNotice(p.id);
+  // Retain the verified bearer and refresh flag through both soft and hard expiry so late in-flight responses for
+  // this bearer still reconcile against the latest verified credential metadata rather than stale pre-join state.
+  activeToken.set(p.id, { tokenHash: cred.tokenHash, expiry: cred.expiry, hasRefresh: !!cred.hasRefresh });
   unverified.delete(p.id);
   signedIn.set(p.id, cred.account);
   armGate(p, cred.gateKeys, now);
+  if (cred.hasRefresh) {
+    expiredCred.add(p.id);
+    credChecked.set(p.id, now);
+    const rej = bearerRejection(p.id, cred);
+    const curLast = last.get(p.id);
+    if (rej) {
+      if (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== cred.tokenHash) {
+        clearResetNotice(p.id);
+        last.set(p.id, rejectedReading(rej, cred.tokenHash, cred.account, cred.gateKeys));
+      }
+    } else {
+      if (curLast?.error && !curLast.signedOut) restoreAccountCache(p, cred.account, cred.gateKeys);
+      foldBgPlan(p, cred.account);
+    }
+    saveState({ signedIn: Object.fromEntries(signedIn), gate: Object.fromEntries(gate) });
+    push();
+    return;
+  }
+  expiredCred.delete(p.id);
+  clearResetNotice(p.id);
   last.set(p.id, { error: 'Session expired — open Antigravity.', renewsFor: cred.account, gateKeys: cred.gateKeys, expired: true });
   saveState({ signedIn: Object.fromEntries(signedIn), gate: Object.fromEntries(gate) });
   push();
@@ -429,12 +490,22 @@ function expireActiveToken(p, now = Date.now(), fallbackAccount = null, fallback
   const curTok = activeToken.get(p.id);
   if (!curTok || unverified.has(p.id)) return false;
   if (!(Number.isFinite(curTok.expiry) && curTok.expiry <= now)) return false;
-  activeToken.delete(p.id);
   const curLast = last.get(p.id);
-  if (curLast?.authError || curLast?.expired) return false;
-  clearResetNotice(p.id);
   const keys = activeKeys.get(p.id) || fallbackKeys || curLast?.gateKeys;
   const account = curLast?.renewsFor || signedIn.get(p.id) || fallbackAccount;
+  if (curTok.hasRefresh) {
+    // Retain verified refreshable metadata for in-flight response reconciliation, and restore same-account cache if
+    // a prior non-bearer error is still hiding it and no bearer denial applies.
+    if (curLast?.error && !curLast.signedOut && !bearerRejection(p.id, curTok)) {
+      restoreAccountCache(p, account, keys);
+      return true;
+    }
+    return false;
+  }
+  // Retain verified non-refreshable metadata too so a late in-flight response whose lookup also fails never falls
+  // back to an older pre-join credential that still had hasRefresh: true.
+  if (curLast?.authError || curLast?.expired) return false;
+  clearResetNotice(p.id);
   last.set(p.id, { error: 'Session expired — open Antigravity.', ...(account ? { renewsFor: account } : {}), ...(keys ? { gateKeys: keys } : {}), expired: true });
   return true;
 }
@@ -503,7 +574,19 @@ function readOne(p, force) {
         // nothing: the fresh read below shows the expiry and supersedes the request in flight.
         if (inflight.has(p.id) && !cred.expired && cred.tokenHash === inflightToken.get(p.id) && sameKeys(p, { gateKeys: inflightKeys.get(p.id) }, cred.gateKeys)) {
           activeKeys.set(p.id, cred.gateKeys);
-          activeToken.set(p.id, { tokenHash: cred.tokenHash, expiry: cred.expiry });
+          expiredCred.delete(p.id);
+          activeToken.set(p.id, { tokenHash: cred.tokenHash, expiry: cred.expiry, hasRefresh: !!cred.hasRefresh });
+          const curLast = last.get(p.id);
+          const rej = bearerRejection(p.id, cred);
+          if (rej && (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== cred.tokenHash)) {
+            clearResetNotice(p.id);
+            last.set(p.id, rejectedReading(rej, cred.tokenHash, cred.account, cred.gateKeys));
+            push();
+          } else if (!rej && (curLast?.expired || (cred.hasRefresh && curLast?.authError && curLast?.tokenHash === cred.tokenHash))) {
+            restoreAccountCache(p, cred.account, cred.gateKeys);
+            foldBgPlan(p, cred.account);
+            push();
+          }
           return inflight.get(p.id);
         }
         // On a recheck after another read published a fresh quota result for this exact account + bearer token
@@ -511,6 +594,9 @@ function readOne(p, force) {
         const pub = publishedQuota.get(p.id);
         const cur = last.get(p.id);
         if (attempt > 0 && !inflight.has(p.id) && !cred.expired && cur && !cur.error && !otherAccount(p, cur, cred.account, cred.gateKeys) && pub && pub.seq > startPublished && pub.tokenHash === cred.tokenHash) {
+          activeKeys.set(p.id, cred.gateKeys);
+          expiredCred.delete(p.id);
+          activeToken.set(p.id, { tokenHash: cred.tokenHash, expiry: cred.expiry, hasRefresh: !!cred.hasRefresh });
           return;
         }
         // Account switched, bearer token rotated, or no read in flight for current credentials: start a fresh read.
@@ -574,7 +660,7 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
         signedOutNow ? now - lastCheck >= p.everyMs :
         gatedNow ? now - lastCheck >= 60_000 :
         // An expired token: looked at again on the cadence, and as soon as a wait looked at under has lifted.
-        cur?.expired ? now - lastCheck >= p.everyMs || lastCheck < until :
+        (cur?.expired || expiredCred.has(p.id)) ? now - lastCheck >= p.everyMs || lastCheck < until :
         now - (fetched.get(p.id) || 0) >= p.everyMs
       );
       if (!credDue) return takeLocal(p);
@@ -617,11 +703,12 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
     // Check local token expiry BEFORE releasing unverified startup/re-enabled cache or folding background tier,
     // so a matching expired token never flashes stale cached quota before reporting session expiry.
     if (preCred.expired) return applyExpired(p, preCred, now);
-    activeToken.set(p.id, { tokenHash: preCred.tokenHash, expiry: preCred.expiry });
+    expiredCred.delete(p.id);
+    activeToken.set(p.id, { tokenHash: preCred.tokenHash, expiry: preCred.expiry, hasRefresh: !!preCred.hasRefresh });
     // The account's deadline under any key it has shown, so a rotated bearer or a dropped email can't skip the wait. Armed
     // before anything shows, so a wait left from another account (one before a switch-off) never shows beside this one.
     const held = armGate(p, preCred.gateKeys, now) > now;
-    const rej = authRejected.get(p.id)?.get(preCred.tokenHash);
+    const rej = bearerRejection(p.id, preCred);
     let restoredRej = false;
     const curLast = last.get(p.id);
     if (rej && (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== preCred.tokenHash)) {
@@ -693,7 +780,7 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
     // or a failed post-fetch check never loses the error AND a newer answer always beats a late older one even if superseded.
     let rejectedNow = false;
     let clearedNow = false;
-    if (res.error && !res.soft && res.tokenHash) {
+    if (res.error && res.tokenHash && (!res.soft || res.authError)) {
       rejectedNow = setAuthRejected(p.id, res.tokenHash, res.error, reqSeq, !!res.authError);
     } else if (curCred?.tokenHash && (!res.error || res.error === 'Rate limited' || !res.soft)) {
       clearedNow = clearAuthRejected(p.id, curCred.tokenHash, reqSeq);
@@ -734,8 +821,7 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
         if (curTok && curTok.tokenHash === curCred.tokenHash && !unverified.has(p.id)) {
           const tokExpired = Number.isFinite(curTok.expiry) && curTok.expiry <= Date.now();
           const curLast = last.get(p.id);
-          if (tokExpired) {
-            activeToken.delete(p.id);
+          if (tokExpired && !curTok.hasRefresh) {
             if (!curLast?.authError && !curLast?.expired) {
               clearResetNotice(p.id);
               const keys = p.gateAliases ? provenKeys(p, curCred.gateKeys, activeKeys.get(p.id)) : (activeKeys.get(p.id) || curCred.gateKeys);
@@ -744,17 +830,28 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
             }
           } else if (stillNewest) {
             if (rejectedNow && res.tokenHash === curCred.tokenHash) {
-              const rej = authRejected.get(p.id)?.get(res.tokenHash);
-              if (rej && (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== res.tokenHash)) {
-                clearResetNotice(p.id);
-                const keys = p.gateAliases ? provenKeys(p, curCred.gateKeys, activeKeys.get(p.id)) : (activeKeys.get(p.id) || curCred.gateKeys);
-                last.set(p.id, rejectedReading(rej, res.tokenHash, curLast?.renewsFor || signedIn.get(p.id) || curCred.account, keys));
+              const rej = bearerRejection(p.id, { tokenHash: res.tokenHash, hasRefresh: curTok.hasRefresh });
+              if (rej) {
+                if (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== res.tokenHash) {
+                  clearResetNotice(p.id);
+                  const keys = p.gateAliases ? provenKeys(p, curCred.gateKeys, activeKeys.get(p.id)) : (activeKeys.get(p.id) || curCred.gateKeys);
+                  last.set(p.id, rejectedReading(rej, res.tokenHash, curLast?.renewsFor || signedIn.get(p.id) || curCred.account, keys));
+                  changed = true;
+                }
+              } else if (curTok.hasRefresh && res.authError && curLast?.error && !curLast.signedOut && (curLast.tokenHash === curCred.tokenHash || curLast.expired || (!curLast.tokenHash && (!curLast.errSeq || reqSeq > curLast.errSeq)))) {
+                restoreAccountCache(p, curCred.account, curCred.gateKeys);
                 changed = true;
               }
             } else if (clearedNow && curLast?.error && !curLast.signedOut && (curLast.tokenHash === curCred.tokenHash || (!curLast.tokenHash && (!res.error || res.error === 'Rate limited') && reqSeq > (curLast.errSeq || 0)))) {
-              cache[p.id] && !otherAccount(p, cache[p.id], curCred.account, curCred.gateKeys) ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+              restoreAccountCache(p, curCred.account, curCred.gateKeys);
+              changed = true;
+            } else if (tokExpired && curTok.hasRefresh && curLast?.error && !curLast.signedOut && !bearerRejection(p.id, curTok)) {
+              restoreAccountCache(p, curLast?.renewsFor || signedIn.get(p.id) || curCred.account, curCred.gateKeys);
               changed = true;
             }
+          } else if (tokExpired && curTok.hasRefresh && curLast?.error && !curLast.signedOut && !bearerRejection(p.id, curTok)) {
+            restoreAccountCache(p, curLast?.renewsFor || signedIn.get(p.id) || curCred.account, curCred.gateKeys);
+            changed = true;
           }
         }
         if (changed) push();
@@ -774,20 +871,30 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
           }
           // The refused/denied bearer's reading goes at once, though the check failed: its error note, and no numbers.
           // Had another account signed in meanwhile, the next check that answers drops the note for it.
-          // Once the bearer's local expiry has passed, show Session expired (keeping Refresh enabled) rather than
-          // leaving cached rows behind a cooldown or overwriting expiry with a non-auth 403.
+          // Once a non-refreshable bearer's local expiry has passed, show Session expired (keeping Refresh enabled)
+          // rather than leaving cached rows behind a cooldown or overwriting expiry with a non-auth 403.
           const curTok = activeToken.get(p.id);
           const exp = curTok?.tokenHash === curCred.tokenHash ? curTok.expiry : curCred.expiry;
-          const tokExpired = !!last.get(p.id)?.expired || (Number.isFinite(exp) && exp <= Date.now());
-          if (tokExpired) {
-            activeToken.delete(p.id);
-            if (!last.get(p.id)?.authError && !last.get(p.id)?.expired) {
+          const hasRefresh = curTok?.tokenHash === curCred.tokenHash ? curTok.hasRefresh : !!curCred.hasRefresh;
+          const curLast = last.get(p.id);
+          const tokExpired = !!curLast?.expired || (Number.isFinite(exp) && exp <= Date.now());
+          if (tokExpired && !hasRefresh) {
+            if (!curLast?.authError && !curLast?.expired) {
               clearResetNotice(p.id);
               last.set(p.id, { error: 'Session expired — open Antigravity.', renewsFor: curCred.account, gateKeys: curCred.gateKeys, expired: true });
             }
           } else if (rejectedNow && stillNewest && res.tokenHash) {
-            clearResetNotice(p.id);
-            last.set(p.id, rejectedReading({ error: res.error, authError: !!res.authError }, res.tokenHash, curCred.account, curCred.gateKeys));
+            const rej = bearerRejection(p.id, { tokenHash: res.tokenHash, hasRefresh });
+            if (rej) {
+              if (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== res.tokenHash) {
+                clearResetNotice(p.id);
+                last.set(p.id, rejectedReading(rej, res.tokenHash, curCred.account, curCred.gateKeys));
+              }
+            } else if (hasRefresh && res.authError && curLast?.error && !curLast.signedOut && (curLast.tokenHash === curCred.tokenHash || curLast.expired || (!curLast.tokenHash && (!curLast.errSeq || reqSeq > curLast.errSeq)))) {
+              restoreAccountCache(p, curCred.account, curCred.gateKeys);
+            }
+          } else if (tokExpired && hasRefresh && curLast?.error && !curLast.signedOut && !bearerRejection(p.id, { tokenHash: curCred.tokenHash, hasRefresh })) {
+            restoreAccountCache(p, curCred.account, curCred.gateKeys);
           }
           credFailed(p, Date.now(), recordedUntil);
         } else if (afterCred?.status === 'signed_out') {
@@ -806,10 +913,11 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
           fetched.delete(p.id);
           fetchedFor.delete(p.id);
           if (afterCred.expired) return applyExpired(p, afterCred);
-          activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry });
+          expiredCred.delete(p.id);
+          activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry, hasRefresh: !!afterCred.hasRefresh });
           // The account now in use may be under a wait of its own, or, a bare bearer, under `__weak__`.
           armGate(p, afterCred.gateKeys);
-          const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
+          const rej = bearerRejection(p.id, afterCred);
           if (rej) last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
           saveState({ signedIn: Object.fromEntries(signedIn) });
           push();
@@ -824,29 +932,26 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
       forgetAccount(p, afterCred.account, afterCred.gateKeys);
       return applyExpired(p, afterCred);
     }
-    activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry });
-    if (afterCred.tokenHash === curCred.tokenHash && last.get(p.id)?.expired) {
-      const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
-      if (rej) last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
-      else cache[p.id] ? last.set(p.id, cache[p.id]) : last.delete(p.id);
-    }
+    expiredCred.delete(p.id);
+    activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry, hasRefresh: !!afterCred.hasRefresh });
     // The bearer was replaced while its request was out (the same account): the screens follow the one installed now,
     // whatever the old one got. One the endpoint has refused/denied shows its error note; any other lifts a note left
     // for another bearer, the old one's included.
     if (afterCred.tokenHash !== curCred.tokenHash) {
       const was = last.get(p.id);
-      const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
+      const rej = bearerRejection(p.id, afterCred);
       const rc = rateCleared.get(p.id);
       const rcMatch = !!(rc && rc.seq > (was?.errSeq || 0) && !otherAccount(p, { renewsFor: rc.account, gateKeys: rc.gateKeys }, afterCred.account, afterCred.gateKeys));
-      const lifted = !rej && (!!was?.expired || !!(was?.error && !was.signedOut && (was.tokenHash || rcMatch)));
+      const softAuthLift = !!(afterCred.hasRefresh && res.authError && was?.error && !was.signedOut && (!was.errSeq || reqSeq > was.errSeq));
+      const lifted = !rej && (!!was?.expired || softAuthLift || !!(was?.error && !was.signedOut && (was.tokenHash || rcMatch)));
       if (rej) {
         clearResetNotice(p.id);
         last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
-      } else if (lifted) cache[p.id] ? last.set(p.id, cache[p.id]) : last.delete(p.id);
-      // The old bearer hit a hard error (401, 403 permission/scope error, etc.): never overwrite the replacement's
-      // state with the old bearer's error. Advance the generation and retry once with the current token unless a
-      // cooldown holds it back.
-      if (res.error && !res.soft) {
+      } else if (lifted) restoreAccountCache(p, afterCred.account, afterCred.gateKeys);
+      // The old bearer hit a hard error (401, 403 permission/scope error, etc.) or a soft auth error while a
+      // replacement bearer is already installed: never keep the old bearer's failure when a new bearer is ready.
+      // Advance the generation and retry once with the current token unless a cooldown holds it back.
+      if (res.error && (!res.soft || res.authError)) {
         gen = bumpGen(p.id);
         forgetAccount(p, afterCred.account, afterCred.gateKeys);
         const tNow = Date.now();
@@ -869,6 +974,33 @@ async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.i
         bumpGen(p.id);
         armGate(p, afterCred.gateKeys);
         return;
+      }
+    } else {
+      const curLast = last.get(p.id);
+      const rej = bearerRejection(p.id, afterCred);
+      if (res.authError) {
+        // Align a 401/auth-403 with the post-fetch credential's refresh_token state and latest bearer answer.
+        if (afterCred.hasRefresh || !stillNewest) {
+          res = { ...res, soft: true };
+          delete res.tokenHash;
+          if (rej) {
+            if (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== afterCred.tokenHash) {
+              clearResetNotice(p.id);
+              last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
+            }
+          } else if (afterCred.hasRefresh && curLast?.error && !curLast.signedOut && (curLast.tokenHash === afterCred.tokenHash || curLast.expired || (!curLast.tokenHash && (!curLast.errSeq || reqSeq > curLast.errSeq)))) {
+            restoreAccountCache(p, afterCred.account, afterCred.gateKeys);
+          }
+        } else {
+          res = { ...res, soft: false, tokenHash: afterCred.tokenHash };
+        }
+      } else if (rej && ((res.error && res.soft && res.error !== 'Rate limited') || curLast?.expired)) {
+        if (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== afterCred.tokenHash) {
+          clearResetNotice(p.id);
+          last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
+        }
+      } else if (!rej && (curLast?.expired || (afterCred.hasRefresh && curLast?.authError && curLast?.tokenHash === afterCred.tokenHash))) {
+        restoreAccountCache(p, afterCred.account, afterCred.gateKeys);
       }
     }
     // The answer goes under the account's name now, with every key it was read under; forgetAccount renames the rest.
@@ -1501,6 +1633,7 @@ function setEnabled(ids) {
       inflightToken.delete(p.id);
       activeKeys.delete(p.id);
       activeToken.delete(p.id);
+      expiredCred.delete(p.id);
       clearResetNotice(p.id);
     } else if (nowOn && !prev.has(p.id)) {
       // Hide any prior state until live credentials confirm the account, and clear backoff so tick() verifies immediately.
@@ -1711,6 +1844,7 @@ function loadState() {
   publishedQuota.clear();
   activeKeys.clear();
   activeToken.clear();
+  expiredCred.clear();
   fetchedFor.clear();
   if (st.cache && typeof st.cache === 'object') cache = Object.fromEntries(Object.entries(st.cache).map(([id, v]) => [id, savedReading(v)]));
   for (const [id, v] of Object.entries(cache)) {
@@ -1730,7 +1864,11 @@ function loadState() {
       for (const [hash, entry] of Object.entries(v)) {
         if (typeof entry === 'string') m.set(hash, { error: entry, authError: true });
         else if (entry && typeof entry === 'object' && typeof entry.error === 'string') {
-          m.set(hash, { error: entry.error, authError: !!entry.authError });
+          m.set(hash, {
+            error: entry.error,
+            authError: !!entry.authError,
+            ...(entry.authError && typeof entry.fallbackError === 'string' && entry.fallbackError ? { fallbackError: entry.fallbackError } : {}),
+          });
         }
       }
     }
@@ -1739,11 +1877,37 @@ function loadState() {
   const now = Date.now();
   for (const [id, v] of Object.entries(st.gate || {})) if (v > now && !PROVIDERS.find((p) => p.id === id)?.peekCred) gate.set(id, v);
   accountGates.clear();
+  const legacyAgIdentity = !SHOT && st.antigravityIdentityVersion !== ANTIGRAVITY_IDENTITY_VERSION;
+  const hasEntries = (v) => !!(v && typeof v === 'object' && Object.keys(v).length);
   for (const p of PROVIDERS) {
+    if (p.peekCred && legacyAgIdentity) {
+      // One-time migration from pre-v2 state.json: earlier builds could link distinct accounts through arbitrary
+      // whitespace-only refresh tokens, so discard legacy cache, identity links, and cooldowns whose owner cannot
+      // be established independently.
+      const hadLegacy = !!(cache[p.id] || signedIn.has(p.id) || hasEntries(st.accountLinks?.[p.id]) || hasEntries(st.accountGates?.[p.id]) || hasEntries(st.tierGates?.[p.id]));
+      delete cache[p.id];
+      last.delete(p.id);
+      unverified.delete(p.id);
+      signedIn.delete(p.id);
+      if (hadLegacy) {
+        saveState({ cache, signedIn: Object.fromEntries(signedIn), accountLinks: linksState(), accountGates: prunedAccountGates(now), tierGates: tierGatesState() });
+      }
+      continue;
+    }
     const list = p.gateList ? p.gateList(st.accountGates?.[p.id], now) : [];
     if (list.length) accountGates.set(p.id, list);
     p.restoreTierGates?.(st.tierGates?.[p.id]);
-    p.restoreLinks?.(cache[p.id], accountGates.get(p.id) || [], st.accountLinks?.[p.id]);
+    const restored = p.restoreLinks?.(cache[p.id], accountGates.get(p.id) || [], st.accountLinks?.[p.id]);
+    if (accountGates.has(p.id) && !accountGates.get(p.id).length) accountGates.delete(p.id);
+    if (restored?.readingTainted) {
+      delete cache[p.id];
+      last.delete(p.id);
+      unverified.delete(p.id);
+      signedIn.delete(p.id);
+    }
+    if (restored?.dirty) {
+      saveState({ cache, signedIn: Object.fromEntries(signedIn), accountLinks: linksState(), accountGates: prunedAccountGates(now), tierGates: tierGatesState() });
+    }
   }
   try {
     if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')), cache.claude?.apiCredit);
