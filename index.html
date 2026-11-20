@@ -493,7 +493,7 @@
     return '<section class="prov" style="--c:' + esc(p.color) + '">' +
       '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span title="' + esc(plan) + '">' + esc(plan) + '</span></header>' +
       rows.map((r) =>
-        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + r.label) + '" data-p="' + r.percent + '">' +
+        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + (r.id ? 'id:' + r.id : 'label:' + r.label)) + '" data-p="' + r.percent + '">' +
           '<span class="l">' + esc(r.label) + '</span><i class="hair"></i>' +
           '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span>' +
           '<span class="rs">' + esc(r.resets) + '</span>' +

@@ -330,22 +330,36 @@
   const newer = (d) => !Number.isFinite(d.rev) || (!retired.has(d.run) && (!Number.isFinite(data?.rev) || d.run !== data.run || d.rev > data.rev));
   function take(d) {
     if (!newer(d)) return false;
+    const wasAway = !reached;
+    const runChanged = d.run !== data?.run;
     if (Number.isFinite(d.rev) && Number.isFinite(data?.rev) && d.run !== data.run) retired.add(data.run);
     data = { ...d, at: Date.now() };
     reached = true;
     store('usage', data);
+    if (runChanged) {
+      optionsRun = undefined;
+      optionsFailedRun = undefined;
+      optionsEpoch++;
+    }
+    if (wasAway) onReconnect();
+    else if (body.classList.contains('prefs') && optionsStale()) loadOptions();
     draw();
     return true;
   }
   let es = null;
   let heard = 0; // when the stream last said anything, a ping included
+  let streamDropped = false;
   async function load(refresh, again) {
     try {
       const r = await fetch('/api/usage', { method: refresh ? 'POST' : 'GET', signal: AbortSignal.timeout(refresh ? 60000 : 20000) });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const state = await r.json();
-      reached = true;
-      if (!take(state)) draw(); // newer state is already here; this answer still says the PC is there
+      const wasAway = !reached;
+      if (!take(state)) {
+        reached = true; // newer state is already here; this answer still says the PC is there
+        if (wasAway) onReconnect();
+        draw();
+      }
     } catch {
       // The link ends the connections on the old way when it switches between Tailscale and the hotspot: one
       // more read, which goes the new way, before the page says the PC is out of reach.
@@ -355,14 +369,33 @@
     }
   }
   function listen() {
-    es?.close();
-    es = new EventSource('/api/events');
+    if (es) {
+      streamDropped = true;
+      es.close();
+    }
+    const src = new EventSource('/api/events');
+    es = src;
     heard = Date.now();
-    es.onmessage = (e) => {
+    src.onopen = () => {
+      if (src !== es) return;
+      heard = Date.now();
+      if (streamDropped) {
+        streamDropped = false;
+        onReconnect();
+      }
+    };
+    src.onerror = () => {
+      if (src !== es) return;
+      streamDropped = true;
+    };
+    src.onmessage = (e) => {
+      if (src !== es) return;
       heard = Date.now();
       take(JSON.parse(e.data));
     };
-    es.addEventListener('ping', () => (heard = Date.now()));
+    src.addEventListener('ping', () => {
+      if (src === es) heard = Date.now();
+    });
     // A dropped connection it retries by itself; whether the PC is reachable is the minute's read to say.
   }
   // The PC pings every 20 s. Silent for 45, the stream sits on a connection that died without a word (the PC
@@ -382,6 +415,7 @@
     codex: '<path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"/>',
     "opencode-go": '<path fill-rule="evenodd" d="M18 19.5H6v-15h12zM15 7.5H9v9h6z"/><path d="M15 10.5v6H9v-6z" opacity=".45"/>',
     xai: '<path d="M6.469 8.776L16.512 23h-4.464L2.005 8.776H6.47zm-.004 7.9l2.233 3.164L6.467 23H2l4.465-6.324zM22 2.582V23h-3.659V7.764L22 2.582zM22 1l-9.952 14.095-2.233-3.163L17.533 1H22z"/>',
+    antigravity: '<path d="M12 1C12.8 7.6 16.4 11.2 23 12C16.4 12.8 12.8 16.4 12 23C11.2 16.4 7.6 12.8 1 12C7.6 11.2 11.2 7.6 12 1Z"/>',
   };
   const mark = (p, cls) => '<span class="' + cls + '">' + (LOGOS[p.id] ? '<svg class="logo" viewBox="0 0 24 24" aria-hidden="true">' + LOGOS[p.id] + '</svg>' : esc(p.glyph)) + '</span>';
 
@@ -475,9 +509,41 @@
 
   // ---- settings. The theme, the providers and each summary number belong to the PC and are shared with
   // it; the size and hiding at the edge are this phone's own.
-  let options = null; // the PC's menu: { themes, providers, choices, pages }, asked for once
+  let options = null; // the PC's menu: { themes, providers, choices, pages, capabilities }, refreshed when the PC run changes
+  let optionsRun;
+  let optionsFailedRun;
+  let optionsEpoch = 0;
+  let optionsInflight = null;
+  let providerQueue = Promise.resolve();
+  // id -> { seq, enabled }: a tap the PC hasn't answered yet. Its checkbox shows the tap, whatever a redraw meanwhile says.
+  const pendingProviders = new Map();
+  let toggleSeq = 0;
+  const shownOn = () => {
+    const on = new Set(data?.enabled || []);
+    for (const [id, { enabled }] of pendingProviders) enabled ? on.add(id) : on.delete(id);
+    return [...on];
+  };
   let prefsError = '';
   let prefsDrawn = '';
+  // A press in the settings, from its pointerdown to its click. A redraw meanwhile could put another row under it, so the
+  // tap switches that one, or move the row a mouse press began on, so its click is lost: the settings wait for it.
+  let pressing = false;
+  const presses = new Set(); // the pointers down that began in the settings: another finger's lift doesn't end the press
+  let pressEnd = 0;
+  const unpress = (ms) => {
+    clearTimeout(pressEnd);
+    pressEnd = setTimeout(() => {
+      pressing = false;
+      drawPrefs();
+    }, ms);
+  };
+  const missingProvider = (d = data) => !!(options && (d?.enabled || []).some((id) => !options.providers.some((p) => p.id === id)));
+  const optionsStale = (d = data) => !options || optionsRun !== (d?.run ?? null) || (d?.run == null && missingProvider(d));
+  function onReconnect() {
+    optionsFailedRun = undefined;
+    optionsEpoch++;
+    if (body.classList.contains('prefs') && optionsStale()) loadOptions();
+  }
   const SIZES = [['Small', 0.85], ['Medium', 1], ['Large', 1.2]];
   // Noir is the stylesheet's own default, so its theme string is empty; its chip needs the colours spelled out.
   const NOIR = '--bg:#171b23;--line:#a4adbb26;--fg:#f3f5f8;--dim:#a4adbb';
@@ -485,12 +551,38 @@
   let autoHide = stored('autoHide', false);
   const opened = new Set(); // the settings groups open now; in memory, so they all start folded when the bubble restarts
 
+  // The settings brought to new markup in place: an element that stays keeps its focus and a press on it, and a new
+  // provider's rows go in beside it. Matched by tag, id, class and data-*, so each provider's rows carry a data-key.
+  const keyOf = (n) => (n.nodeType === 1 ? n.tagName + '#' + n.id + '.' + n.getAttribute('class') + JSON.stringify({ ...n.dataset }) : '#' + n.nodeType);
+  function patch(el, to) {
+    if (to.nodeType !== 1 && to.nodeType !== 11) {
+      if (el.nodeValue !== to.nodeValue) el.nodeValue = to.nodeValue;
+      return;
+    }
+    if (to.nodeType === 1) {
+      // A group's open is left to it: the toggle that tells `opened` comes a task later.
+      for (const { name } of [...el.attributes]) if (name !== 'open' && !to.hasAttribute(name)) el.removeAttribute(name);
+      for (const { name, value } of to.attributes) if (name !== 'open' && el.getAttribute(name) !== value) el.setAttribute(name, value);
+      if (to.type === 'checkbox') el.checked = to.checked; // once tapped, the attribute no longer says
+    }
+    const left = new Map();
+    for (const c of el.childNodes) left.set(keyOf(c), [...(left.get(keyOf(c)) || []), c]);
+    const pairs = [...to.childNodes].map((c) => [c, left.get(keyOf(c))?.shift()]);
+    for (const gone of left.values()) gone.forEach((c) => c.remove());
+    pairs.forEach(([c, mine], i) => {
+      const at = el.childNodes[i] || null;
+      if (!mine) return el.insertBefore(c, at);
+      if (mine !== at) el.insertBefore(mine, at); // only when the order changed: a move takes the focus
+      patch(mine, c);
+    });
+  }
+
   function drawPrefs() {
-    if (!body.classList.contains('prefs')) return;
+    if (!body.classList.contains('prefs') || pressing) return;
     let html;
     if (!options) html = '<p class="err">' + esc(prefsError || 'Loading settings from the PC…') + '</p>';
     else {
-      const on = data?.enabled || [];
+      const on = shownOn();
       const chosen = data?.choices || {};
       const theme = options.themes.flatMap(([, list]) => list).find(([id]) => id === data?.theme)?.[1] || '';
       const picks = options.providers.filter((p) => options.choices[p.id] && on.includes(p.id));
@@ -503,9 +595,9 @@
           list.map(([id, label, css]) => '<button class="sw" data-theme="' + esc(id) + '" aria-pressed="' + (data?.theme === id) + '"><i style="' + esc(css || NOIR) + '">Aa</i><span>' + esc(label) + '</span></button>').join('') +
         '</div>').join('')) +
         fold('providers', 'Providers', on.length + ' of ' + options.providers.length + ' on',
-          options.providers.map((p) => '<label class="opt" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + '<span>' + esc(p.name) + '</span><input type="checkbox" role="switch" data-provider="' + esc(p.id) + '"' + (on.includes(p.id) ? ' checked' : '') + '></label>').join('')) +
+          options.providers.map((p) => '<label class="opt" data-key="' + esc(p.id) + '" style="--c:' + esc(p.color) + '">' + mark(p, 'g') + '<span>' + esc(p.name) + '</span><input type="checkbox" role="switch" data-provider="' + esc(p.id) + '"' + (on.includes(p.id) ? ' checked' : '') + '></label>').join('')) +
         fold('choices', 'Number on the bubble', picks.map((p) => options.choices[p.id].find(([, row]) => row === (chosen[p.id] || ''))?.[0] || '').filter(Boolean).join(', '),
-          picks.map((p) => '<div class="pick" style="--c:' + esc(p.color) + '"><span class="who">' + mark(p, 'g') + esc(p.name) + '</span><div class="seg">' +
+          picks.map((p) => '<div class="pick" data-key="' + esc(p.id) + '" style="--c:' + esc(p.color) + '"><span class="who">' + mark(p, 'g') + esc(p.name) + '</span><div class="seg">' +
             options.choices[p.id].map(([label, row]) => '<button data-choice="' + esc(p.id) + '" data-row="' + esc(row) + '" aria-pressed="' + ((chosen[p.id] || '') === row) + '">' + esc(label) + '</button>').join('') +
           '</div></div>').join('')) +
         fold('phone', 'This phone', SIZES.find(([, z]) => z === size)[0] + (autoHide ? ', hides at the edge' : ''),
@@ -518,24 +610,53 @@
         '</div>') +
         '<button id="remove">Remove bubble</button>';
     }
-    if (html !== prefsDrawn) prefs.innerHTML = prefsDrawn = html;
+    if (html !== prefsDrawn) {
+      const t = document.createElement('template');
+      t.innerHTML = prefsDrawn = html;
+      patch(prefs, t.content);
+    }
+  }
+
+  async function loadOptions(force = false) {
+    const forRun = data?.run ?? null;
+    if (!optionsStale()) return;
+    if (!force && optionsFailedRun === forRun) return;
+    if (optionsInflight) return optionsInflight;
+    const startEpoch = optionsEpoch;
+    optionsInflight = (async () => {
+      try {
+        const r = await fetch('/api/options?toggle=1', { signal: AbortSignal.timeout(15000) });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        options = await r.json();
+        optionsRun = forRun;
+        optionsFailedRun = undefined;
+        prefsError = '';
+      } catch {
+        if (optionsEpoch === startEpoch && (data?.run ?? null) === forRun) optionsFailedRun = forRun;
+        prefsError = "Settings come from the PC, and it can't be reached right now.";
+      } finally {
+        optionsInflight = null;
+      }
+      drawPrefs();
+      // Retry immediately only if the PC started a new run or reconnected while this request was in flight; a
+      // failure on the same run stops here and waits for an actual reconnect, a new run, or Settings reopening.
+      if (body.classList.contains('prefs') && ((data?.run ?? null) !== forRun || optionsEpoch !== startEpoch) && optionsStale()) loadOptions();
+    })();
+    return optionsInflight;
   }
 
   async function showPrefs(on) {
+    if (!on) {
+      // a press that was going on can't end in them now
+      presses.clear();
+      pressing = false;
+    }
     body.classList.toggle('prefs', on);
     mn.setAttribute('aria-expanded', on);
     mn.setAttribute('aria-label', on ? 'Back to usage' : 'Settings');
     draw();
-    if (!on || options) return;
-    try {
-      const r = await fetch('/api/options', { signal: AbortSignal.timeout(15000) });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      options = await r.json();
-      prefsError = '';
-    } catch {
-      prefsError = "Settings come from the PC, and it can't be reached right now.";
-    }
-    drawPrefs();
+    if (!on) return;
+    await loadOptions(true);
   }
 
   // A change goes to the PC, which answers with the new state; a theme shows here before the answer does.
@@ -549,6 +670,50 @@
     }
   }
 
+  // Provider toggles are serialized so a delayed earlier request can never overwrite a later tap on the same
+  // checkbox, and always carry both toggleProvider (used by upgraded PCs, which ignore companion enabled) and
+  // the legacy enabled list (used by older PCs, including after a PC rollback before /api/options reloads).
+  // A tap is shown at once and kept until its own request settles, so a redraw from an earlier answer can't put the
+  // checkbox back and turn the next tap into a repeat. Not redrawn here: the tapped box already shows it, and the next
+  // draw, once the press is over, brings the rest.
+  function toggleProvider(id, wantOn) {
+    const seq = ++toggleSeq;
+    pendingProviders.set(id, { seq, enabled: wantOn });
+    prefsDrawn = ''; // the tapped box already shows it; the next draw repaints the rest
+    const val = prefs.querySelector('[data-fold="providers"] .val');
+    if (val && options) val.textContent = shownOn().length + ' of ' + options.providers.length + ' on';
+    providerQueue = providerQueue.then(async () => {
+      try {
+        const cur = new Set(data?.enabled || []);
+        if (wantOn) cur.add(id);
+        else cur.delete(id);
+        await change({ toggleProvider: { id, enabled: wantOn }, enabled: [...cur] });
+      } finally {
+        // A later tap on the same box is still pending, and is drawn when it settles.
+        if (pendingProviders.get(id)?.seq === seq) {
+          pendingProviders.delete(id);
+          drawPrefs();
+        }
+      }
+    });
+  }
+
+  prefs.addEventListener('pointerdown', (e) => {
+    presses.add(e.pointerId);
+    pressing = true;
+    clearTimeout(pressEnd);
+  });
+  // A touch's click comes a task after its lift, so the last lift waits for it, or 400 ms for one that doesn't come. The
+  // click's task ends with the checkbox's change, before a 0 ms timer.
+  const lifted = (e) => presses.delete(e.pointerId) && !presses.size && unpress(e.type === 'pointerup' ? 400 : 0);
+  addEventListener('pointerup', lifted, true);
+  addEventListener('pointercancel', lifted, true);
+  addEventListener('click', () => pressing && !presses.size && unpress(0), true);
+  addEventListener('blur', () => {
+    // the window's own, not a control's: whatever was down won't be heard lifting
+    presses.clear();
+    if (pressing) unpress(0);
+  });
   prefs.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -569,8 +734,9 @@
   }, true);
   prefs.addEventListener('change', (e) => {
     const t = e.target;
-    if (t.dataset.provider) change({ enabled: [...prefs.querySelectorAll('[data-provider]')].filter((x) => x.checked).map((x) => x.dataset.provider) });
-    else if (t.id === 'autohide') setAutoHide(t.checked);
+    if (t.dataset.provider) {
+      toggleProvider(t.dataset.provider, t.checked);
+    } else if (t.id === 'autohide') setAutoHide(t.checked);
     else if (t.id === 'keep-awake') {
       const next = t.checked;
       t.checked = data?.keepAwake === true;
@@ -698,8 +864,7 @@
   });
   // Open, a tap anywhere but the panel closes it: the backdrop, the tab, or the empty part of #dock that
   // holds the panel level with the tab. Collapsed, Bubble.java takes every touch, so this never fires there.
-  // The path the click took, not where its target is now: a settings button redraws the settings as it is
-  // tapped, so by the time the click reaches here its target is no longer in the page. A snip takes its own
+  // The path the click took, not where its target is now, should a redraw have taken it out of the page. A snip takes its own
   // taps: the click that ends a drag must not cancel the snip it just made.
   addEventListener('click', (e) => e.composedPath().includes(card) || body.classList.contains('snip') || shut());
 

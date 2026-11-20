@@ -16,18 +16,21 @@ const edges = ['left', 'right', 'top', 'bottom'];
 const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
-// The native windows at Size = Large for the six providers below, each only on the edges main gives that shape.
-// From main.js's windowSize(): beside the pill 8 + 86 + 300 + 16 by max(6 × 56, 600) + 32, above or below it
-// max(6 × 88, 300) + 32 by 8 + 60 + 600 + 16.
-const NATIVE = { left: 410, right: 410, top: 560, bottom: 560 };
-viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 560, height: 684, edges: ['top', 'bottom'] });
-// Extra large on a 600px portrait monitor: main shrinks the pill to fit (pillScale: (600 - 32) / (6 × 88)) and keeps
+// The native windows at Size = Large for the seven providers below, each only on the edges main gives that shape.
+// From main.js's windowSize(): beside the pill 8 + 86 + 300 + 16 by max(7 × 56, 600) + 32, above or below it
+// max(7 × 88, 300) + 32 by 8 + 60 + 600 + 16.
+const NATIVE = { left: 410, right: 410, top: 648, bottom: 648 };
+viewports.push({ width: 410, height: 632, edges: ['left', 'right'] }, { width: 648, height: 684, edges: ['top', 'bottom'] });
+// Extra large on a 600px portrait monitor: main shrinks the pill to fit (pillScale: (600 - 32) / (7 × 88)) and keeps
 // the panel's 1.25, in a window of 600 by 8 + 60 × that + 600 × 1.25 + 16.
-const XL = (600 - 32) / (6 * 88);
+const XL = (600 - 32) / (7 * 88);
 viewports.push({ width: 600, height: Math.ceil(8 + 60 * XL + 750 + 16), edges: ['top', 'bottom'], scale: XL, panel: 1.25 });
 // Extra large on a display 600px tall: main stops the window at the display's height (windowSize), and the panel's rows
 // scroll. Beside the pill the window is 8 + 86 × 1.25 + 300 × 1.25 + 16 wide; above or below it, the 600px display's width.
 viewports.push({ width: Math.ceil(8 + 86 * 1.25 + 375 + 16), height: 600, edges: ['left', 'right'], scale: 1.25, panel: 1.25 }, { width: 600, height: 600, edges: ['top', 'bottom'], scale: XL, panel: 1.25 });
+// Extra large on a short 320px-tall work area: main shrinks the side-docked pill to fit all seven chips without clipping.
+const VXL = (320 - 32) / (7 * 56);
+viewports.push({ width: Math.ceil(8 + 86 * VXL + 375 + 16), height: 320, edges: ['left', 'right'], scale: VXL, panel: 1.25 });
 const data = [
   {
     id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: 37,
@@ -60,6 +63,16 @@ const data = [
     // xAI's mark is monochrome, so it takes the theme's ink, in every theme.
     id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: 42.5,
     rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }],
+    updatedAt: Date.now(),
+  },
+  {
+    id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', plan: 'AI Ultra', ringPercent: 4.6,
+    rows: [
+      { id: 'gemini-5h', label: 'Gemini 5h', percent: 4.6, resets: 'in 3h 50m' },
+      { id: 'gemini-weekly', label: 'Gemini wk', percent: 2.4, resets: 'in 6d 22h' },
+      { id: '3p-5h', label: 'Other 5h', percent: 0, resets: 'in 5h' },
+      { id: '3p-weekly', label: 'Other wk', percent: 0, resets: 'in 7d' },
+    ],
     updatedAt: Date.now(),
   },
   // This PC: a long CPU model in the plan tag, and RAM's GB in the reset column.
@@ -183,13 +196,13 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
     if (result.outside.length > clip.length) bad.push('outside the window');
     if (clip.length) clipped.add(`${edge} at ${width}px`);
     if (result.contentOverflow) bad.push('content overflows the panel');
-    if (state === 'hidden' && (result.exposed !== 0 || Math.abs(result.lipThickness - 5 * (scale || 1)) > 0.01 || result.lipLevels !== 6)) bad.push('lip');
+    if (state === 'hidden' && (result.exposed !== 0 || Math.abs(result.lipThickness - 5 * (scale || 1)) > 0.01 || result.lipLevels !== 7)) bad.push('lip');
     if (state === 'rest' && result.detailsW !== 0) bad.push('panel open at rest');
     if ((panel || state === 'reset') && result.detailsW < 200) bad.push('panel did not open');
     if (result.islandW > Math.max(300 * (panelZoom || 1) + 86 * (scale || 1), result.summaryW + 1)) bad.push('panel too wide');
     if (state === 'reset' && !result.noticing) bad.push('reset notice');
-    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 11) bad.push('one row per limit');
-    if (state === 'long' && result.rows !== 16) bad.push('long rows');
+    if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 15) bad.push('one row per limit');
+    if (state === 'long' && result.rows !== 20) bad.push('long rows');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
     // A rate limit is never shown, in any state. Numbers that have fallen behind say how old they are, gated or not.
     if (result.status.some((s) => s.includes('Rate limited'))) bad.push('rate-limit line');

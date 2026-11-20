@@ -33,6 +33,8 @@ const providers = (hot) => [
   // Hot, xAI is the provider whose usage is unavailable: signed out, no numbers at all.
   { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: hot ? 0 : 42.5, updatedAt: Date.now(), waitMs: 0,
     ...(hot ? { rows: [], error: 'Grok sign-in expired — run `grok` to renew it.' } : { rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }] }) },
+  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', plan: 'AI Ultra', ringPercent: hot ? 82 : 4.6, updatedAt: Date.now(), waitMs: 0,
+    rows: [{ label: 'Gemini 5h', percent: hot ? 82 : 4.6, resets: 'in 3h 50m' }, { label: 'Gemini wk', percent: 2.4, resets: 'in 6d 22h' }, { label: 'Other 5h', percent: 0, resets: 'in 5h' }, { label: 'Other wk', percent: 0, resets: 'in 7d' }] },
   // This PC, as main.js sends it: a long CPU model, RAM's GB in the reset column.
   { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: cpuLoad, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'Load', percent: cpuLoad, resets: '' }] },
   { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', plan: '127.8 GB', ringPercent: hot ? 93 : 58, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'In use', percent: hot ? 93 : 58, resets: '112.4 GB' }] },
@@ -40,20 +42,27 @@ const providers = (hot) => [
 const options = {
   themes: THEME_GROUPS,
   providers: providers(false).map(({ id, name, glyph, color }) => ({ id, name, glyph, color })),
-  choices: { claude: [['Highest limit', ''], ['Session', 'Session'], ['Weekly', 'All models'], ['Fable', 'Fable']], 'opencode-go': [['Highest limit', ''], ['5-hour', '5h limit'], ['Weekly', 'Weekly'], ['Monthly', 'Monthly']] },
+  choices: { claude: [['Highest limit', ''], ['Session', 'Session'], ['Weekly', 'All models'], ['Fable', 'Fable']], 'opencode-go': [['Highest limit', ''], ['5-hour', '5h limit'], ['Weekly', 'Weekly'], ['Monthly', 'Monthly']], antigravity: [['Highest limit', ''], ['Gemini 5h', 'gemini-5h'], ['Gemini weekly', 'gemini-weekly'], ['Other 5h', '3p-5h'], ['Other weekly', '3p-weekly']] },
   pages: { claude: 'https://claude.ai/settings/usage', codex: 'https://chatgpt.com/codex/settings/usage', xai: 'https://grok.com/?_s=usage' },
+  capabilities: { toggleProvider: true },
 };
 
 // ---- the stand-in PC: the same routes and answers as main.js's servePhone
 let answer = 'ok';
+let optionsDown = false;
+let legacyPc = false;
 let holdUsage = false; // the next /api/usage answer waits for release(), as a slow network would hold it
 let holdSettings = false; // the same for the next /api/settings answer
+let holdOptions = false; // the same for the next /api/options answer
+let optionsRequests = 0;
 let release = null;
+let releaseOptions = null;
+let servedOptions = options;
 let holdStreams = false; // a cut stream's reconnections wait, so a reconnect's fresh state can't hide a rollback
 let dropUsage = false; // the next /api/usage connection ends unanswered, as the link ends it switching ways
 let opened = 0; // streams the page has opened
 const waiting = [];
-const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai', 'cpu', 'ram'], choices: {}, keepAwake: false };
+const pc = { theme: 'noir', enabled: ['claude', 'codex', 'opencode-go', 'xai', 'antigravity', 'cpu', 'ram'], choices: {}, keepAwake: false };
 // Every provider on: the tallest tab. Its height is 6px above and below, 40.5px per provider, as fit() draws it.
 const COUNT = pc.enabled.length;
 const TAB = 8.5 + 40.5 * COUNT;
@@ -83,21 +92,33 @@ const reopen = () => {
   waiting.splice(0).forEach(([req, res]) => openStream(req, res));
 };
 const server = http.createServer(async (req, res) => {
-  if (req.url === '/') return res.end(fs.readFileSync(pageFile));
-  if (req.url === '/fonts/geist.woff2') return res.end(fs.readFileSync(path.join(here, '..', 'fonts', 'geist.woff2')));
+  const pathUrl = req.url.split('?')[0];
+  if (pathUrl === '/') return res.end(fs.readFileSync(pageFile));
+  if (pathUrl === '/fonts/geist.woff2') return res.end(fs.readFileSync(path.join(here, '..', 'fonts', 'geist.woff2')));
+  if (pathUrl === '/api/options') optionsRequests++;
   if (answer === 'down') return res.writeHead(502).end();
-  if (req.url === '/api/events') {
+  if (pathUrl === '/api/events') {
     if (holdStreams) return void waiting.push([req, res]);
     return openStream(req, res);
   }
-  if (req.url === '/api/options') return res.end(JSON.stringify(options));
-  if (req.url === '/api/settings') {
+  if (pathUrl === '/api/options') {
+    if (optionsDown) return res.writeHead(502).end();
+    const body = JSON.stringify(servedOptions);
+    if (!holdOptions) return res.end(body);
+    holdOptions = false;
+    releaseOptions = () => res.end(body);
+    return;
+  }
+  if (pathUrl === '/api/settings') {
     let body = '';
     for await (const c of req) body += c;
     posts.push({ type: req.headers['content-type'], body: JSON.parse(body) });
     const want = JSON.parse(body);
     if (want.theme) pc.theme = want.theme;
-    if (want.enabled) pc.enabled = want.enabled;
+    if (!legacyPc && want.toggleProvider) {
+      const { id, enabled } = want.toggleProvider;
+      pc.enabled = enabled ? [...new Set([...pc.enabled, id])] : pc.enabled.filter((x) => x !== id);
+    } else if (want.enabled) pc.enabled = want.enabled;
     if (want.choices) Object.assign(pc.choices, want.choices);
     if (typeof want.keepAwake === 'boolean') pc.keepAwake = want.keepAwake;
     // As main.js does: the phones hear the change, then the answer goes, unless it is held back.
@@ -477,9 +498,9 @@ try {
   await page.evaluate(() => (window.kept = [...document.querySelectorAll('#sections .prov')]));
   cpuLoad = 71;
   tell();
-  await until(() => document.querySelectorAll('#sections .prov')[4]?.textContent.includes('71'), 'redraw: the new CPU load shows');
+  await until(() => document.querySelectorAll('#sections .prov')[5]?.textContent.includes('71'), 'redraw: the new CPU load shows');
   const redrawn = await page.evaluate(() => [...document.querySelectorAll('#sections .prov')].map((el, i) => el !== kept[i]));
-  if (JSON.stringify(redrawn) !== JSON.stringify([false, false, false, false, true, false])) fail(`redraw: a CPU change replaced sections ${JSON.stringify(redrawn)}`);
+  if (JSON.stringify(redrawn) !== JSON.stringify([false, false, false, false, false, true, false])) fail(`redraw: a CPU change replaced sections ${JSON.stringify(redrawn)}`);
   cpuLoad = 23;
   // The footer dates the usage, not CPU and RAM, which are always fresh; with only those two it dates them.
   const foot = await page.evaluate(() => {
@@ -501,7 +522,7 @@ try {
   await page.click('#rf');
   for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 20));
   tell();
-  await until(() => document.querySelectorAll('#sections .prov')[4]?.textContent.includes('23'), 'refresh: a streamed reading lands meanwhile');
+  await until(() => document.querySelectorAll('#sections .prov')[5]?.textContent.includes('23'), 'refresh: a streamed reading lands meanwhile');
   const spinning = await page.$eval('#rf', (b) => [b.disabled, b.getAttribute('aria-busy')].join());
   if (spinning !== 'true,true') fail(`refresh: with the stream's numbers in and the Refresh still out, the button is ${spinning}`);
   release?.();
@@ -653,9 +674,12 @@ try {
   await unfold(['phone']);
   const phoneLine = () => page.$eval('details[data-fold="phone"] .val', (e) => e.textContent);
   const lineBefore = await phoneLine();
+  const turn = () => page.evaluate(() => new Promise((r) => setTimeout(r))); // a press redraws a timer's turn after its click
   await page.click('#autohide');
+  await turn();
   const lineAfter = await phoneLine();
   await page.click('#autohide');
+  await turn();
   if (lineBefore !== 'Medium' || lineAfter !== 'Medium, hides at the edge' || (await phoneLine()) !== 'Medium') fail(`prefs: the This phone line said "${lineBefore}", then "${lineAfter}"`);
   await closes(() => page.mouse.click(20, 885));
   await resize(small);
@@ -700,7 +724,7 @@ try {
   if (!near(fewer.b - fewer.t, TAB - 40.5)) fail(`providers: with one fewer the tab is ${(fewer.b - fewer.t).toFixed(1)} tall`);
   const tight = await page.evaluate(({ t, b }) => [...document.querySelectorAll('#tab .dial, #tab b')].filter((e) => { const x = e.getBoundingClientRect(); return x.top < t + 4 || x.bottom > b - 4; }).length, fewer);
   if (tight) fail(`providers: with one fewer, ${tight} rings or numbers crowd the tab's ends`);
-  if (!posts.some((p) => p.body.enabled && !p.body.enabled.includes('codex') && p.body.enabled.length === COUNT - 1)) fail(`providers: the PC got ${JSON.stringify(posts.at(-1))}`);
+  if (!posts.some((p) => p.body.toggleProvider?.id === 'codex' && p.body.toggleProvider?.enabled === false)) fail(`providers: the PC got ${JSON.stringify(posts.at(-1))}`);
   await page.click('#prefs [data-provider="codex"]');
   await until((n) => document.querySelectorAll('#cells .cell').length === n, 'providers: Codex back on the tab', COUNT);
   await page.click('#prefs [data-choice="claude"][data-row="Session"]');
@@ -787,27 +811,35 @@ try {
   if (posts.length) fail(`size: the PC got ${JSON.stringify(posts)}`);
   await closes(() => page.mouse.click(20, 885));
   // ---- turning the screen with the panel open, on either edge: the tab follows its edge, nothing leaves the screen
-  await page.evaluate(() => setSize(1));
-  for (const side of ['right', 'left']) {
-    // Where Bubble.java's snap leaves it on a landscape screen: inside the bars, which six providers' tab fills.
-    await open(812, 375, side, Math.max(24, Math.min(120, 375 - 48 - small.height)));
-    await openCheck(`rotate ${side} at 812x375`, 812, 375, side);
-    for (const [width, height] of [[375, 812], [812, 375]]) {
-      await resize({ width, height, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
-      await reanchor(`rotate ${side} to ${width}x${height}`, width, height, side, 120);
-      await openCheck(`rotate ${side} to ${width}x${height}`, width, height, side);
-      await page.screenshot({ path: path.join(shots, `rotate-${side}-${width}x${height}.png`) });
-    }
-    await closes(() => page.mouse.click(side === 'right' ? 20 : 792, 340));
-  }
-  // ---- Large on a landscape screen too short for six providers' tab: it shrinks to the room between the bars,
-  // as a stand-in for Bubble.java's room() gives it, and fits there collapsed and open. Turned back to a
-  // portrait room, it is Large again.
   const room = (dp) => page.evaluate((r) => {
     window.calls = [];
     window.Android = new Proxy({}, { get: (_, k) => (...a) => (k === 'room' ? r : calls.push([k, ...a])) });
   }, dp);
   const fitted = () => page.evaluate(() => [parseFloat(body.style.getPropertyValue('--z')), calls.filter(([k]) => k === 'size').at(-1)]);
+  await page.evaluate(() => setSize(1));
+  for (const side of ['right', 'left']) {
+    // Where Bubble.java's snap leaves it on a landscape screen: inside the bars, shrunk by fit() when needed.
+    await room(375 - 72);
+    await page.evaluate(() => fit());
+    const [zLand] = await fitted();
+    await open(812, 375, side, Math.max(24, Math.min(120, 375 - 48 - windowFor(zLand).height)), zLand);
+    await openCheck(`rotate ${side} at 812x375`, 812, 375, side, zLand);
+    for (const [width, height] of [[375, 812], [812, 375]]) {
+      await room(height - 72);
+      await page.evaluate(() => fit());
+      const [zRot] = await fitted();
+      await resize({ width, height, deviceScaleFactor: 1, isMobile: true, hasTouch: true });
+      await reanchor(`rotate ${side} to ${width}x${height}`, width, height, side, 120, zRot);
+      await openCheck(`rotate ${side} to ${width}x${height}`, width, height, side, zRot);
+      await page.screenshot({ path: path.join(shots, `rotate-${side}-${width}x${height}.png`) });
+    }
+    await unstub();
+    await page.evaluate(() => fit());
+    await closes(() => page.mouse.click(side === 'right' ? 20 : 792, 340));
+  }
+  // ---- Large on a landscape screen too short for seven providers' tab: it shrinks to the room between the bars,
+  // as a stand-in for Bubble.java's room() gives it, and fits there collapsed and open. Turned back to a
+  // portrait room, it is Large again.
   for (const side of ['right', 'left']) {
     await room(375 - 24 - 48);
     await page.evaluate(() => setSize(1.2));
@@ -871,6 +903,243 @@ try {
   }
 
   // The PC restarted: the new run numbers from 1 again, and still wins over the old run's higher numbers.
+  // Regression 1: an open phone bubble kept open across a PC upgrade that adds Antigravity must NOT disable
+  // Antigravity even if the user toggles another provider BEFORE the phone receives the upgraded snapshot,
+  // nor may two rapid toggles from the same snapshot undo each other; and /api/options reloads on the new run.
+  const preUpgradeProviders = options.providers.filter((p) => p.id !== 'antigravity');
+  const preUpgradeOptions = { themes: options.themes, providers: preUpgradeProviders, choices: options.choices, pages: options.pages };
+  servedOptions = preUpgradeOptions;
+  pc.enabled = preUpgradeProviders.map((p) => p.id);
+  run = 'before-upgrade';
+  revs = 0;
+  await page.setViewport(small);
+  await page.goto(url, { waitUntil: 'load' });
+  await page.waitForFunction((n) => document.querySelectorAll('#cells .cell .dial').length === n, {}, preUpgradeProviders.length);
+  await open(412, 915, 'right', 120);
+  await page.click('#mn');
+  await page.waitForSelector('#prefs .sw');
+  await unfold(['providers']);
+  if (await page.$('#prefs [data-provider="antigravity"]')) fail('upgrade: Antigravity should not exist before upgrade');
+  // Upgrade the PC WITHOUT pushing the new snapshot yet (phone still holds the old 6-provider snapshot and checkboxes).
+  servedOptions = options;
+  holdOptions = true;
+  pc.enabled = options.providers.map((p) => p.id);
+  run = 'after-upgrade';
+  revs = 0;
+  // Two rapid toggles (codex + xai) fired from the pre-upgrade snapshot before any upgraded snapshot arrives!
+  await page.evaluate(() => {
+    document.querySelector('#prefs [data-provider="codex"]').click();
+    document.querySelector('#prefs [data-provider="xai"]').click();
+  });
+  await until(() => data.run === 'after-upgrade' && !data.enabled.includes('codex') && !data.enabled.includes('xai'), 'upgrade: both rapid toggles land on upgraded PC');
+  if (!pc.enabled.includes('antigravity')) fail(`upgrade: toggling before upgraded snapshot disabled Antigravity: ${JSON.stringify(pc.enabled)}`);
+  if (pc.enabled.includes('codex') || pc.enabled.includes('xai')) fail(`upgrade: rapid toggles undid each other: ${JSON.stringify(pc.enabled)}`);
+  // Once /api/options finishes reloading for the new run, Antigravity appears checked in Settings.
+  releaseOptions?.();
+  releaseOptions = null;
+  await until(() => !!document.querySelector('#prefs [data-provider="antigravity"]')?.checked, 'upgrade: reloaded options show Antigravity checked');
+  await page.click('#prefs [data-provider="xai"]');
+  await until(() => data.enabled.includes('xai'), 'upgrade: restore xAI enabled');
+  // Two rapid taps on the SAME checkbox (codex: ON then OFF) while the first POST is delayed must serialize so the second tap wins!
+  holdSettings = true;
+  release = null;
+  await page.evaluate(() => {
+    const el = document.querySelector('#prefs [data-provider="codex"]');
+    el.click();
+    el.click();
+  });
+  for (let i = 0; i < 60 && !release; i++) await new Promise((r) => setTimeout(r, 10));
+  if (!release) fail('serialize: first POST never arrived');
+  release?.();
+  release = null;
+  await new Promise((r) => setTimeout(r, 150));
+  if (pc.enabled.includes('codex')) fail(`serialize: delayed first tap undid second tap on codex: ${JSON.stringify(pc.enabled)}`);
+  await page.click('#prefs [data-provider="codex"]');
+  await until(() => data.enabled.includes('codex'), 'upgrade: restore Codex enabled');
+
+  // Regression 4: Codex then Antigravity switched off in quick succession, Codex's answer held. The PC's snapshot after
+  // Codex's change redraws the settings while Antigravity's off waits its turn: Antigravity must stay unchecked, so a
+  // second tap on it turns it back on instead of sending another off. (The PC tells the phones before it answers, so
+  // the redraw comes while Codex's answer is held, and the second tap goes then, before Antigravity's off can land.)
+  const agChecked = () => page.$eval('#prefs [data-provider="antigravity"]', (e) => e.checked);
+  holdSettings = true;
+  release = null;
+  await page.evaluate(() => {
+    document.querySelector('#prefs [data-provider="codex"]').click();
+    document.querySelector('#prefs [data-provider="antigravity"]').click();
+  });
+  for (let i = 0; i < 60 && !release; i++) await new Promise((r) => setTimeout(r, 10));
+  if (!release) fail("pending: Codex's off never reached the PC");
+  await until(() => !data.enabled.includes('codex') && data.enabled.includes('antigravity'), "pending: the PC's snapshot after Codex's off lands first");
+  await settle();
+  if (await agChecked()) fail("pending: the snapshot after Codex's off redrew Antigravity checked while its off was queued");
+  await page.click('#prefs [data-provider="antigravity"]');
+  release?.();
+  release = null;
+  await until(() => data.enabled.includes('antigravity') && !data.enabled.includes('codex') && !!document.querySelector('#prefs [data-provider="antigravity"]')?.checked, 'pending: the second tap leaves Antigravity on');
+  await new Promise((r) => setTimeout(r, 150)); // the queue settles
+  if (!pc.enabled.includes('antigravity') || !(await agChecked())) fail(`pending: two taps on Antigravity left it off: ${JSON.stringify(pc.enabled)}`);
+  if (pc.enabled.includes('codex')) fail(`pending: Codex should be off: ${JSON.stringify(pc.enabled)}`);
+  await page.click('#prefs [data-provider="codex"]');
+  await until(() => data.enabled.includes('codex'), 'pending: restore Codex enabled');
+
+  // Round 21: a finger or the mouse down on CPU's row as /api/options lands with the upgrade. Antigravity's new row would
+  // go in above CPU's, under the press: a tap would switch Antigravity instead, and a click whose press went to a row since
+  // replaced would be lost. The rows wait for the press to end, and CPU, the same element throughout, is the one switched.
+  for (const kind of ['touch', 'mouse']) {
+    servedOptions = preUpgradeOptions;
+    pc.enabled = preUpgradeProviders.map((p) => p.id);
+    run = `press-${kind}-before`;
+    revs = 0;
+    tell();
+    await until((r) => optionsRun === r && !document.querySelector('#prefs [data-provider="antigravity"]'), `press ${kind}: the PC before the upgrade`, run);
+    // Only Providers open and the settings at their top, so nothing scrolls: scroll anchoring would keep CPU's row under
+    // the press. Pressed near the row's top edge: the panel grows as a row goes in, and there the new row lands under it.
+    await fold();
+    await unfold(['providers']);
+    const box = await page.$('#prefs [data-provider="cpu"]');
+    const { x, y, b } = await box.evaluate((e) => {
+      e.closest('#prefs').scrollTop = 0;
+      const r = e.closest('label').getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + 4, b: r.bottom };
+    });
+    if (b > (await page.evaluate(() => document.querySelector('#prefs').getBoundingClientRect().bottom))) fail(`press ${kind}: CPU's row is below the fold`);
+    servedOptions = options;
+    holdOptions = true;
+    releaseOptions = null;
+    pc.enabled = options.providers.map((p) => p.id);
+    run = `press-${kind}-after`;
+    revs = 0;
+    const postsBefore = posts.length;
+    if (kind === 'touch') await touch('touchStart', [[1, x, y]]);
+    else {
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+    }
+    tell();
+    for (let i = 0; i < 100 && !releaseOptions; i++) await new Promise((r) => setTimeout(r, 5));
+    if (!releaseOptions) fail(`press ${kind}: /api/options was never asked`);
+    releaseOptions?.();
+    releaseOptions = null;
+    await until(() => options.providers.some((p) => p.id === 'antigravity'), `press ${kind}: the upgrade's options land with the ${kind} down`);
+    await settle();
+    if (await page.$('#prefs [data-provider="antigravity"]')) fail(`press ${kind}: Antigravity's row went in with the ${kind} still down`);
+    if (kind === 'touch') await touch('touchEnd', [[1, x, y]]);
+    else await page.mouse.up();
+    await until(() => !data.enabled.includes('cpu') && !!document.querySelector('#prefs [data-provider="antigravity"]')?.checked, `press ${kind}: CPU off, then Antigravity's row`);
+    const sent = posts.slice(postsBefore).map((p) => p.body.toggleProvider);
+    if (JSON.stringify(sent) !== JSON.stringify([{ id: 'cpu', enabled: false }])) fail(`press ${kind}: the PC got ${JSON.stringify(sent)}, not CPU off alone`);
+    if (!(await box.evaluate((e) => e.isConnected && !e.checked))) fail(`press ${kind}: CPU's switch was replaced, or shows on`);
+    await page.click('#prefs [data-provider="cpu"]');
+    await until(() => data.enabled.includes('cpu'), `press ${kind}: restore CPU`);
+  }
+
+  // Keyboard focus on CPU's switch outlives a snapshot that redraws the settings and an options reload that adds a row
+  // above it: the switch stays the same element, and Space still flips it.
+  servedOptions = preUpgradeOptions;
+  pc.enabled = preUpgradeProviders.map((p) => p.id);
+  run = 'focus-before';
+  revs = 0;
+  tell();
+  await until((r) => optionsRun === r && !document.querySelector('#prefs [data-provider="antigravity"]'), 'focus: the PC before the upgrade', run);
+  await page.focus('#prefs [data-provider="cpu"]');
+  await page.evaluate(() => (window.focused = document.activeElement));
+  pc.enabled = pc.enabled.filter((id) => id !== 'xai'); // the snapshot redraws xAI's switch, the count and the choices
+  tell();
+  await until(() => !data.enabled.includes('xai') && !document.querySelector('#prefs [data-provider="xai"]').checked, 'focus: a snapshot redraws the settings');
+  if (!(await page.evaluate(() => document.activeElement === focused && focused.dataset.provider === 'cpu'))) fail('focus: a snapshot redraw took the focus off CPU');
+  servedOptions = options;
+  pc.enabled = options.providers.map((p) => p.id);
+  run = 'focus-after';
+  revs = 0;
+  tell();
+  await until(() => !!document.querySelector('#prefs [data-provider="antigravity"]')?.checked, 'focus: the reload adds Antigravity');
+  if (!(await page.evaluate(() => document.activeElement === focused && focused.isConnected))) fail('focus: an options reload took the focus off CPU');
+  await page.keyboard.press('Space');
+  await until(() => !data.enabled.includes('cpu'), 'focus: Space on the focused switch turns CPU off');
+  await page.keyboard.press('Space');
+  await until(() => data.enabled.includes('cpu'), 'focus: and Space turns it on again');
+
+  // Regression 2a: PC rolls back to an older version while /api/options returns 502 (phone still holds cached
+  // capabilities.toggleProvider === true): toggling a provider must still include legacy `enabled` so the older PC applies it!
+  legacyPc = true;
+  optionsDown = true;
+  pc.enabled = preUpgradeProviders.map((p) => p.id);
+  run = 'rollback-legacy-502';
+  revs = 0;
+  tell();
+  await until(() => data.run === 'rollback-legacy-502', 'rollback: snapshot from older PC lands');
+  await page.click('#prefs [data-provider="codex"]');
+  await until(() => !data.enabled.includes('codex'), 'rollback: toggle succeeds against older PC even while /api/options returns 502');
+  if (pc.enabled.includes('codex')) fail(`rollback: older PC ignored toggle during /api/options 502: ${JSON.stringify(pc.enabled)}`);
+  optionsDown = false;
+
+  // Regression 2b: updated bubble.html against an older PC (no toggleProvider support) must still toggle providers
+  // via the legacy enabled payload and serialize rapid taps on the same checkbox.
+  servedOptions = preUpgradeOptions;
+  pc.enabled = preUpgradeProviders.map((p) => p.id);
+  run = 'legacy-pc';
+  revs = 0;
+  tell();
+  await until(() => data.run === 'legacy-pc' && !document.querySelector('#prefs [data-provider="antigravity"]'), 'legacy PC: options reloaded without toggleProvider');
+  await page.click('#prefs [data-provider="codex"]');
+  await until(() => !data.enabled.includes('codex'), 'legacy PC: updated APK still disables Codex');
+  holdSettings = true;
+  release = null;
+  await page.evaluate(() => {
+    const el = document.querySelector('#prefs [data-provider="codex"]');
+    el.click();
+    el.click();
+  });
+  for (let i = 0; i < 60 && !release; i++) await new Promise((r) => setTimeout(r, 10));
+  release?.();
+  release = null;
+  await new Promise((r) => setTimeout(r, 150));
+  if (pc.enabled.includes('codex')) fail(`legacy PC: delayed first tap undid second tap: ${JSON.stringify(pc.enabled)}`);
+  legacyPc = false;
+
+  // Regression 3a: four snapshots on an upgraded run while /api/options returns 502 (keeping the old options that
+  // lack Antigravity) must trigger only ONE /api/options request, and recover automatically via stream reconnect.
+  servedOptions = options;
+  optionsDown = true;
+  const reqsBeforeUpgrade502 = optionsRequests;
+  pc.enabled = options.providers.map((p) => p.id);
+  run = 'upgraded-options-502';
+  revs = 0;
+  for (let i = 0; i < 4; i++) {
+    tell();
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  await new Promise((r) => setTimeout(r, 150));
+  if (optionsRequests - reqsBeforeUpgrade502 !== 1) fail(`options retry on upgraded run: expected 1 request across 4 snapshots during 502, got ${optionsRequests - reqsBeforeUpgrade502}`);
+  optionsDown = false;
+  cut();
+  await until(() => es.readyState !== EventSource.OPEN, 'options 502: stream dropped');
+  reopen();
+  await until(() => !!document.querySelector('#prefs [data-provider="antigravity"]')?.checked, 'options 502: stream reconnect recovers upgraded options without manual loadOptions()');
+
+  // Regression 3b: fresh Settings session failing with 502 on the current run retries automatically on a same-run stream reconnect.
+  await closes(() => page.mouse.click(20, 885));
+  await resize(small);
+  optionsDown = true;
+  await page.reload({ waitUntil: 'load' });
+  await until(() => es.readyState === EventSource.OPEN && data.run === 'upgraded-options-502', 'fresh session: loaded');
+  await open(412, 915, 'right', 120);
+  const reqsBeforeFresh = optionsRequests;
+  await page.click('#mn');
+  await until(() => !!document.querySelector('#prefs .err'), 'fresh session: shows 502 error');
+  tell();
+  tell();
+  await new Promise((r) => setTimeout(r, 150));
+  if (optionsRequests - reqsBeforeFresh !== 1) fail(`fresh session 502: expected 1 request, got ${optionsRequests - reqsBeforeFresh}`);
+  optionsDown = false;
+  cut();
+  await until(() => es.readyState !== EventSource.OPEN, 'fresh session: stream dropped');
+  reopen();
+  await until(() => !!document.querySelector('#prefs .sw'), 'fresh session: same-run stream reconnect recovers Settings automatically');
+  await closes(() => page.mouse.click(20, 885));
+  await resize(small);
+
   run = 'stand-in, restarted';
   revs = 0;
   pc.theme = 'paper';

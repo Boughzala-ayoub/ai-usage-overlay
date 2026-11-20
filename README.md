@@ -35,6 +35,7 @@ icon is three level rows, so you can tell the two apart.
 | Codex | `~/.codex/auth.json` then the ChatGPT usage endpoint | 5 min |
 | OpenCode Go | `~/.local/share/opencode/auth.json` (or `OPENCODE_API_KEY`) then `opencode.ai/zen/go/v1/usage` | 5 min |
 | xAI | `~/.grok/auth.json` then `cli-chat-proxy.grok.com/v1/billing` | 5 min |
+| Antigravity | Windows Credential Manager (`gemini:antigravity`) then `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | 5 min |
 | CPU, RAM | This PC, through Node's `os` module. No account, no request | 15 s |
 
 Codex uses only `~/.codex/auth.json` for login and re-reads it on every refresh. If the request
@@ -63,6 +64,13 @@ refresh token and writes the new tokens back to `auth.json` for `grok`. Only if 
 refresh token does the xAI section say to run `grok`, with a dash on the chip. The endpoint is the CLI's own, not a public API. If its answer changes shape,
 the section says no usage windows were reported. xAI's mark is monochrome, so on both screens it
 takes the theme's text colour.
+
+Antigravity reads its Google OAuth token from Windows Credential Manager (`gemini:antigravity`), or
+from `~/.gemini/antigravity-cli/antigravity-oauth-token` (or `ANTIGRAVITY_AUTH_FILE`) if present.
+It queries `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` for the 5-hour
+and weekly buckets across both model groups (`Gemini 5h`, `Gemini wk`, `Other 5h`, `Other wk`),
+converting `remainingFraction` into percentage used, and reads the subscription tier once per token
+from `v1internal:loadCodeAssist`. Like Claude, the overlay never mutates Antigravity's credentials.
 
 CPU and RAM are this PC, so the phone can see them too. CPU is the load across every core since the
 last read, so the first read samples half a second. It is Windows' "% Processor Time", and Task
@@ -108,7 +116,7 @@ lines that moved land and the reading keeps its age and note.
 Only the usage lines move: a line the copy lacks keeps its number, and the plan, the API credit and
 the banked resets stay as the endpoint last gave them.
 
-A 429's `Retry-After` becomes a per-provider gate in `readOne`. The gate blocks the manual Refresh
+A 429's `Retry-After` (for Antigravity, any failed answer's, a 503's included) becomes a per-provider gate in `readOne`. The gate blocks the manual Refresh
 too, since a button that fires a doomed request every click earns the next 429. It persists to
 `state.json` with the last good reading, so a restart paints real numbers at once and doesn't ask
 an endpoint that already said no. Meanwhile the local sources keep the numbers moving. When the
@@ -148,7 +156,7 @@ puts the capsule back on the right of the primary display.
   one the panel's rows scroll. A display that turns, rescales, or is unplugged or plugged back in puts
   the capsule back on its edge at once.
 - A chip reads the highest of that provider's limits, since that one stops you first. `Summary
-  shows` picks a specific limit instead, for Claude and OpenCode Go.
+  shows` picks a specific limit instead, for Claude, OpenCode Go and Antigravity.
 - Every reading, in the pill or the panel, is a number with a thin bar filled to the percentage.
   Both turn amber at 75% and red at 90%, and a chip's bar pulses above 90%.
 - The panel opens after the cursor rests on the capsule for 120ms, so running the mouse along the
@@ -243,7 +251,7 @@ tailscale serve --bg --https=8443 http://127.0.0.1:7430
 | `GET /api/usage` | What the panel shows, the theme's colours, the shared settings, and the snapshot's `run` and `rev`. Reads what is due first, through `readOne`, so the phone obeys the same 5-minute floor and 429 gate as the PC. It waits at most 5 s for those reads, then answers with what there is, and the stream brings the rest. `POST` is the panel's Refresh, and waits at most 45 s. |
 | `GET /api/events` | The same, as a stream: once on connecting, then on every change. Each provider's reading goes out as it lands, not with the slowest one's. CPU and RAM move at most every tick, so with nothing else new a phone hears at most twice every 15 s, or once a minute with both off. A `ping` event every 20 s lets the page replace a stream that died without closing. |
 | `GET /api/options` | The tray menu's choices: themes, providers, summary limits, usage pages. |
-| `POST /api/settings` | `{ theme, enabled, choices }`, any of them, applied as the tray menu applies them. JSON only. |
+| `POST /api/settings` | `{ theme, enabled, toggleProvider, choices, keepAwake }`, any of them, applied as the tray menu applies them. JSON only. |
 
 Requests for any host but loopback or a `*.ts.net` name get a 403. That stops a web page that points
 its own domain at 127.0.0.1 from reading anything. Settings take `application/json` only, which a

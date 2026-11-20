@@ -3,6 +3,7 @@
 //   { plan, rows: [{ label, percent, resetsAt }], error, updatedAt }
 // Pure shaping is exported separately so test.js can check it without touching disk or network.
 
+const { execFile } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -24,6 +25,9 @@ const GROK_BILLING_API = 'https://cli-chat-proxy.grok.com/v1/billing';
 const GROK_TOKEN_API = 'https://auth.x.ai/oauth2/token';
 const CURSOR_AUTH = path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Cursor', 'auth.json');
 const CURSOR_DASHBOARD_API = 'https://api2.cursor.sh/aiserver.v1.DashboardService';
+const ANTIGRAVITY_API = 'https://daily-cloudcode-pa.googleapis.com/v1internal';
+const ANTIGRAVITY_UA = 'antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64)';
+const ANTIGRAVITY_AUTH = path.join(HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -34,15 +38,126 @@ const TAIL_BYTES = 256 * 1024; // rollout files grow to MBs; the last rate_limit
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 
-// A failed answer as an error with its status and its Retry-After in seconds, seconds or an HTTP date.
-async function httpError(r) {
+const ERROR_BODY_MAX_BYTES = 64 * 1024;
+const ERROR_BODY_TIMEOUT_MS = 2000;
+
+// Retry-After in seconds (RFC 9110 §10.2.3): digits, or an HTTP date, a past one being 0. 0 is a delay like any other.
+// null when the header gives none to use: absent, junk, negative, or digits too many for its deadline in ms to be a
+// number, or a date that isn't one (httpDate).
+function retryAfterSeconds(v) {
+  const s = (v || '').trim();
+  if (/^\d+$/.test(s)) return Number.isFinite(Date.now() + Number(s) * 1000) ? Number(s) : null;
+  const t = httpDate(s);
+  return Number.isFinite(t) ? Math.max(0, (t - Date.now()) / 1000) : null;
+}
+
+// The three HTTP-date forms (RFC 9110 §5.6.7), every one GMT: IMF-fixdate, RFC 850's and asctime's (a day of a space and
+// one digit allowed). Not Date.parse: it reads asctime's in the local zone, rolls 31 Nov over to 1 Dec, and takes "-5".
+// The weekday goes unchecked; nothing needs it.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MON = `(?<mo>${MONTHS.join('|')})`;
+const HMS = '(?<h>\\d\\d):(?<mi>\\d\\d):(?<s>\\d\\d)';
+const HTTP_DATES = [
+  new RegExp(`^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (?<d>\\d\\d) ${MON} (?<y>\\d{4}) ${HMS} GMT$`),
+  new RegExp(`^(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, (?<d>\\d\\d)-${MON}-(?<y>\\d\\d) ${HMS} GMT$`),
+  new RegExp(`^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ${MON} (?<d>[ \\d]\\d) ${HMS} (?<y>\\d{4})$`),
+];
+function httpDate(s) {
+  const g = HTTP_DATES.map((re) => re.exec(s)?.groups).find(Boolean);
+  if (!g) return NaN;
+  let y = Number(g.y);
+  const [mo, d, h, mi, sec] = [MONTHS.indexOf(g.mo), Number(g.d), Number(g.h), Number(g.mi), Number(g.s)];
+  // RFC 850's two-digit year: the latest year ending in those digits that is no more than 50 years ahead, to the second
+  // (a date has no milliseconds, so a part second of now never tips it). Only the year 50 on can pass that, and the rest
+  // of the date says whether it does. Decided before the day is checked, so 29 Feb lands in the century whose leap year it is.
+  if (g.y.length === 2) {
+    const now = new Date(Date.now());
+    const max = now.getUTCFullYear() + 50;
+    y = max - ((max - y) % 100);
+    const at = [mo, d, h, mi, sec];
+    const cut = [now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds()];
+    const i = at.findIndex((v, k) => v !== cut[k]);
+    if (y === max && i >= 0 && at[i] > cut[i]) y -= 100;
+  }
+  const day = new Date(Date.UTC(y, mo, d));
+  // A day that rolled over (31 Nov, 29 Feb 2026, day 00, or a year under 100 that Date.UTC put in the 1900s) is no date.
+  // A second of 60 is a leap second.
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo || day.getUTCDate() !== d || h > 23 || mi > 59 || sec > 60) return NaN;
+  return day.getTime() + ((h * 60 + mi) * 60 + sec) * 1000;
+}
+
+function buildHttpError(r) {
   const e = new Error(`HTTP ${r.status}`);
   e.status = r.status;
   e.soft = r.status >= 500 || r.status === 408; // a server error or timeout fixes itself: no message, the last numbers stay
-  const retry = r.headers.get('retry-after');
-  e.retryAfter = Math.max(0, Number(retry) || (Date.parse(retry) - Date.now()) / 1000 || 0);
+  e.retryAfter = retryAfterSeconds(r.headers.get('retry-after'));
+  return e;
+}
+
+// A failed answer as an error with its status and its Retry-After in seconds, seconds or an HTTP date.
+async function httpError(r) {
+  const e = buildHttpError(r);
   await r.body?.cancel().catch(() => {}); // a body that already broke rejects here; the status still stands
   return e;
+}
+
+// Reads up to 64 KiB of an error response within 2s, cancelling the reader and aborting fetch on deadline or cap so
+// the stream is never left locked/open and a stalled body never erases an already-known HTTP status.
+async function readBoundedErrorBody(r, abort, signal) {
+  let timer;
+  let reader = null;
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    reader?.cancel().catch(() => {});
+    abort?.();
+  };
+  let settleTimeout;
+  const timeout = new Promise((resolve) => {
+    settleTimeout = () => {
+      stop();
+      resolve(null);
+    };
+    timer = setTimeout(settleTimeout, ERROR_BODY_TIMEOUT_MS);
+  });
+  if (signal) {
+    if (signal.aborted) settleTimeout();
+    else signal.addEventListener('abort', settleTimeout, { once: true });
+  }
+  const read = (async () => {
+    try {
+      if (r.body && typeof r.body.getReader === 'function') {
+        reader = r.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (!stopped) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          total += value.byteLength;
+          if (total > ERROR_BODY_MAX_BYTES) {
+            stop();
+            return null;
+          }
+          chunks.push(Buffer.from(value));
+        }
+        return stopped ? null : Buffer.concat(chunks).toString('utf8');
+      }
+      if (typeof r.text === 'function') {
+        const text = await r.text();
+        if (stopped || Buffer.byteLength(String(text || ''), 'utf8') > ERROR_BODY_MAX_BYTES) return null;
+        return String(text || '');
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  })();
+  return Promise.race([read, timeout]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', settleTimeout);
+  });
 }
 
 // A request's deadline, body included, that holds whatever fetch does. AbortSignal.timeout alone didn't: on
@@ -58,24 +173,52 @@ function within(ms, request) {
       reject(e);
     }, ms);
   });
-  return Promise.race([request(ac.signal), late]).finally(() => clearTimeout(timer));
+  return Promise.race([request(ac.signal, () => ac.abort()), late]).finally(() => clearTimeout(timer));
 }
 
-async function fetchJson(url, headers, body) {
+async function fetchJson(url, headers, body, opts = {}) {
   for (let attempt = 0; ; attempt++) {
+    let knownHttpError = null;
     try {
-      return await within(15_000, async (signal) => {
+      return await within(15_000, async (signal, abort) => {
         const r = await fetch(url, { headers, signal, ...(body ? { method: 'POST', body } : {}) });
-        if (!r.ok) throw await httpError(r);
+        if (!r.ok) {
+          knownHttpError = buildHttpError(r);
+          // The wait holds as the headers land, not once a 403's body is read (2s at most, or cut off): a request made
+          // meanwhile, a refresh under a rotated bearer, must find it.
+          if (knownHttpError.retryAfter > 0) opts.onRetryAfter?.(knownHttpError.retryAfter);
+          if (opts.readErrorBody && r.status === 403) {
+            const raw = await readBoundedErrorBody(r, abort, signal);
+            if (raw) {
+              try {
+                const parsed = JSON.parse(raw);
+                knownHttpError.errorStatus = typeof parsed?.error?.status === 'string' ? parsed.error.status : '';
+                knownHttpError.errorReasons = (Array.isArray(parsed?.error?.details) ? parsed.error.details : [])
+                  .map((d) => (typeof d?.reason === 'string' ? d.reason : ''))
+                  .filter(Boolean);
+              } catch {
+                /* non-JSON error body; the HTTP 403 status still stands */
+              }
+            }
+          } else {
+            await r.body?.cancel().catch(() => {});
+          }
+          throw knownHttpError;
+        }
         return await r.json();
       });
     } catch (e) {
+      // Once headers established an HTTP status, an outer deadline firing during error-body read must never
+      // downgrade that known HTTP error into a retryable transport timeout.
+      if (knownHttpError) throw knownHttpError;
       // A body cut short (SyntaxError) is as soft as no answer at all.
       const transport = !e.status && (e instanceof TypeError || e instanceof SyntaxError || e.name === 'TimeoutError');
       if (!transport) throw e;
-      if (attempt === 0) {
+      // The caller says whether a retry may still go: not under a wait that came meanwhile (another request's 429 for the
+      // account), nor once the request is called off (a sign-out). Asked before the pause, so a dead one skips it, and after.
+      if (attempt === 0 && (!opts.canRetry || opts.canRetry())) {
         await new Promise((resolve) => setTimeout(resolve, 250));
-        continue;
+        if (!opts.canRetry || opts.canRetry()) continue;
       }
       const detail = e.cause?.code;
       throw Object.assign(new Error(e.name === 'TimeoutError' ? 'Request timed out' : `${e.message}${detail ? ` (${detail})` : ''}`), { soft: true });
@@ -122,11 +265,81 @@ function nextMonthly(start, now = Date.now()) {
 }
 
 const clamp = (n) => Math.max(0, Math.min(100, Number(n) || 0));
-const ringPercent = (rows, label) => (rows || []).find((r) => r.label === label)?.percent ?? Math.max(0, ...(rows || []).map((r) => r.percent));
+// A row's own comparison key first (an Antigravity bucket's: what it is, not which ID it drew), then its ID, then its
+// label, each in a namespace of its own so none can equal another. Window casing is normalized in stored keys so a
+// cached uppercase window ("WEEKLY") still matches its lowercased successor after upgrade.
+const rowKey = (r) => {
+  if (!r.key) return r.id ? `id:${r.id}` : `label:${r.label}`;
+  try {
+    const p = JSON.parse(r.key);
+    if (Array.isArray(p) && (p.length === 3 || p.length === 4)) {
+      const wi = p.length === 4 ? 2 : 1;
+      if (typeof p[wi] === 'string' && p[wi] !== p[wi].toLowerCase()) {
+        const norm = [...p];
+        norm[wi] = p[wi].toLowerCase();
+        return `key:${JSON.stringify(norm)}`;
+      }
+    }
+  } catch { /* non-JSON key: compare verbatim */ }
+  return `key:${r.key}`;
+};
+const ringPercent = (rows, choice) => {
+  const list = rows || [];
+  // A stable ID's pool: the row with that ID and every row that belongs to it (duplicates of its bucketId, and ID-less
+  // Antigravity rows that are that bucket), the fullest showing. Else a human-readable label match.
+  if (choice) {
+    const pool = list.filter((r) => r.id === choice || r.bucketId === choice);
+    if (pool.length) return Math.max(...pool.map((r) => r.percent));
+    const byLabel = list.find((r) => r.label === choice);
+    if (byLabel) return byLabel.percent;
+  }
+  return Math.max(0, ...list.map((r) => r.percent));
+};
 const resetRows = (previous, current) => {
-  const before = new Map((previous || []).map((r) => [r.label, Number(r.percent)]));
+  // Skip ambiguous rows (whose keys depend on response ordering, or multiple legacy rows that collapse onto one
+  // normalized key) and disabled rows (whose 100% display is an artificial lockout override, so re-enabling them at
+  // their real usage never fires a false reset). Count collisions across ALL previous rows before filtering disabled
+  // rows so a disabled legacy row colliding with an enabled one never makes the survivor look unique.
+  const allPrev = previous || [];
+  const prevCounts = new Map();
+  const prevIdCounts = new Map();
+  for (const r of allPrev) {
+    prevCounts.set(rowKey(r), (prevCounts.get(rowKey(r)) || 0) + 1);
+    if (r.id) prevIdCounts.set(r.id, (prevIdCounts.get(r.id) || 0) + 1);
+  }
+  const prev = allPrev.filter((r) => !r.ambiguous && !r.disabled && prevCounts.get(rowKey(r)) === 1);
+  const before = new Map(prev.map((r) => [rowKey(r), Number(r.percent)]));
+  // A known lone bucket (its own canonical bucketId as its ID, no pool beside it) can match when display metadata or its
+  // window is added or dropped (even if label disambiguation renamed it), provided any group, window and displayName
+  // present on both sides agree. Unknown shared bucketIds require exact comparison-key matches so distinct buckets taking
+  // turns never false-reset.
+  const lone = (r) => r.id && !r.bucketId && Object.hasOwn(ANTIGRAVITY_BUCKETS, r.id);
+  const keyParts = (r) => {
+    if (!r.key) return null;
+    try {
+      const p = JSON.parse(r.key);
+      return Array.isArray(p) && p.length === 4 ? p : null;
+    } catch {
+      return null;
+    }
+  };
+  const sameLone = (a, b) => {
+    // [bucketId, group, window, displayName]; a row with no key still has its window.
+    const ap = keyParts(a) || [a.id, '', a.win || '', ''];
+    const bp = keyParts(b) || [b.id, '', b.win || '', ''];
+    return [1, 2, 3].every((i) => !ap[i] || !bp[i] || (i === 2 ? ap[i].toLowerCase() === bp[i].toLowerCase() : ap[i] === bp[i]));
+  };
+  const beforeLone = new Map(prev.filter((r) => lone(r) && prevIdCounts.get(r.id) === 1).map((r) => [r.id, r]));
   // Under a point is rounding, such as xAI's whole percent against Cursor's fraction of the same pool, not a reset.
-  return (current || []).filter((r) => before.has(r.label) && Number(r.percent) <= before.get(r.label) - 1);
+  return (current || []).filter((r) => {
+    if (r.ambiguous || r.disabled) return false;
+    let was = before.get(rowKey(r));
+    if (was === undefined && lone(r)) {
+      const p = beforeLone.get(r.id);
+      if (p && sameLone(p, r)) was = Number(p.percent);
+    }
+    return was !== undefined && Number(r.percent) <= was - 1;
+  });
 };
 
 // ---- Claude: OAuth token that Claude Code keeps rotating in place, so we re-read it every call.
@@ -294,7 +507,7 @@ async function readClaude() {
     // newest numbers other clients have (readClaudeLocal). With only the marker to go on (accountUnknown), it still
     // drops the plan and date on hand, but goes on taking copies for the account it last knew.
     const failed = { ...whose(), ...(known.account ? {} : { accountUnknown: true }) };
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60, ...failed };
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter ?? 60, ...failed };
     return { error: e.message || 'Request failed', soft: !!e.soft, ...failed };
   }
 }
@@ -492,7 +705,7 @@ async function readCodex() {
     }
     return shaped.error ? { ...readCodexFallback('Live usage unavailable'), ...renewal() } : { ...shaped, ...renewal(), updatedAt: Date.now() };
   } catch (e) {
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60, ...renewal() }; // whose, for main
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter ?? 60, ...renewal() }; // whose, for main
     return { ...readCodexFallback('Live refresh failed'), ...renewal() };
   }
 }
@@ -526,7 +739,7 @@ async function readOpenCodeGo() {
     const body = await fetchJson(OPENCODE_GO_API, { Authorization: `Bearer ${key}` });
     return { ...shapeOpenCodeGo(body), updatedAt: Date.now() };
   } catch (e) {
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter ?? 60 };
     if (e.status === 401) return { error: 'OpenCode Go key rejected — run `opencode auth login`.' };
     return { error: e.message || 'Request failed', soft: !!e.soft };
   }
@@ -637,7 +850,7 @@ async function readXai() {
     // A refused sign-in is the read's, whatever else answered: it asks you to act. Then a 429 gates xAI as a whole,
     // whichever lookup drew it, for the longer wait if both did. With no line left a failure is the read's, the
     // monthly lookup's first. On the unified weekly pool the monthly limit is 0, so that's any weekly failure.
-    const wait = (e) => e.retryAfter || 60;
+    const wait = (e) => e.retryAfter ?? 60;
     const fatal = failed.find((e) => e.status === 401 || e.status === 403) ||
       failed.filter((e) => e.status === 429).sort((a, b) => wait(b) - wait(a))[0] || (shaped.error && failed[0]);
     if (fatal) throw fatal;
@@ -650,12 +863,638 @@ async function readXai() {
     if (!lost) xaiLines = (shaped.rows || []).map((r) => r.label);
     return { ...shaped, updatedAt: Date.now() };
   } catch (e) {
-    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter || 60 };
+    if (e.status === 429) return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter ?? 60 };
     // A refresh token xAI no longer takes, or a token renewed elsewhere and revoked.
     if (e.status === 401 || e.status === 403) return { error: 'Grok sign-in expired — run `grok` to renew it.' };
     // The billing endpoint answers 503 now and then: soft, so the last numbers stay up until it recovers.
     if (e.status >= 500) return { error: `xAI usage not refreshed (${e.message}).`, soft: true };
     return { error: e.message || 'Request failed', soft: !!e.soft };
+  }
+}
+
+// ---- Antigravity: Google's OAuth token sits in Windows Credential Manager as `gemini:antigravity`
+// (or a fallback token file on headless setups), refreshed while Antigravity runs.
+// Usage comes from daily-cloudcode-pa's retrieveUserQuotaSummary, and the plan tier from loadCodeAssist.
+const ANTIGRAVITY_TIERS = Object.assign(Object.create(null), {
+  'g1-ultra-tier': 'AI Ultra',
+  'g1-ultra-lite-tier': 'AI Ultra',
+  'g1-pro-tier': 'AI Pro',
+  'free-tier': 'Free',
+  'standard-tier': 'Standard',
+});
+const ANTIGRAVITY_BUCKETS = Object.assign(Object.create(null), {
+  'gemini-5h': 'Gemini 5h',
+  'gemini-weekly': 'Gemini wk',
+  '3p-5h': 'Other 5h',
+  '3p-weekly': 'Other wk',
+});
+// The group of non-Gemini models ("Claude and GPT models"), whose ID-less 5h and weekly buckets are Other 5h's and Other
+// wk's. Never one led by Gemini.
+const THIRD_PARTY = /^(?!gemini\b).*\b(?:claude|gpt|other|3p|third[- ]?party)\b/i;
+const POWERSHELL = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+// Structured JSON envelope with base64 payload and Win32 error code (1168 = ERROR_NOT_FOUND), so a timeout or
+// native read failure is never mistaken for an absent credential or routed to a stale fallback file.
+// Empty blobs (CredentialBlobSize == 0 or null pointer) return raw:"" without calling Marshal.Copy, which would throw.
+const CRED_READ_PS = `[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class C { [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct CR { public uint F,T; public string N,Co; public long W; public uint S; public IntPtr B; public uint P,Ac; public IntPtr A; public string Ta,U; } [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CredRead(string t, uint ty, uint r, out IntPtr p); [DllImport("advapi32.dll")] public static extern void CredFree(IntPtr p); public static string Get(string t) { IntPtr p; if (!CredRead(t, 1, 0, out p)) { int e = Marshal.GetLastWin32Error(); return "{\\"ok\\":false,\\"notFound\\":" + (e == 1168 ? "true" : "false") + ",\\"code\\":" + e + "}"; } try { var c = Marshal.PtrToStructure<CR>(p); if (c.S == 0 || c.B == IntPtr.Zero) return "{\\"ok\\":true,\\"raw\\":\\"\\"}"; var b = new byte[c.S]; Marshal.Copy(c.B, b, 0, (int)c.S); return "{\\"ok\\":true,\\"raw\\":\\"" + Convert.ToBase64String(b) + "\\"}"; } finally { CredFree(p); } } }'; [Console]::Write([C]::Get('gemini:antigravity'))`;
+
+function defaultWinCredReader() {
+  return new Promise((resolve) => {
+    execFile(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', CRED_READ_PS], { windowsHide: true, timeout: 10_000, encoding: 'utf8' }, (err, stdout) => {
+      if (err) return resolve({ status: 'error', message: err.killed ? 'Antigravity credential lookup timed out' : (err.message || 'Antigravity credential lookup failed') });
+      try {
+        const res = JSON.parse(stdout || '');
+        if (res?.ok && typeof res.raw === 'string') {
+          if (!res.raw) return resolve({ status: 'invalid' });
+          try {
+            return resolve({ status: 'ok', data: JSON.parse(Buffer.from(res.raw, 'base64').toString('utf8')) });
+          } catch {
+            return resolve({ status: 'invalid' });
+          }
+        }
+        if (res?.notFound) return resolve({ status: 'not_found' });
+        return resolve({ status: 'error', message: `Antigravity credential read failed (Win32 ${res?.code ?? 'unknown'})` });
+      } catch {
+        return resolve({ status: 'error', message: 'Antigravity credential lookup returned invalid data' });
+      }
+    });
+  });
+}
+
+let winCredReader = defaultWinCredReader;
+function setAntigravityCredReader(fn) {
+  winCredReader = fn || defaultWinCredReader;
+}
+
+function readCredFile(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e?.code === 'ENOENT') return { status: 'not_found' };
+    return { status: 'error', message: e?.message || 'Antigravity credential file unreadable' };
+  }
+  try {
+    return { status: 'ok', data: JSON.parse(text) };
+  } catch {
+    return { status: 'invalid' };
+  }
+}
+
+async function readAntigravityCreds() {
+  if (process.env.ANTIGRAVITY_AUTH_FILE) return readCredFile(process.env.ANTIGRAVITY_AUTH_FILE);
+  if (process.platform === 'win32' || winCredReader !== defaultWinCredReader) {
+    const win = await winCredReader();
+    // Only fall back to the CLI token file on confirmed absence (ERROR_NOT_FOUND); a helper timeout, Win32
+    // error, or corrupted/empty credential entry must never silently select another account from an old file.
+    if (win.status !== 'not_found') return win;
+  }
+  return readCredFile(ANTIGRAVITY_AUTH);
+}
+
+function antigravityIdentity(raw) {
+  const tok = raw?.token || raw;
+  const email = typeof raw?.id_token_email === 'string' && raw.id_token_email.trim().toLowerCase();
+  const refresh = typeof tok?.refresh_token === 'string' && tok.refresh_token;
+  const access = typeof tok?.access_token === 'string' && tok.access_token;
+  const tokenHash = access ? accountKey(access) : null;
+  const refreshHash = refresh ? accountKey(refresh) : null;
+  const strong = email || refresh;
+  if (strong) {
+    const account = accountKey(strong);
+    // Include the hashed refresh token alongside email so rotating the bearer when email is absent/added still matches Retry-After.
+    const gateKeys = [...new Set([account, ...(refreshHash ? [refreshHash] : []), ...(tokenHash ? [`tok:${tokenHash}`] : [])])];
+    return { account, gateKey: account, gateKeys, tokenHash, identityWeak: false };
+  }
+  if (access) {
+    // Access-token-only credentials cannot distinguish rotation from account switch, so 429 gating is conservative,
+    // and carrying the hashed bearer token preserves backoff if refresh_token/email is later added to the same token.
+    return { account: tokenHash, gateKey: '__weak__', gateKeys: ['__weak__', `tok:${tokenHash}`], tokenHash, identityWeak: true };
+  }
+  return { account: null, gateKey: null, gateKeys: [], tokenHash: null, identityWeak: true };
+}
+
+// Which backoff keys belong to one account. An email, a refresh token and a bearer each name a single account, so every
+// credential read links the ones it carries, for good: a Retry-After then holds back every key its account has shown,
+// whenever the 429 lands and whatever the credential has become since, across account switches too. `__weak__` stands
+// for every bare bearer nothing names: it never links, and only such a bearer reads it (see antigravityAliases).
+// ponytail: forgets the least recently seen key past 128 (a bearer rotates about hourly, so days-old ones). main.js
+// saves the groups (antigravityLinks) whenever one gains a key, so a restart knows them before any wait is read; a
+// restart loses only the order they were last seen in.
+const agAliases = new Map(); // key -> Set of keys proven to be the same account, shared by all of them
+// True when a group of two or more keys gained one: a link worth saving.
+function linkAntigravityKeys(keys) {
+  const strong = [...new Set((keys || []).filter((k) => k && k !== '__weak__'))];
+  if (!strong.length) return false;
+  const groups = new Set(strong.map((k) => agAliases.get(k)).filter(Boolean));
+  const group = groups.size === 1 ? [...groups][0] : new Set([...groups].flatMap((g) => [...g]));
+  const grew = groups.size > 1 || strong.some((k) => !group.has(k));
+  for (const k of strong) group.add(k);
+  if (groups.size > 1) for (const k of group) agAliases.set(k, group);
+  for (const k of strong) {
+    agAliases.delete(k); // the most recently seen go last, so the oldest go first
+    agAliases.set(k, group);
+  }
+  for (const [k, g] of agAliases) {
+    if (agAliases.size <= 128) break;
+    agAliases.delete(k);
+    g.delete(k);
+  }
+  return grew && group.size > 1;
+}
+// The groups to save: hashed keys only (accountKey), 128 at most. A lone key links nothing.
+const antigravityLinks = () => [...new Set(agAliases.values())].filter((g) => g.size > 1).map((g) => [...g]);
+// For test.js's simulated restarts: a real one starts with no links and no tier deadlines but those state.json kept.
+const clearAntigravityAliases = () => agAliases.clear();
+const clearAntigravityTierGates = () => (tierGates.splice(0), tierRejected.clear());
+// The keys a credential's deadline is read from: its own and every key linked to them. A bare bearer reads `__weak__`
+// only while nothing names it, since it could be any bare token's rotation; one an email or refresh token came with is
+// that account's. Writes go here and to the credential's own keys, so a named bearer still leaves its wait on
+// `__weak__` for its account's unnamed rotations.
+function antigravityAliases(keys) {
+  const out = new Set();
+  let bare = false;
+  for (const k of keys || []) {
+    if (k === '__weak__') bare = true;
+    else if (k) {
+      out.add(k);
+      for (const m of agAliases.get(k) || []) out.add(m);
+    }
+  }
+  if (bare && out.size <= 1) out.add('__weak__');
+  return [...out];
+}
+
+// Retry-After deadlines, quota's (main.js) and loadCodeAssist's (tierGates) alike: [{ until, keys, origin }]. A wait
+// holds back every key in `keys`: the account's that drew it, `__weak__` once that account shows a bare bearer, and the
+// bare bearers that read it there, since each may be the account's next. `origin` is the keys proven to be the drawer's:
+// the bearer that drew it, and every key since linked to that bearer, so a bare bearer that drew one is named the moment
+// it comes with an email or refresh token. When a bearer that waited under `__weak__` is named as an account the origin
+// names none of, the wait was another account's and no longer holds it. A wait whose drawer nothing has named still does:
+// it may be this account's. Records are saved whole, so a restart knows whose a wait is.
+const namesAccount = (keys) => keys.some((k) => k !== '__weak__' && !k.startsWith('tok:'));
+function gateUntil(list, keys, now = Date.now()) {
+  const read = antigravityAliases(keys);
+  const all = [...new Set([...read, ...(keys || [])])].filter(Boolean);
+  let until = 0;
+  let changed = false;
+  const add = (to, ks) => {
+    for (const k of ks) {
+      if (!to.includes(k)) {
+        to.push(k);
+        changed = true;
+      }
+    }
+  };
+  for (const g of list) {
+    if (g.until <= now) continue;
+    const owner = antigravityAliases(g.origin); // no `__weak__`: an origin never holds it
+    add(g.origin, owner);
+    add(g.keys, owner);
+    if (!read.some((k) => g.keys.includes(k))) continue;
+    const mine = read.some((k) => g.origin.includes(k));
+    if (!mine && namesAccount(read) && namesAccount(g.origin)) continue;
+    until = Math.max(until, g.until);
+    add(g.keys, all);
+    if (mine && namesAccount(g.origin)) add(g.origin, read.filter((k) => k !== '__weak__'));
+  }
+  return { until, changed };
+}
+// Expanded when the answer lands, not when the request left, so keys linked meanwhile are covered too.
+function gateSet(list, keys, until, now = Date.now()) {
+  const all = [...new Set([...antigravityAliases(keys), ...(keys || [])])].filter(Boolean);
+  if (!all.length || !Number.isFinite(until)) return; // a deadline that never comes would hold the account for good
+  for (let i = list.length; i--;) if (list[i].until <= now) list.splice(i, 1);
+  list.push({ until, keys: all, origin: all.filter((k) => k !== '__weak__') });
+}
+// Saved records, the live ones. The format before origins ({ key: until }) comes back with none known, so it holds.
+const isKeyList = (a) => Array.isArray(a) && a.every((k) => typeof k === 'string');
+const gateList = (raw, now = Date.now()) => (Array.isArray(raw) ? raw : Object.entries(raw && typeof raw === 'object' ? raw : {}).map(([k, until]) => ({ until, keys: [k], origin: [] })))
+  .filter((g) => g && typeof g.until === 'number' && g.until > now && isKeyList(g.keys) && isKeyList(g.origin))
+  .map((g) => ({ until: g.until, keys: [...g.keys], origin: [...g.origin] }));
+// A restart's links, from what state.json kept: the saved groups, the saved reading's keys, and the origin of each saved
+// wait that names an account, quota's and loadCodeAssist's. A bare bearer that only waited under `__weak__` is in `keys`,
+// never linked. A saved key that isn't a hash (a hand-edited file) links nothing.
+function restoreAntigravityLinks(reading, gates, links) {
+  if (Array.isArray(links)) for (const g of links) if (isKeyList(g)) linkAntigravityKeys(g.filter((k) => /^(?:tok:)?[0-9a-f]{12}$/.test(k)));
+  if (isKeyList(reading?.gateKeys)) linkAntigravityKeys(reading.gateKeys);
+  for (const g of [...gates, ...tierGates]) if (namesAccount(g.origin)) linkAntigravityKeys(g.origin);
+}
+
+function parseTierObj(tier) {
+  if (!tier || typeof tier !== 'object') return '';
+  if (typeof tier.id === 'string' && Object.hasOwn(ANTIGRAVITY_TIERS, tier.id)) return ANTIGRAVITY_TIERS[tier.id];
+  return typeof tier.name === 'string' && tier.name.trim() ? tier.name.trim().replace(/^Google\s+/i, '') : '';
+}
+
+function parseAntigravityPlan(assist) {
+  return parseTierObj(assist?.paidTier) || parseTierObj(assist?.currentTier);
+}
+
+// Strict ProtoJSON decimal/exponent float syntax: rejects non-decimal forms like "0b0" or "0x1".
+const PROTO_FLOAT = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+function shapeAntigravity(summary, assist) {
+  const plan = typeof assist === 'string' ? assist : parseAntigravityPlan(assist);
+  const groups = Array.isArray(summary?.groups) ? summary.groups : [];
+  const order = (w) => {
+    const s = typeof w === 'string' ? w.trim().toLowerCase() : '';
+    return s === '5h' ? 0 : s === 'weekly' || s === 'wk' ? 1 : 2;
+  };
+  // Parse valid buckets first so malformed/skipped buckets cannot affect duplicate detection, and count raw
+  // bucketIds and comparison keys across all groups.
+  const items = [];
+  const idCounts = new Map();
+  const keyCounts = new Map();
+  for (const g of groups) {
+    if (!g || typeof g !== 'object' || Array.isArray(g)) continue;
+    const buckets = Array.isArray(g.buckets) ? [...g.buckets].sort((a, b) => order(a?.window) - order(b?.window)) : [];
+    // Any other type (an object with no usable toString, a number) is no name: one malformed group must not throw away
+    // every valid row.
+    const rawGroup = typeof g.displayName === 'string' ? g.displayName.trim() : '';
+    const groupName = rawGroup.replace(/\s+models?\s*$/i, '').trim();
+    for (const b of buckets) {
+      if (!b || typeof b !== 'object' || Array.isArray(b)) continue;
+      const parsedReset = typeof b.resetTime === 'string' && b.resetTime.trim() ? Date.parse(b.resetTime) : NaN;
+      // Protobuf zero-timestamp (1970-01-01T00:00:00Z / .000Z / +00:00) and invalid dates count as no reset time.
+      const resetTime = Number.isFinite(parsedReset) && parsedReset > 0 ? b.resetTime.trim() : null;
+      const rawId = typeof b.bucketId === 'string' && b.bucketId.trim() ? b.bucketId.trim() : undefined;
+      const rawWin = typeof b.window === 'string' ? b.window.trim() : '';
+      const lowWin = rawWin.toLowerCase();
+      const win = lowWin === 'weekly' || lowWin === 'wk' ? 'wk' : lowWin === '5h' ? '5h' : rawWin;
+      const disp = typeof b.displayName === 'string' ? b.displayName.trim() : '';
+      if (!rawId && !rawWin && !disp && !resetTime && b.disabled !== true && (b.remainingFraction === undefined || b.remainingFraction === null)) continue;
+      let percent;
+      if (b.disabled === true) {
+        percent = 100;
+      } else if (b.remainingFraction === undefined || b.remainingFraction === null) {
+        // Proto3 JSON omits 0.0 when a bucket is exhausted; an active resetTime distinguishes drained from untouched.
+        percent = resetTime ? 100 : 0;
+      } else {
+        const rawFrac = b.remainingFraction;
+        let frac = NaN;
+        if (typeof rawFrac === 'number') frac = rawFrac;
+        else if (typeof rawFrac === 'string' && PROTO_FLOAT.test(rawFrac.trim())) frac = Number(rawFrac.trim());
+        if (!Number.isFinite(frac) || frac < 0 || frac > 1) continue; // reject malformed or out-of-range values
+        percent = clamp(Math.round((1 - frac) * 1000) / 10);
+      }
+      const qualifier = [groupName, win, disp].filter(Boolean).join('|');
+      const hasWin = (s) => win && (win === 'wk' ? /\b(?:wk|weekly)\b/i : new RegExp(`\\b${win.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')).test(s);
+      const baseLabel = groupName
+        ? (win ? `${groupName} ${win}` : disp || groupName)
+        : disp
+          ? (win && !hasWin(disp) ? `${disp} ${win}` : disp)
+          : win || rawId || 'Usage';
+      // What the bucket is, the same whether or not another shares its bucketId: resetRows compares by it. Built from the
+      // API's own fields, since the label's shortening ("Alpha Models" and "Alpha" both show as "Alpha") would join two
+      // buckets. Window is lowercased so "weekly" and "WEEKLY" match while "weekly" and "wk" stay distinct.
+      const key = JSON.stringify(rawId ? [rawId, rawGroup, lowWin, disp] : [rawGroup, lowWin, disp]);
+      // An ID-less bucket that shows as a known one ("Gemini 5h"), or a 5h or weekly one of the third-party group ("Claude
+      // and GPT models"), is that bucket: in its pool, so a choice of it finds this row (ringPercent), whatever suffix the
+      // label takes below. Non-standard named groups (e.g. "Gemini 4 Argon") stay out of standard Gemini/Other pools.
+      const dispName = disp.replace(/\s+models?\s*$/i, '').trim();
+      const normWk = (s) => s.replace(/\bweekly\b/i, 'wk');
+      const allowKnownPool = !groupName || /^(?:gemini|other)$/i.test(groupName);
+      const grpDisp = groupName && !win && dispName ? `${groupName} ${dispName}` : '';
+      const poolNames = allowKnownPool
+        ? [
+          baseLabel, normWk(baseLabel),
+          ...(grpDisp ? [grpDisp, normWk(grpDisp)] : []),
+          ...(!groupName && dispName ? [[dispName, win].filter(Boolean).join(' ')] : []),
+        ].map((s) => s.toLowerCase())
+        : [];
+      const pool = rawId || Object.keys(ANTIGRAVITY_BUCKETS).find((k) => poolNames.includes(ANTIGRAVITY_BUCKETS[k].toLowerCase())) ||
+        (THIRD_PARTY.test(groupName || dispName) ? (win === '5h' || (!win && /\b5h\b/i.test(disp)) ? '3p-5h' : win === 'wk' || (!win && /\b(?:wk|weekly)\b/i.test(disp)) ? '3p-weekly' : undefined) : undefined);
+      if (rawId) idCounts.set(rawId, (idCounts.get(rawId) || 0) + 1);
+      keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
+      items.push({ rawId, rawWin: lowWin, pool, qualifier, baseLabel, key, percent, resetTime, disabled: b.disabled === true });
+    }
+  }
+  // A duplicate's row ID is its bucketId and what tells it apart, never a bucketId the answer holds (so a choice of one
+  // shows that bucket, or that pool's maximum: ringPercent), and handed out in key order, so the answer's order can't
+  // move an ID to another bucket. A lone bucket's is its bucketId.
+  const ids = new Map();
+  const taken = new Set(items.map((it) => it.rawId).filter(Boolean));
+  for (const it of [...items].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))) {
+    if (!it.rawId || idCounts.get(it.rawId) === 1) continue;
+    const stem = it.qualifier ? `${it.rawId}@${it.qualifier}` : it.rawId;
+    let id = it.qualifier ? stem : `${stem}#1`;
+    for (let n = 2; taken.has(id); n++) id = `${stem}#${n}`;
+    taken.add(id);
+    ids.set(it, id);
+  }
+  const rows = [];
+  const usedLabels = new Set();
+  for (const it of items) {
+    const { rawId, rawWin, pool, baseLabel, key, percent, resetTime, disabled } = it;
+    const id = ids.get(it) || rawId;
+    // Two buckets nothing tells apart: which is which can follow the answer's order, so neither is compared.
+    const ambiguous = keyCounts.get(key) > 1;
+    const knownLabel = rawId && Object.hasOwn(ANTIGRAVITY_BUCKETS, rawId) ? ANTIGRAVITY_BUCKETS[rawId] : '';
+    let label = (id === rawId && knownLabel) || baseLabel;
+    if (usedLabels.has(label)) {
+      if (id && !usedLabels.has(id)) {
+        label = id;
+      } else {
+        let n = 2;
+        while (usedLabels.has(`${label} (${n})`)) n++;
+        label = `${label} (${n})`;
+      }
+    }
+    usedLabels.add(label);
+    rows.push({
+      ...(id ? { id } : {}),
+      key,
+      ...(rawWin ? { win: rawWin } : {}), // the quota window, for resetRows: main strips it with the key
+      ...(pool && pool !== id ? { bucketId: pool } : {}),
+      ...(ambiguous ? { ambiguous: true } : {}),
+      ...(disabled ? { disabled: true } : {}),
+      label,
+      percent,
+      resetsAt: resetTime,
+    });
+  }
+  return rows.length ? { plan, rows } : { plan, error: 'No usage windows reported.' };
+}
+
+// Per-account tier lookup from loadCodeAssist: never blocks quota, refreshes on token rotation or every 6 hours,
+// keeps one in-flight request per account, holds a Retry-After over every key the account has shown (gateUntil),
+// and never evicts unexpired deadlines. main.js saves the deadlines (watchTierGates), so a restart keeps them too.
+const ANTIGRAVITY_TIER_TTL = 6 * HOUR;
+const antigravityTiers = new Map(); // account -> { plan: '', fetchedAt: 0, tokenHash: null, inflight: null }
+const tierGates = []; // loadCodeAssist's Retry-After deadlines (gateUntil); a later shorter answer never cuts one short
+let tierGatesChanged = null; // main.js's save
+// A bearer whose lookup failed with no Retry-After (a refusal, a plain 403 or 5xx, no answer, or no plan) -> until when it
+// isn't sent again: our own backoff, so it holds only that bearer. tierGates would spread it over the account, and hold
+// the replacement a rotation or a new sign-in brings. A sign-out clears it (clearTierPlans).
+// ponytail: in memory, so a restart sends a failing bearer once more.
+const tierRejected = new Map();
+// Bearer -> [the newest-begun quota request that answered for it, whether that answer refused it (401/auth-403)], so a
+// pending loadCodeAssist retry for a refused bearer cancels, and an older refusal landing after a newer success says nothing.
+const quotaAnswers = new Map();
+let quotaSeq = 0;
+function holdBearer(tokenHash, ms) {
+  const now = Date.now();
+  for (const [k, until] of tierRejected) if (until <= now) tierRejected.delete(k);
+  tierRejected.set(tokenHash, Math.max(tierRejected.get(tokenHash) || 0, now + ms));
+}
+const antigravityTierPending = new Map(); // linked key -> the lookup in flight for that key's account
+let antigravityTierGen = 0;
+// The bearer and expiry the newest-begun credential read found (peekAntigravityCred). A lookup's retry goes only while
+// that bearer is still current and unexpired, so a rotation, another account, or a newly-expired credential read during
+// the pause calls the retry off. An older read landing late says nothing.
+let latestBearer = null;
+let latestExpiry = NaN;
+let peekSeq = 0;
+let latestPeek = 0;
+// The keys a 429 is to hold, for each request out, quota's and loadCodeAssist's: its credential's, and those of every
+// credential of that account seen while it is out (peekAntigravityCred), `__weak__` when one came bare, as gateUntil adds
+// it for a bare bearer seen after the 429. gateSet leaves `__weak__` out of the origin, which stays the account's.
+const antigravityOut = new Set();
+
+let tierSeq = 0; // counts loadCodeAssist requests as they start so older late responses never roll back newer plans
+function tierSlot(account) {
+  let slot = antigravityTiers.get(account);
+  if (!slot) {
+    if (antigravityTiers.size >= 20) {
+      const now = Date.now();
+      for (const [k, v] of antigravityTiers) {
+        if (!v.inflight && !tierGates.some((g) => g.until > now && g.keys.includes(k))) {
+          antigravityTiers.delete(k);
+          break;
+        }
+      }
+    }
+    slot = { plan: '', fetchedAt: 0, seq: 0, tokenHash: null, inflight: null };
+    antigravityTiers.set(account, slot);
+  }
+  return slot;
+}
+
+// The account's newest lookup under any name it has shown. Slots go by the primary key, which changes as an email comes
+// or goes (the bearer and refresh token kept), and a bare bearer's slot is its hash, linked as `tok:` + hash.
+// Ordered by launch sequence (`seq`) so a slower older lookup landing after a newer one never rolls back the plan.
+function newestTier(account, keys = []) {
+  let best = antigravityTiers.get(account);
+  for (const k of antigravityAliases([...keys, account, `tok:${account}`])) {
+    const s = antigravityTiers.get(k.replace(/^tok:/, ''));
+    if (s && s.plan && (s.seq > (best?.seq || 0) || (s.seq === (best?.seq || 0) && s.fetchedAt > (best?.fetchedAt || 0)))) best = s;
+  }
+  return best;
+}
+
+function setTierRetry(gateKeys, until) {
+  gateSet(tierGates, gateKeys, until);
+  tierGatesChanged?.();
+}
+// A restart's saved deadlines join those on hand (test.js reloads state mid-run), each once.
+function restoreTierGates(raw) {
+  const have = new Set(tierGates.map((g) => JSON.stringify(g)));
+  for (const g of gateList(raw)) if (!have.has(JSON.stringify(g))) tierGates.push(g);
+}
+
+function clearTierPlans() {
+  antigravityTierGen++;
+  for (const slot of antigravityTiers.values()) {
+    slot.plan = '';
+    slot.fetchedAt = 0;
+    slot.seq = 0;
+    slot.tokenHash = null;
+    slot.inflight = null;
+  }
+  antigravityTierPending.clear();
+  tierRejected.clear(); // the API's Retry-After (tierGates) still holds
+  quotaAnswers.clear();
+}
+
+// isOn: main.js's say that Antigravity is still switched on, asked before a retry.
+function ensureAntigravityTier(cred, headers, isOn, launchSeq = 0) {
+  const { account, gateKeys, tokenHash, expiry } = cred;
+  const slot = tierSlot(account);
+  // Copied, not shared: a lookup in flight still lands in the slot it was made for.
+  const newest = newestTier(account, gateKeys);
+  if (newest && newest !== slot && newest.seq > slot.seq) Object.assign(slot, { plan: newest.plan, fetchedAt: newest.fetchedAt, seq: newest.seq, tokenHash: newest.tokenHash });
+  const now = Date.now();
+  const stale = !slot.plan || slot.tokenHash !== tokenHash || now - slot.fetchedAt >= ANTIGRAVITY_TIER_TTL;
+  if (!stale || slot.inflight) return slot;
+  const held = gateUntil(tierGates, gateKeys, now);
+  if (held.changed) tierGatesChanged?.();
+  if (held.until > now || tierRejected.get(tokenHash) > now) return slot;
+  // Slots go by the primary key, which changes when an email comes or goes: the account's other keys find its lookup.
+  const linked = antigravityAliases(gateKeys).filter((k) => k !== '__weak__');
+  if (linked.some((k) => antigravityTierPending.has(k))) return slot;
+  const gen = antigravityTierGen;
+  const out = [...gateKeys];
+  antigravityOut.add(out);
+  let req;
+  // A retry goes only under a bearer still current: not after a sign-out, a newer bearer read (a rotation or another
+  // account), its expiry, or Antigravity switched off, nor under a wait come meanwhile. One called off holds nothing.
+  let retryCancelled = false;
+  const canRetry = () => {
+    const now = Date.now();
+    const qa = quotaAnswers.get(tokenHash);
+    let go = gen === antigravityTierGen &&
+      latestBearer === tokenHash &&
+      !(qa && qa[0] >= launchSeq && qa[1]) &&
+      !(Number.isFinite(expiry) && expiry <= now) &&
+      !(Number.isFinite(latestExpiry) && latestExpiry <= now) &&
+      (!isOn || isOn());
+    if (go) {
+      const wait = gateUntil(tierGates, out);
+      if (wait.changed) tierGatesChanged?.();
+      go = wait.until <= now;
+    }
+    if (!go) retryCancelled = true;
+    return go;
+  };
+  // Switched off since it went out, even if on again: a wait of our own would hold the lookup the switch-on makes, a
+  // replacement bearer's included. The API's Retry-After still holds.
+  const switchedOff = () => !!isOn && !isOn();
+  // Our own backoff goes on this bearer alone, and not once signed out or switched off since it went out.
+  const backOff = (ms) => {
+    if (!switchedOff() && gen === antigravityTierGen) holdBearer(tokenHash, ms);
+  };
+  // The API's wait is recorded as its headers land (fetchJson), once: each check since copies it onto the keys it shows.
+  let heldUntil = 0;
+  const onRetryAfter = (secs) => setTierRetry(out, (heldUntil = Date.now() + secs * 1000));
+  const seq = ++tierSeq;
+  req = fetchJson(`${ANTIGRAVITY_API}:loadCodeAssist`, headers, '{}', { readErrorBody: true, canRetry, onRetryAfter })
+    .then((d) => {
+      if (gen !== antigravityTierGen) return; // sign-out invalidated this in-flight tier lookup
+      const plan = parseAntigravityPlan(d);
+      if (plan) {
+        if (seq < (newestTier(account, out)?.seq || 0) || seq < slot.seq) return;
+        slot.plan = plan;
+        slot.fetchedAt = Date.now();
+        slot.seq = seq;
+        slot.tokenHash = tokenHash;
+      } else backOff(5 * MIN);
+    })
+    .catch((e) => {
+      // Signed out meanwhile, the retry called off, the bearer replaced or expired, or switched off: a failure that
+      // isn't the API's holds nothing.
+      if ((gen !== antigravityTierGen || retryCancelled || latestBearer !== tokenHash || (Number.isFinite(latestExpiry) && latestExpiry <= Date.now()) || switchedOff()) && !e.status) return;
+      // A refusal or a 403 waits five minutes, anything else one. Only the API's wait holds the account: its Retry-After,
+      // or a 429's minute when it names none, as quota's does. When the API names a wait, 0 included, don't hold the
+      // bearer past it unless the bearer itself was refused.
+      const wait = e.retryAfter ?? (e.status === 429 ? 60 : null);
+      if (wait > 0 && !heldUntil) setTierRetry(out, Date.now() + wait * 1000);
+      if (wait === null || isAntigravityAuthError(e)) backOff(isAntigravityAuthError(e) || e.status === 403 ? 5 * MIN : MIN);
+    })
+    .finally(() => {
+      antigravityOut.delete(out);
+      if (slot.inflight === req) slot.inflight = null;
+      for (const k of linked) if (antigravityTierPending.get(k) === req) antigravityTierPending.delete(k);
+    });
+  slot.inflight = req;
+  for (const k of linked) antigravityTierPending.set(k, req);
+  return slot;
+}
+
+// Reads and normalizes the current Antigravity credential snapshot once, so main.js can verify account identity and
+// generation before mutating tier caches, checking per-account gates, or publishing quota. Its one side effect is
+// linking the snapshot's keys (agAliases), a fact about the account that holds however the read is used.
+async function peekAntigravityCred() {
+  const seq = ++peekSeq;
+  const cred = await readAntigravityCreds();
+  if (cred.status === 'error') return { status: 'error', error: cred.message, soft: true };
+  if (cred.status === 'invalid') {
+    if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+    return { status: 'signed_out', error: 'Antigravity credentials unreadable — open Antigravity to sign in.', signedOut: true };
+  }
+  const tok = cred.status === 'ok' ? (cred.data?.token || cred.data) : null;
+  const accessToken = typeof tok?.access_token === 'string' && tok.access_token;
+  if (!accessToken) {
+    if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+    return { status: 'signed_out', error: 'No Antigravity credentials — open Antigravity to sign in.', signedOut: true };
+  }
+  const { account, gateKey, gateKeys, tokenHash, identityWeak } = antigravityIdentity(cred.data);
+  // A date or epoch ms. Anything else (null, an object) is no expiry: never coerced, which can throw or read null as 1970.
+  const expiry = typeof tok.expiry === 'string' ? Date.parse(tok.expiry) : typeof tok.expiry === 'number' ? tok.expiry : NaN;
+  const expired = Number.isFinite(expiry) && expiry <= Date.now();
+  if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, tokenHash, expiry];
+  // `linked` tells the caller a new link formed, for main.js to save (antigravityLinks).
+  const linked = linkAntigravityKeys(gateKeys);
+  const seen = antigravityAliases(gateKeys).filter((k) => k !== '__weak__');
+  for (const out of antigravityOut) if (seen.some((k) => out.includes(k))) out.push(...gateKeys.filter((k) => !out.includes(k)));
+  // Every key the account shows joins its loadCodeAssist wait at once, as quota's does in main.js, so a restart finds it.
+  if (gateUntil(tierGates, gateKeys).changed) tierGatesChanged?.();
+  return { status: 'ok', account, gateKey, gateKeys, tokenHash, identityWeak, accessToken, expiry, expired, linked };
+}
+
+const isAntigravityAuthError = (e) =>
+  e.status === 401 ||
+  (e.status === 403 && (
+    /^UNAUTHENTICATED$/i.test(e.errorStatus || '') ||
+    (e.errorReasons || []).some((r) => /^(?:ACCESS_TOKEN_EXPIRED|ACCESS_TOKEN_INVALID|AUTH_ERROR|UNAUTHENTICATED|INVALID_CREDENTIALS|CREDENTIALS_EXPIRED)$/i.test(r))
+  ));
+
+// opts.canRetry(keys): main.js's say on a transport retry, false under a quota wait it has recorded for those keys or
+// once the read is superseded (a sign-out, another account, Antigravity switched off). opts.isOn(): whether Antigravity
+// is still switched on, asked before a loadCodeAssist retry. opts.onRetryAfter(secs, keys): a positive Retry-After, told
+// as the answer's headers land.
+async function readAntigravity(preCred, opts = {}) {
+  const cred = preCred || await peekAntigravityCred();
+  if (cred.status === 'error') return { error: cred.error, soft: true };
+  if (cred.status === 'signed_out') {
+    if (!preCred) clearTierPlans();
+    return { error: cred.error, signedOut: true };
+  }
+  const { account, gateKey, gateKeys, accessToken, expiry } = cred;
+  if (Number.isFinite(expiry) && expiry <= Date.now()) return { error: 'Session expired — open Antigravity.', authError: true, tokenHash: cred.tokenHash, renewsFor: account, gateFor: gateKey, gateKeys };
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': ANTIGRAVITY_UA,
+  };
+  const reqTierGen = antigravityTierGen;
+  const seq = ++quotaSeq;
+  // Fire tier lookup in the background without blocking quota; if it settles before quota does, this read gets the plan immediately.
+  const slot = ensureAntigravityTier(cred, headers, opts.isOn, seq);
+  const out = [...gateKeys];
+  antigravityOut.add(out);
+  const answered = (refused) => {
+    if (!cred.tokenHash || reqTierGen !== antigravityTierGen || (quotaAnswers.get(cred.tokenHash)?.[0] || 0) > seq) return;
+    quotaAnswers.delete(cred.tokenHash);
+    quotaAnswers.set(cred.tokenHash, [seq, refused]);
+    if (quotaAnswers.size > 64) quotaAnswers.delete(quotaAnswers.keys().next().value);
+  };
+  try {
+    // Never a retry once the bearer was replaced/signed out or its stored expiry has passed: the one it was sent with,
+    // or a nearer one the newest credential read found for it (including an expired snapshot whose check was overtaken).
+    const canRetry = () => {
+      const now = Date.now();
+      return latestBearer === cred.tokenHash &&
+        !(Number.isFinite(expiry) && expiry <= now) &&
+        !(Number.isFinite(latestExpiry) && latestExpiry <= now) &&
+        (!opts.canRetry || opts.canRetry(out));
+    };
+    // A Retry-After goes to main.js as its headers land, on `out`, before a 403's body is read (opts.onRetryAfter).
+    const onRetryAfter = (secs) => opts.onRetryAfter?.(secs, out);
+    const summary = await fetchJson(`${ANTIGRAVITY_API}:retrieveUserQuotaSummary`, headers, '{}', { readErrorBody: true, canRetry, onRetryAfter });
+    answered(false);
+    return { ...shapeAntigravity(summary, newestTier(account, out)?.plan || slot.plan), renewsFor: account, gateFor: gateKey, gateKeys, updatedAt: Date.now() };
+  } catch (e) {
+    // main.js records the wait on `out` as this answer lands, before any later credential check. Any answer's Retry-After
+    // holds (a 503's too); only a 429 waits without one.
+    if (e.status === 429) {
+      answered(false);
+      return { error: 'Rate limited', soft: true, retryAfter: e.retryAfter ?? 60, renewsFor: account, gateFor: gateKey, gateKeys: out };
+    }
+    const hasRetry = Number.isFinite(e.retryAfter) && e.retryAfter >= 0;
+    const whose = { renewsFor: account, gateFor: gateKey, ...(hasRetry ? { retryAfter: e.retryAfter, gateKeys: out } : { gateKeys }) };
+    // The bearer refused, so main can tell a replacement from it (main strips it before any screen) and any pending
+    // loadCodeAssist transport retry for this bearer is called off.
+    if (isAntigravityAuthError(e)) {
+      answered(true);
+      return { error: 'Session expired — open Antigravity.', authError: true, tokenHash: cred.tokenHash, ...whose };
+    }
+    if (e.status === 403) {
+      answered(false);
+      return { error: 'Antigravity access denied — check your Antigravity account permissions.', tokenHash: cred.tokenHash, ...whose };
+    }
+    return { error: e.message || 'Request failed', soft: !!e.soft, ...whose };
+  } finally {
+    antigravityOut.delete(out);
   }
 }
 
@@ -690,8 +1529,9 @@ const PROVIDERS = [
   { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
   // xAI's mark is monochrome, so it wears the theme's own ink.
   { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', everyMs: 5 * 60_000, read: readXai },
+  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', everyMs: 5 * 60_000, read: readAntigravity, peekCred: peekAntigravityCred, gateAliases: antigravityAliases, gateUntil, gateSet, gateList, tierGates: () => tierGates.filter((g) => g.until > Date.now()), restoreTierGates, links: antigravityLinks, restoreLinks: restoreAntigravityLinks, watchTierGates: (fn) => (tierGatesChanged = fn), onSignedOut: clearTierPlans, cachedPlan: (account) => (account ? (newestTier(account)?.plan || '') : '') },
   { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', everyMs: 0, local: true, read: readCpu },
   { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', everyMs: 0, local: true, read: readRam },
 ];
 
-module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits };
+module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, setAntigravityCredReader, clearAntigravityAliases, clearAntigravityTierGates,shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeAntigravity, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits, retryAfterSeconds };

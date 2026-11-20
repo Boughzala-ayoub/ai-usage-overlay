@@ -31,6 +31,7 @@ const EDGES = ['left', 'right', 'top', 'bottom'];
 const NUMBER_CHOICES = {
   claude: [['Highest limit', ''], ['Session', 'Session'], ['Weekly', 'All models'], ['Fable', 'Fable']],
   'opencode-go': [['Highest limit', ''], ['5-hour', '5h limit'], ['Weekly', 'Weekly'], ['Monthly', 'Monthly']],
+  antigravity: [['Highest limit', ''], ['Gemini 5h', 'gemini-5h'], ['Gemini weekly', 'gemini-weekly'], ['Other 5h', '3p-5h'], ['Other weekly', '3p-weekly']],
 };
 const USAGE_PAGES = {
   claude: 'https://claude.ai/settings/usage',
@@ -81,6 +82,7 @@ let open = false; // the capsule is grown into the full panel
 let overSince = 0; // when the cursor arrived on the capsule or its lip
 let closeAt = 0; // when the grace period runs out
 let noticeUntil = 0;
+let noticeFor = null; // provider id currently displayed in the desktop reset notice
 let drag = null; // { dx, dy } from the window origin to the grabbed point
 let rects = null; // lip and capsule rects in window coordinates, measured by the renderer
 let edge = 'right';
@@ -92,14 +94,44 @@ let theme = 'noir';
 let scale = 1; // Size: the pill's zoom in the renderer, and the panel's once it is above 1
 let hasConsoleKey = false; // a Console session is saved, so the tray offers to forget it
 const panelScale = () => Math.max(1, scale);
-// The pill's zoom: Size's, or smaller where a row of chips at that size is wider than the display it sits on,
-// as six providers at Extra large are on a 600px portrait monitor. The panel keeps its own.
-const pillScale = () => (vertical() ? scale : Math.min(scale, (areaFor(displayId).width - 2 * PAD) / (on().length * CHIP.h)));
+// The pill's zoom: Size's, or smaller where a row or column of chips at that size exceeds the display it sits on,
+// as seven providers at Extra large do on a 600px portrait monitor or a 320px-tall work area. The panel keeps its own.
+const pillScale = () => {
+  const n = on().length;
+  if (!n) return scale;
+  const a = areaFor(displayId);
+  return Math.min(scale, ((vertical() ? a.height : a.width) - 2 * PAD) / (n * (vertical() ? CHIP.v : CHIP.h)));
+};
 const last = new Map(); // id -> last good { plan, rows, updatedAt }
-const fetched = new Map(); // id -> ms of the last read attempt
+const fetched = new Map(); // id -> ms of the last quota read attempt
+const fetchedFor = new Map(); // id -> { renewsFor, gateKeys } of the account that made the last quota attempt
+const credChecked = new Map(); // id -> ms of the last credential check (independent of quota attempts)
+const credRetryAt = new Map(); // id -> ms before which a failed credential lookup will not auto-retry
+const credFails = new Map(); // id -> credential lookups failed in a row since the last that answered
 const gate = new Map(); // id -> ms before which we must not ask again (a 429's Retry-After)
+const accountGates = new Map(); // id -> [{ until, keys, origin }] for providers that track 429 gates per account (p.gateUntil)
+const unverified = new Set(); // providers whose startup cache waits for credential verification before publishing
+// Providers that pre-toggleProvider phone APKs can manage with whole-list `{ enabled: [...] }` writes.
+const LEGACY_PROVIDERS = new Set(['claude', 'codex', 'opencode-go', 'xai', 'cpu', 'ram']);
 const inflight = new Map(); // id -> the read in progress; a second refresh joins it rather than racing it
+const inflightKeys = new Map(); // id -> backoff keys of the credential the in-flight read was started with
+const inflightToken = new Map(); // id -> bearer token hash the in-flight read was started with
+let publishSeq = 0;
+const publishedQuota = new Map(); // id -> { seq, tokenHash } of the last confirmed non-error quota publish
+const activeKeys = new Map(); // id -> backoff keys of the credential the last accepted check found
+const activeToken = new Map(); // id -> { tokenHash, expiry } of the last verified unexpired credential
+const accountGen = new Map(); // id -> incremented on account switch/sign-out so abandoned in-flight responses are discarded
+// id -> how many times it was switched off. A lookup begun before one never retries, though it is back on by then: the
+// credential check after the switch-on may still be out, and the bearer the lookup carries may be another account's.
+const disableGen = new Map();
 const signedIn = new Map(); // id -> last confirmed account (renewsFor), saved separately from unverified readings
+// id -> Map<tokenHash, { error, authError }> of bearers refused with 401/auth-403 or 403 permission denial, saved per
+// bearer so restarts and account switches (A -> B -> A) keep the error note during a cooldown instead of flashing
+// cached data or waiting indefinitely.
+const authRejected = new Map();
+let authSeq = 0; // counts quota requests as they begin
+const authAnswered = new Map(); // bearer hash -> the newest-begun request whose answer set or cleared its refusal
+const rateCleared = new Map(); // id -> { seq, account, gateKeys } of the newest 429 or good 200 that supersedes a non-bearer error
 let cache = {}; // id -> last good reading, as saved. Kept here: building it from disk loses readings that land within one save debounce.
 
 // ---- state
@@ -154,9 +186,80 @@ const alive = () => win && !win.isDestroyed();
 
 // ---- data
 
+function prunedAccountGates(now = Date.now()) {
+  const out = {};
+  for (const [id, list] of accountGates) {
+    for (let i = list.length; i--;) if (list[i].until <= now) list.splice(i, 1);
+    if (list.length) out[id] = list;
+  }
+  return out;
+}
+// A 429's deadline, kept per account by the provider (p.gateUntil, p.gateSet): over every key the account has shown,
+// with whose it is. A lookup copies it onto the credential's keys and saves it, so the record names them itself, whatever
+// the saved links (128 keys at most) have since let go.
+function accountGateUntil(p, keys, now = Date.now()) {
+  const list = accountGates.get(p.id);
+  if (!list || !keys?.length) return 0;
+  const { until, changed } = p.gateUntil(list, keys, now);
+  if (changed) saveState({ accountGates: prunedAccountGates(now) });
+  return until;
+}
+function setAccountGate(p, keys, until) {
+  if (!accountGates.has(p.id)) accountGates.set(p.id, []);
+  p.gateSet(accountGates.get(p.id), keys, until);
+  saveState({ accountGates: prunedAccountGates() });
+}
+// loadCodeAssist's deadlines are the provider's, saved here apart from quota's: they hold back no quota read.
+const tierGatesState = () => Object.fromEntries(PROVIDERS.filter((p) => p.tierGates).map((p) => [p.id, p.tierGates()]));
+for (const p of PROVIDERS) p.watchTierGates?.(() => saveState({ tierGates: tierGatesState() }));
+// Which keys are one account's, saved apart from readings and waits: a verified account may have neither yet.
+const linksState = () => Object.fromEntries(PROVIDERS.filter((p) => p.links).map((p) => [p.id, p.links()]));
+// Holds the provider back until the deadline the credential's account is under and returns it, or lifts a wait that
+// was another account's.
+function armGate(p, keys, now = Date.now()) {
+  const until = accountGateUntil(p, keys, now);
+  if (until > now) {
+    gate.set(p.id, until);
+    fetched.delete(p.id); // the gate alone holds it back, so polling resumes as soon as Retry-After lifts
+    fetchedFor.delete(p.id);
+    // A failed credential look's next one waits no longer than the wait either (credRetry caps it the same way).
+    if ((credRetryAt.get(p.id) || 0) > until) credRetryAt.set(p.id, until);
+  } else gate.delete(p.id);
+  return until;
+}
+// Each credential read links the keys it carries (p.gateAliases), so a deadline any of them is under is copied onto
+// all of them at once: a restart straight after still finds it under whichever key the next credential has.
+// Checks count in the order they began. One that lands after a later one has holds an older snapshot (a refresh that
+// joins the read in flight moves no generation, so nothing else would tell), and looks again rather than be acted on.
+let credSeq = 0;
+const credLanded = new Map(); // id -> the latest-begun credential check that has landed
+async function peekCred(p) {
+  for (let i = 0; i < 3; i++) {
+    const seq = ++credSeq;
+    const cred = await p.peekCred();
+    if (cred.linked) saveState({ accountLinks: linksState() }); // a fact about the account, even from an overtaken check
+    if (cred.status === 'ok') accountGateUntil(p, cred.gateKeys);
+    if (seq < (credLanded.get(p.id) || 0)) continue;
+    credLanded.set(p.id, seq);
+    return cred;
+  }
+  return { status: 'error', error: 'Credential check overtaken', soft: true };
+}
+
+// A row as the screens get it: without what only main compares by (an Antigravity bucket's key, pool, window, ambiguity, disabled flag).
+const shownRow = ({ ambiguous, bucketId, disabled, key, win: _win, ...r }) => r;
+
 function snapshot() {
   const now = Date.now();
   return on().map((p) => {
+    // Do not publish restored cached data for an account-checked provider until its live credentials confirm the account.
+    // With nothing verified to show, a lookup that has failed twice running says why, so the section never waits forever
+    // on a helper that cannot run; once is a hiccup, and stays quiet.
+    // One fixed line: the helper's own message can carry its whole PowerShell command line or a local path.
+    const lookupError = credFails.get(p.id) >= 2 && (unverified.has(p.id) || !last.get(p.id)) ? `${p.name} credential lookup failing — retrying every minute.` : '';
+    if (unverified.has(p.id) || lookupError) {
+      return { id: p.id, name: p.name, glyph: p.glyph, color: p.color, local: p.local, ringPercent: 0, rows: [], waitMs: 0, ...(lookupError ? { error: lookupError } : {}) };
+    }
     const d = last.get(p.id) || {};
     const until = gate.get(p.id) || 0;
     return {
@@ -175,11 +278,21 @@ function snapshot() {
       // or from before a restart) says nothing about the next one, so it goes.
       ...(d.renewsAt > now ? { renewsIn: fmtReset(d.renewsAt, now) } : { renewsAt: undefined, renewsGuess: undefined }),
       renewsFor: undefined, // the account a date belongs to: main's to check, not the screens'
+      gateFor: undefined,
+      gateKeys: undefined,
+      retryAfter: undefined, // a failed read's wait, which waitMs shows
+      expired: undefined,
       accountUnknown: undefined,
+      signedOut: undefined,
+      authError: undefined,
+      tokenHash: undefined, // the refused/denied bearer's hash, main's to compare
+      errSeq: undefined, // the request sequence of a non-bearer error, main's to compare
       ringPercent: ringPercent(d.rows, choices[p.id] || ''),
       // Formatted here so "in 3h 39m" has one implementation, and stays honest between fetches.
-      rows: (d.rows || []).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
-      waitMs: until > now ? until - now : 0,
+      rows: (d.rows || []).map(shownRow).map((r) => ({ ...r, resets: r.resets || fmtReset(r.resetsAt, now) })), // a local row brings its own
+      // Keep Refresh enabled beside an error (sign-in note or permission denial) so a user who signs in, rotates
+      // tokens, or switches accounts can re-verify immediately without waiting out the old account's cooldown.
+      waitMs: until > now && !d.error ? until - now : 0,
     };
   });
 }
@@ -189,58 +302,627 @@ function push() {
   tellPhones();
 }
 
+function clearResetNotice(id) {
+  if (noticeFor !== id) return;
+  noticeFor = null;
+  noticeUntil = 0;
+  if (alive()) win.webContents.send('reset', null);
+}
+
 function showResetNotice(p, rows) {
   // A read still in flight when you hid the overlay or dropped the provider must not beep or reveal it.
   if (!rows.length || !alive() || !visible || !enabled.includes(p.id)) return;
   shell.beep();
   if (open) return; // the open panel already shows the fresh numbers
+  noticeFor = p.id;
   noticeUntil = Date.now() + NOTICE_MS;
   closeAt = 0;
   setRevealed(true);
-  win.webContents.send('reset', { id: p.id, name: p.name, glyph: p.glyph, color: p.color, rows });
+  win.webContents.send('reset', { id: p.id, name: p.name, glyph: p.glyph, color: p.color, rows: rows.map(shownRow) });
+}
+
+function bumpGen(id) {
+  const next = (accountGen.get(id) || 0) + 1;
+  accountGen.set(id, next);
+  return next;
+}
+
+const authRejectedState = () => Object.fromEntries(
+  [...authRejected]
+    .filter(([, m]) => m.size)
+    .map(([id, m]) => [id, Object.fromEntries([...m].map(([h, v]) => [h, { error: v.error, ...(v.authError ? { authError: true } : {}) }]))]),
+);
+const rejectedReading = (rej, tokenHash, account, gateKeys) => ({
+  error: rej.error,
+  ...(rej.authError ? { authError: true } : {}),
+  tokenHash,
+  renewsFor: account,
+  gateKeys,
+});
+// Whether a bearer is refused/denied is the newest-begun request's say: an older one landing after it (A -> B -> A,
+// its 403's body slow) says nothing, however late. Requests count in the order they began (authSeq).
+function newestAuthAnswer(tokenHash, seq) {
+  if (seq < (authAnswered.get(tokenHash) || 0)) return false;
+  authAnswered.delete(tokenHash);
+  authAnswered.set(tokenHash, seq);
+  if (authAnswered.size > 64) authAnswered.delete(authAnswered.keys().next().value);
+  return true;
+}
+function setAuthRejected(id, tokenHash, error, seq, authError = false) {
+  if (!tokenHash || typeof error !== 'string' || !newestAuthAnswer(tokenHash, seq)) return false;
+  let m = authRejected.get(id);
+  if (!m) authRejected.set(id, (m = new Map()));
+  const cur = m.get(tokenHash);
+  if (cur && cur.error === error && !!cur.authError === !!authError && [...m.keys()].at(-1) === tokenHash) return true;
+  m.delete(tokenHash);
+  m.set(tokenHash, { error, authError: !!authError });
+  while (m.size > 20) m.delete(m.keys().next().value);
+  saveState({ authRejected: authRejectedState() });
+  return true;
+}
+function clearAuthRejected(id, tokenHash, seq) {
+  if (!newestAuthAnswer(tokenHash, seq)) return false;
+  const m = authRejected.get(id);
+  if (!m) return true;
+  const changed = tokenHash ? m.delete(tokenHash) : (m.size > 0 && (m.clear(), true));
+  if (!m.size) authRejected.delete(id);
+  if (changed) saveState({ authRejected: authRejectedState() });
+  return true;
+}
+
+function applySignedOut(p, error, now = Date.now()) {
+  bumpGen(p.id);
+  p.onSignedOut?.();
+  publishedQuota.delete(p.id);
+  activeKeys.delete(p.id);
+  activeToken.delete(p.id);
+  rateCleared.delete(p.id);
+  fetched.delete(p.id);
+  fetchedFor.delete(p.id);
+  const prevLast = last.get(p.id);
+  const unchanged = prevLast?.signedOut && prevLast.error === error && !cache[p.id] && !signedIn.has(p.id) && !gate.has(p.id) && !unverified.has(p.id);
+  clearResetNotice(p.id);
+  if (unchanged) return;
+  unverified.delete(p.id);
+  signedIn.delete(p.id);
+  gate.delete(p.id);
+  delete cache[p.id];
+  last.set(p.id, { error, signedOut: true });
+  saveState({ cache, signedIn: Object.fromEntries(signedIn), gate: Object.fromEntries(gate), accountGates: prunedAccountGates(now) });
+  push();
+}
+
+// The credential's token has run out: the sign-in note, under the account's keys so a replacement under its other name
+// (an email gone) still counts as this account. Reached before a request, from a refresh that would have joined one,
+// and after one, whose answer then goes unshown and unsaved. A 429's wait still holds the provider, off screen (snapshot), and
+// paces the looks for a valid token (readFresh), so one installed meanwhile is found the moment the wait lifts.
+function applyExpired(p, cred, now = Date.now()) {
+  bumpGen(p.id);
+  activeToken.delete(p.id);
+  clearResetNotice(p.id);
+  unverified.delete(p.id);
+  signedIn.set(p.id, cred.account);
+  armGate(p, cred.gateKeys, now);
+  last.set(p.id, { error: 'Session expired — open Antigravity.', renewsFor: cred.account, gateKeys: cred.gateKeys, expired: true });
+  saveState({ signedIn: Object.fromEntries(signedIn), gate: Object.fromEntries(gate) });
+  push();
+}
+
+function foldBgPlan(p, confirmedAccount) {
+  if (!confirmedAccount || unverified.has(p.id)) return;
+  const cur = last.get(p.id);
+  if (!cur || cur.error || cur.renewsFor !== confirmedAccount) return;
+  const bgPlan = p.cachedPlan?.(confirmedAccount);
+  if (!bgPlan || bgPlan === cur.plan) return;
+  const updated = { ...cur, plan: bgPlan };
+  last.set(p.id, updated);
+  if (cache[p.id]?.renewsFor === confirmedAccount) {
+    cache[p.id] = updated;
+    saveState({ cache });
+  }
+}
+
+// When a credential lookup fails after the last verified bearer's stored expiry has passed, surface Session expired
+// right away (keeping Refresh enabled while any account cooldown still blocks quota requests) rather than leaving
+// stale cached rows behind a cooldown.
+function expireActiveToken(p, now = Date.now(), fallbackAccount = null, fallbackKeys = null) {
+  const curTok = activeToken.get(p.id);
+  if (!curTok || unverified.has(p.id)) return false;
+  if (!(Number.isFinite(curTok.expiry) && curTok.expiry <= now)) return false;
+  activeToken.delete(p.id);
+  const curLast = last.get(p.id);
+  if (curLast?.authError || curLast?.expired) return false;
+  clearResetNotice(p.id);
+  const keys = activeKeys.get(p.id) || fallbackKeys || curLast?.gateKeys;
+  const account = curLast?.renewsFor || signedIn.get(p.id) || fallbackAccount;
+  last.set(p.id, { error: 'Session expired — open Antigravity.', ...(account ? { renewsFor: account } : {}), ...(keys ? { gateKeys: keys } : {}), expired: true });
+  return true;
+}
+
+// A failed credential lookup is tried again in a minute, or as the wait it fell inside lifts if that is sooner (a wait
+// recorded before a restart or re-enable and not yet armed counts too): a valid token installed meanwhile is found the
+// moment reads may resume.
+function credRetry(p, now, also = 0) {
+  const recorded = accountGateUntil(p, activeKeys.get(p.id) || last.get(p.id)?.gateKeys || cache[p.id]?.gateKeys, now);
+  const until = Math.max(gate.get(p.id) || 0, also, recorded);
+  return until > now ? Math.min(now + 60_000, until) : now + 60_000;
+}
+// A failed lookup: its retry is set, and it counts toward the error snapshot shows once two have failed running.
+function credFailed(p, now, also = 0) {
+  credRetryAt.set(p.id, credRetry(p, now, also));
+  const n = (credFails.get(p.id) || 0) + 1;
+  credFails.set(p.id, n);
+  if (n === 2) push();
+}
+// A lookup that answered (signed in or out): no retry pending, and the failures counted end. Returns whether a visible
+// failure message was cleared so callers can push immediately rather than waiting for the quota request to finish.
+function credAnswered(p) {
+  const had = (credFails.get(p.id) || 0) >= 2;
+  credRetryAt.delete(p.id);
+  credFails.delete(p.id);
+  return had;
 }
 
 // One read per provider at a time. Two overlapping refreshes used to race, and a slow older answer
 // landing last rolled the numbers back and beeped a reset that never happened. Each read pushes as it
 // settles, whoever asked for it: a read can take over a minute to give up, and the other providers' numbers,
 // CPU and RAM and the countdowns used to wait for it.
+// For account-checked providers (Antigravity), a refresh while an earlier request is in flight still verifies
+// credentials so an account switch, token rotation, or sign-out supersedes the old in-flight request instead of joining it.
 function readOne(p, force) {
-  if (!inflight.has(p.id)) inflight.set(p.id, readFresh(p, force).finally(() => (inflight.delete(p.id), push())));
+  if (p.peekCred && inflight.has(p.id)) {
+    if (!force) return inflight.get(p.id);
+    return (async () => {
+      const startPublished = publishedQuota.get(p.id)?.seq || 0;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!enabled.includes(p.id)) return;
+        const startGen = accountGen.get(p.id) || 0;
+        credChecked.set(p.id, Date.now());
+        const cred = await peekCred(p);
+        const now = Date.now(); // when the check landed
+        if (!enabled.includes(p.id)) return;
+        // If another read advanced the generation while this lookup was pending, discard this potentially stale
+        // result and recheck current credentials so a newer sign-out or switch is never dropped.
+        if (startGen !== (accountGen.get(p.id) || 0)) continue;
+        if (cred.status === 'error') {
+          const expiredNow = expireActiveToken(p, now);
+          credFailed(p, now);
+          if (expiredNow) push();
+          return inflight.get(p.id);
+        }
+        if (credAnswered(p) && cred.status === 'ok' && !last.get(p.id) && !unverified.has(p.id)) push();
+        if (cred.status === 'signed_out') {
+          inflight.delete(p.id);
+          inflightKeys.delete(p.id);
+          inflightToken.delete(p.id);
+          applySignedOut(p, cred.error, now);
+          return;
+        }
+        // The same bearer, for the same account under whatever name the credential gives it now (an email gone or come),
+        // joins the request in flight; the keys it shows are already linked and saved (peekCred). An expired token joins
+        // nothing: the fresh read below shows the expiry and supersedes the request in flight.
+        if (inflight.has(p.id) && !cred.expired && cred.tokenHash === inflightToken.get(p.id) && sameKeys(p, { gateKeys: inflightKeys.get(p.id) }, cred.gateKeys)) {
+          activeKeys.set(p.id, cred.gateKeys);
+          activeToken.set(p.id, { tokenHash: cred.tokenHash, expiry: cred.expiry });
+          return inflight.get(p.id);
+        }
+        // On a recheck after another read published a fresh quota result for this exact account + bearer token
+        // during this refresh, skip a duplicate fetch (tier-only folds do not bump publishedQuota).
+        const pub = publishedQuota.get(p.id);
+        const cur = last.get(p.id);
+        if (attempt > 0 && !inflight.has(p.id) && !cred.expired && cur && !cur.error && !otherAccount(p, cur, cred.account, cred.gateKeys) && pub && pub.seq > startPublished && pub.tokenHash === cred.tokenHash) {
+          return;
+        }
+        // Account switched, bearer token rotated, or no read in flight for current credentials: start a fresh read.
+        const gen = bumpGen(p.id);
+        let runP;
+        inflightKeys.set(p.id, cred.gateKeys);
+        inflightToken.set(p.id, cred.tokenHash);
+        runP = readFresh(p, force, cred, gen).finally(() => {
+          if (inflight.get(p.id) === runP) {
+            inflight.delete(p.id);
+            inflightKeys.delete(p.id);
+            inflightToken.delete(p.id);
+          }
+          push();
+        });
+        inflight.set(p.id, runP);
+        return runP;
+      }
+      return inflight.get(p.id);
+    })();
+  }
+  if (!inflight.has(p.id)) {
+    const gen = p.peekCred ? bumpGen(p.id) : (accountGen.get(p.id) || 0);
+    let runP;
+    runP = readFresh(p, force, null, gen).finally(() => {
+      if (inflight.get(p.id) === runP) {
+        inflight.delete(p.id);
+        inflightKeys.delete(p.id);
+        inflightToken.delete(p.id);
+      }
+      push();
+    });
+    inflight.set(p.id, runP);
+  }
   return inflight.get(p.id);
 }
 
-async function readFresh(p, force) {
+async function readFresh(p, force, suppliedCred = null, gen = accountGen.get(p.id) || 0) {
   // A --shot run paints the numbers the installed copy saved, and asks no provider: a read can renew a token on disk or
   // draw a 429 that every client of the account then waits out. CPU and RAM are this PC's, read as always.
   if (SHOT && !p.local) return;
-  const now = Date.now();
-  // The gate is the whole rate-limit answer: a 429's Retry-After stops every later request,
-  // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint. Meanwhile, and between
-  // reads, a provider with local numbers (Claude: other clients' files) shows them when they are newer.
-  if (now < (gate.get(p.id) || 0)) return takeLocal(p);
-  if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
-  fetched.set(p.id, now);
-  const res = await p.read();
+  let now = Date.now();
+  // Providers with peekCred (Antigravity) verify credentials on their own cadence (independent of quota attempts)
+  // BEFORE releasing startup/re-enabled cache, folding in background tier updates, checking per-account gates, or
+  // awaiting a quota request.
+  let preCred = suppliedCred;
+  if (p.peekCred) {
+    if (!preCred) {
+      const cur = last.get(p.id);
+      const pendingPlan = !!(cur && !cur.error && cur.renewsFor && p.cachedPlan?.(cur.renewsFor) && p.cachedPlan(cur.renewsFor) !== cur.plan);
+      const signedOutNow = !!cur?.signedOut;
+      const until = gate.get(p.id) || 0;
+      const gatedNow = now < until;
+      const lastCheck = credChecked.get(p.id) || 0;
+      const retryAt = credRetryAt.get(p.id) || 0;
+      // A failed lookup's retry is due as its wait ends, beside a sign-in note too: never a whole cadence after the failure.
+      const credDue = force || (
+        retryAt > now ? false :
+        retryAt > 0 ? true :
+        unverified.has(p.id) || pendingPlan ? true :
+        signedOutNow ? now - lastCheck >= p.everyMs :
+        gatedNow ? now - lastCheck >= 60_000 :
+        // An expired token: looked at again on the cadence, and as soon as a wait looked at under has lifted.
+        cur?.expired ? now - lastCheck >= p.everyMs || lastCheck < until :
+        now - (fetched.get(p.id) || 0) >= p.everyMs
+      );
+      if (!credDue) return takeLocal(p);
+      credChecked.set(p.id, now);
+      preCred = await peekCred(p);
+      // What follows acts on when the check landed, not when it began: a wait that lifted meanwhile holds nothing, and
+      // the request goes now, so `fetched` must say now or the next scheduled one comes early.
+      now = Date.now();
+    }
+    if (gen !== (accountGen.get(p.id) || 0)) return;
+    if (preCred.status === 'error') {
+      expireActiveToken(p, now);
+      credFailed(p, now);
+      return takeLocal(p);
+    }
+    const clearedCredErr = credAnswered(p);
+    if (preCred.status === 'signed_out') {
+      applySignedOut(p, preCred.error, now);
+      return;
+    }
+    const switched = otherAccount(p, last.get(p.id), preCred.account, preCred.gateKeys) ||
+      otherAccount(p, cache[p.id], preCred.account, preCred.gateKeys) ||
+      otherAccount(p, fetchedFor.get(p.id), preCred.account, preCred.gateKeys);
+    if (!suppliedCred || switched) gen = bumpGen(p.id);
+    activeKeys.set(p.id, preCred.gateKeys);
+    if (switched) {
+      publishedQuota.delete(p.id);
+      rateCleared.delete(p.id);
+      clearResetNotice(p.id);
+      unverified.delete(p.id);
+      fetched.delete(p.id);
+      fetchedFor.delete(p.id);
+    }
+    // Another account's reading goes; this one's, named anew (an email gone), takes the new name.
+    forgetAccount(p, preCred.account, preCred.gateKeys);
+    if (signedIn.get(p.id) !== preCred.account && (switched || signedIn.has(p.id))) {
+      signedIn.set(p.id, preCred.account);
+      saveState({ signedIn: Object.fromEntries(signedIn) });
+    }
+    // Check local token expiry BEFORE releasing unverified startup/re-enabled cache or folding background tier,
+    // so a matching expired token never flashes stale cached quota before reporting session expiry.
+    if (preCred.expired) return applyExpired(p, preCred, now);
+    activeToken.set(p.id, { tokenHash: preCred.tokenHash, expiry: preCred.expiry });
+    // The account's deadline under any key it has shown, so a rotated bearer or a dropped email can't skip the wait. Armed
+    // before anything shows, so a wait left from another account (one before a switch-off) never shows beside this one.
+    const held = armGate(p, preCred.gateKeys, now) > now;
+    const rej = authRejected.get(p.id)?.get(preCred.tokenHash);
+    let restoredRej = false;
+    const curLast = last.get(p.id);
+    if (rej && (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== preCred.tokenHash)) {
+      // The same bearer the endpoint already refused/denied (after a restart, a failed post-fetch check, or switching
+      // A -> B -> A during its cooldown): keep its error note instead of releasing cached quota or waiting indefinitely.
+      clearResetNotice(p.id);
+      last.set(p.id, rejectedReading(rej, preCred.tokenHash, preCred.account, preCred.gateKeys));
+      restoredRej = true;
+    }
+    if (switched) push();
+    else {
+      const shown = unverified.delete(p.id);
+      // A valid token after one that expired, after a bearer whose error was already superseded by a newer 429/200
+      // (whose post-fetch lookup failed), or after a different bearer's auth/permission error (held under a Retry-After):
+      // the account's last numbers come back in place of the stale error, whether a wait holds the read or it fails.
+      const was = last.get(p.id);
+      const rc = rateCleared.get(p.id);
+      const rcMatch = !!(rc && rc.seq > (was?.errSeq || 0) && !otherAccount(p, { renewsFor: rc.account, gateKeys: rc.gateKeys }, preCred.account, preCred.gateKeys));
+      const lifted = !rej && (!!was?.expired || !!(was?.error && !was.signedOut && (was.tokenHash || rcMatch)));
+      if (lifted) cache[p.id] ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+      foldBgPlan(p, preCred.account);
+      if (shown || lifted || restoredRej || clearedCredErr) push();
+    }
+    if (held) return takeLocal(p);
+    if (!force && !switched && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
+  } else {
+    // The gate is the whole rate-limit answer: a 429's Retry-After stops every later request,
+    // including the ones you ask for by hand. Refusing locally is what keeps us off the endpoint. Meanwhile, and between
+    // reads, a provider with local numbers (Claude: other clients' files) shows them when they are newer.
+    if (now < (gate.get(p.id) || 0)) return takeLocal(p);
+    if (!force && now - (fetched.get(p.id) || 0) < p.everyMs) return takeLocal(p);
+  }
+  let curCred = preCred;
+  let res;
+  let recordedUntil = 0;
+  let fetchedAt = 0;
+  let reqSeq = 0;
+  const offs = disableGen.get(p.id) || 0;
+  const isOn = () => enabled.includes(p.id) && (disableGen.get(p.id) || 0) === offs;
+  for (let retry = 0; ; retry++) {
+    if (p.peekCred) {
+      inflightKeys.set(p.id, curCred.gateKeys);
+      inflightToken.set(p.id, curCred.tokenHash);
+      fetchedFor.set(p.id, { renewsFor: curCred.account, gateKeys: curCred.gateKeys });
+    }
+    fetched.set(p.id, (fetchedAt = retry === 0 ? now : Date.now()));
+    // A transport retry goes only while this read is still the current one (a sign-out, another account or the provider
+    // switched off moves the generation) and no wait has come meanwhile for its keys.
+    const canRetry = (keys) => gen === (accountGen.get(p.id) || 0) && enabled.includes(p.id) && accountGateUntil(p, keys) <= Date.now();
+    // A Retry-After is recorded as its headers land, before a 403's body is read, so a refresh made meanwhile (a rotated
+    // bearer's, which joins no request in flight) finds it. Once per answer: each check since copies it onto its keys.
+    recordedUntil = 0;
+    const onRetryAfter = (secs, keys) => {
+      recordedUntil = Date.now() + secs * 1000;
+      setAccountGate(p, keys, recordedUntil);
+    };
+    reqSeq = ++authSeq;
+    res = await p.read(curCred || undefined, { canRetry, isOn, onRetryAfter });
+    if (!p.peekCred) break;
+    // Record any 429 Retry-After on arrival, BEFORE awaiting the post-fetch credential check, so a concurrent refresh
+    // can't slip past it. It goes on every key linked to the request's by now, and on `__weak__` when a check saw the
+    // account's bearer bare while the request was out (res.gateKeys, from providers.js).
+    if (!recordedUntil && res.retryAfter > 0 && Number.isFinite(res.retryAfter)) {
+      recordedUntil = Date.now() + res.retryAfter * 1000;
+      setAccountGate(p, res.gateKeys || curCred.gateKeys, recordedUntil);
+    }
+    // Record a bearer refusal/denial (401/auth-403 or 403 permission denial) or definitive non-error / 429 / non-bearer
+    // answer on arrival alongside any cooldown, BEFORE the post-fetch check, so switching away (A -> B -> A), restarting,
+    // or a failed post-fetch check never loses the error AND a newer answer always beats a late older one even if superseded.
+    let rejectedNow = false;
+    let clearedNow = false;
+    if (res.error && !res.soft && res.tokenHash) {
+      rejectedNow = setAuthRejected(p.id, res.tokenHash, res.error, reqSeq, !!res.authError);
+    } else if (curCred?.tokenHash && (!res.error || res.error === 'Rate limited' || !res.soft)) {
+      clearedNow = clearAuthRejected(p.id, curCred.tokenHash, reqSeq);
+      if (clearedNow && (!res.error || res.error === 'Rate limited') && reqSeq >= (rateCleared.get(p.id)?.seq || 0)) {
+        rateCleared.set(p.id, { seq: reqSeq, account: curCred.account, gateKeys: curCred.gateKeys });
+      }
+    }
+    // Require a successful post-fetch credential check matching the same generation and account before publishing.
+    // A failed lookup, sign-out, account switch, or superseded generation discards the response. The account may have
+    // another name by now (an email gone or come, the bearer or refresh token kept): a key both show says it is the same.
+    let staleGen = gen !== (accountGen.get(p.id) || 0);
+    const afterCred = staleGen ? null : await peekCred(p);
+    if (!staleGen && gen !== (accountGen.get(p.id) || 0)) staleGen = true;
+    // Re-check after awaiting peekCred(p): a newer response for this bearer may have arrived while the lookup was pending.
+    const stillNewest = !!curCred?.tokenHash && authAnswered.get(curCred.tokenHash) === reqSeq;
+    const movedAway = staleGen ||
+      afterCred?.status !== 'ok' ||
+      (afterCred.account !== curCred.account && !sameKeys(p, curCred, afterCred.gateKeys));
+    if (movedAway) {
+      if (staleGen) {
+        let changed = false;
+        if (recordedUntil && activeKeys.has(p.id)) {
+          // A superseded request's late Retry-After holds the provider only when it holds back the credential in use now:
+          // the same account under any key, or a bare bearer nothing names under `__weak__`. Either way it is already
+          // recorded. Beside an error note it holds off screen (snapshot), so the next look for a valid token comes as it lifts.
+          const before = gate.get(p.id) || 0;
+          if (armGate(p, activeKeys.get(p.id)) > before) {
+            saveState({ gate: Object.fromEntries(gate) });
+            changed = true;
+          }
+        }
+        // If this late response is still the newest answer for the currently verified bearer (e.g., A1 in flight ->
+        // rotated to A2 with a 503 Retry-After -> switched back to A1 during cooldown -> original A1 returns 401/403),
+        // reflect the bearer's refusal or lift on screen right away instead of waiting for the next 60s poll or leaving
+        // Refresh disabled under stale numbers. Once the active bearer's local expiry has passed, show Session expired
+        // (keeping Refresh enabled) rather than lifting back to cached quota or overwriting expiry with a 403.
+        const curTok = activeToken.get(p.id);
+        if (curTok && curTok.tokenHash === curCred.tokenHash && !unverified.has(p.id)) {
+          const tokExpired = Number.isFinite(curTok.expiry) && curTok.expiry <= Date.now();
+          const curLast = last.get(p.id);
+          if (tokExpired) {
+            activeToken.delete(p.id);
+            if (!curLast?.authError && !curLast?.expired) {
+              clearResetNotice(p.id);
+              const keys = p.gateAliases ? provenKeys(p, curCred.gateKeys, activeKeys.get(p.id)) : (activeKeys.get(p.id) || curCred.gateKeys);
+              last.set(p.id, { error: 'Session expired — open Antigravity.', renewsFor: curLast?.renewsFor || signedIn.get(p.id) || curCred.account, gateKeys: keys, expired: true });
+              changed = true;
+            }
+          } else if (stillNewest) {
+            if (rejectedNow && res.tokenHash === curCred.tokenHash) {
+              const rej = authRejected.get(p.id)?.get(res.tokenHash);
+              if (rej && (curLast?.error !== rej.error || !!curLast?.authError !== !!rej.authError || curLast?.tokenHash !== res.tokenHash)) {
+                clearResetNotice(p.id);
+                const keys = p.gateAliases ? provenKeys(p, curCred.gateKeys, activeKeys.get(p.id)) : (activeKeys.get(p.id) || curCred.gateKeys);
+                last.set(p.id, rejectedReading(rej, res.tokenHash, curLast?.renewsFor || signedIn.get(p.id) || curCred.account, keys));
+                changed = true;
+              }
+            } else if (clearedNow && curLast?.error && !curLast.signedOut && (curLast.tokenHash === curCred.tokenHash || (!curLast.tokenHash && (!res.error || res.error === 'Rate limited') && reqSeq > (curLast.errSeq || 0)))) {
+              cache[p.id] && !otherAccount(p, cache[p.id], curCred.account, curCred.gateKeys) ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+              changed = true;
+            }
+          }
+        }
+        if (changed) push();
+      }
+      if (!staleGen) {
+        if (afterCred?.status === 'error') {
+          fetched.delete(p.id);
+          fetchedFor.delete(p.id);
+          // A wait from this response (429/503/401/403 Retry-After) is already recorded for the account on arrival;
+          // arm the live gate too so desktop and phone reflect the active cooldown right away when cached numbers stay
+          // on screen (beside an error note, snapshot keeps waitMs at 0 so Refresh stays enabled).
+          if (recordedUntil) {
+            const before = gate.get(p.id) || 0;
+            if (armGate(p, activeKeys.get(p.id) || curCred.gateKeys) > before) {
+              saveState({ gate: Object.fromEntries(gate) });
+            }
+          }
+          // The refused/denied bearer's reading goes at once, though the check failed: its error note, and no numbers.
+          // Had another account signed in meanwhile, the next check that answers drops the note for it.
+          // Once the bearer's local expiry has passed, show Session expired (keeping Refresh enabled) rather than
+          // leaving cached rows behind a cooldown or overwriting expiry with a non-auth 403.
+          const curTok = activeToken.get(p.id);
+          const exp = curTok?.tokenHash === curCred.tokenHash ? curTok.expiry : curCred.expiry;
+          const tokExpired = !!last.get(p.id)?.expired || (Number.isFinite(exp) && exp <= Date.now());
+          if (tokExpired) {
+            activeToken.delete(p.id);
+            if (!last.get(p.id)?.authError && !last.get(p.id)?.expired) {
+              clearResetNotice(p.id);
+              last.set(p.id, { error: 'Session expired — open Antigravity.', renewsFor: curCred.account, gateKeys: curCred.gateKeys, expired: true });
+            }
+          } else if (rejectedNow && stillNewest && res.tokenHash) {
+            clearResetNotice(p.id);
+            last.set(p.id, rejectedReading({ error: res.error, authError: !!res.authError }, res.tokenHash, curCred.account, curCred.gateKeys));
+          }
+          credFailed(p, Date.now(), recordedUntil);
+        } else if (afterCred?.status === 'signed_out') {
+          credAnswered(p);
+          applySignedOut(p, afterCred.error);
+        } else if (afterCred?.status === 'ok') {
+          bumpGen(p.id);
+          publishedQuota.delete(p.id);
+          rateCleared.delete(p.id);
+          activeKeys.set(p.id, afterCred.gateKeys);
+          credAnswered(p);
+          clearResetNotice(p.id);
+          forgetAccount(p, afterCred.account, afterCred.gateKeys);
+          unverified.delete(p.id);
+          signedIn.set(p.id, afterCred.account);
+          fetched.delete(p.id);
+          fetchedFor.delete(p.id);
+          if (afterCred.expired) return applyExpired(p, afterCred);
+          activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry });
+          // The account now in use may be under a wait of its own, or, a bare bearer, under `__weak__`.
+          armGate(p, afterCred.gateKeys);
+          const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
+          if (rej) last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
+          saveState({ signedIn: Object.fromEntries(signedIn) });
+          push();
+        }
+      }
+      return;
+    }
+    credAnswered(p);
+    activeKeys.set(p.id, afterCred.gateKeys);
+    // The token ran out while its request was out: the answer goes unshown and unsaved (a 429 in it is recorded above).
+    if (afterCred.expired) {
+      forgetAccount(p, afterCred.account, afterCred.gateKeys);
+      return applyExpired(p, afterCred);
+    }
+    activeToken.set(p.id, { tokenHash: afterCred.tokenHash, expiry: afterCred.expiry });
+    if (afterCred.tokenHash === curCred.tokenHash && last.get(p.id)?.expired) {
+      const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
+      if (rej) last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
+      else cache[p.id] ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+    }
+    // The bearer was replaced while its request was out (the same account): the screens follow the one installed now,
+    // whatever the old one got. One the endpoint has refused/denied shows its error note; any other lifts a note left
+    // for another bearer, the old one's included.
+    if (afterCred.tokenHash !== curCred.tokenHash) {
+      const was = last.get(p.id);
+      const rej = authRejected.get(p.id)?.get(afterCred.tokenHash);
+      const rc = rateCleared.get(p.id);
+      const rcMatch = !!(rc && rc.seq > (was?.errSeq || 0) && !otherAccount(p, { renewsFor: rc.account, gateKeys: rc.gateKeys }, afterCred.account, afterCred.gateKeys));
+      const lifted = !rej && (!!was?.expired || !!(was?.error && !was.signedOut && (was.tokenHash || rcMatch)));
+      if (rej) {
+        clearResetNotice(p.id);
+        last.set(p.id, rejectedReading(rej, afterCred.tokenHash, afterCred.account, afterCred.gateKeys));
+      } else if (lifted) cache[p.id] ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+      // The old bearer hit a hard error (401, 403 permission/scope error, etc.): never overwrite the replacement's
+      // state with the old bearer's error. Advance the generation and retry once with the current token unless a
+      // cooldown holds it back.
+      if (res.error && !res.soft) {
+        gen = bumpGen(p.id);
+        forgetAccount(p, afterCred.account, afterCred.gateKeys);
+        const tNow = Date.now();
+        if (armGate(p, afterCred.gateKeys, tNow) > tNow) {
+          if (lifted || rej) push();
+          return takeLocal(p);
+        }
+        if (lifted || rej) push();
+        if (retry < 1) {
+          curCred = afterCred;
+          continue;
+        }
+        fetched.delete(p.id);
+        fetchedFor.delete(p.id);
+        return;
+      }
+      // Any other answer, a reading included, goes unshown and unsaved beside the refused/denied bearer's note: it
+      // only says the old bearer is not refused. A wait it brought is recorded above.
+      if (rej) {
+        bumpGen(p.id);
+        armGate(p, afterCred.gateKeys);
+        return;
+      }
+    }
+    // The answer goes under the account's name now, with every key it was read under; forgetAccount renames the rest.
+    if (afterCred.account !== curCred.account) Object.assign(res, { renewsFor: afterCred.account, gateFor: afterCred.gateKey, gateKeys: provenKeys(p, res.gateKeys, afterCred.gateKeys) });
+    // The bearer that fetched, which can be the one the credential has just replaced.
+    if (!res.error) publishedQuota.set(p.id, { seq: ++publishSeq, tokenHash: curCred.tokenHash });
+    bumpGen(p.id);
+    break;
+  }
+  preCred = curCred;
+  if (res.signedOut) {
+    applySignedOut(p, res.error);
+    return;
+  }
   if (res.renewsFor && !res.accountUnknown) signedIn.set(p.id, res.renewsFor);
   // One that knows no account leaves the last one known, which after a restart is the reading on hand's, before it goes.
   else if (res.accountUnknown && !signedIn.has(p.id) && !last.get(p.id)?.accountUnknown && last.get(p.id)?.renewsFor) signedIn.set(p.id, last.get(p.id).renewsFor);
   if (res.renewsFor) saveState({ signedIn: Object.fromEntries(signedIn) });
-  forgetAccount(p, res.renewsFor);
+  forgetAccount(p, res.renewsFor, res.gateKeys);
   const prev = last.get(p.id);
   // A 429's Retry-After, whether or not a reading came with it: nothing is asked before it, and the read is due
   // again the moment it lifts rather than a whole cadence later, so the numbers fall behind as little as they can.
-  if (res.retryAfter) {
-    const until = Date.now() + res.retryAfter * 1000; // from the 429's arrival, not the request's start
+  // A delay of 0 is due at once.
+  const delayed = Number.isFinite(res.retryAfter) && res.retryAfter >= 0;
+  const nowAfter = Date.now();
+  const knownWait = p.peekCred ? accountGateUntil(p, activeKeys.get(p.id) || res.gateKeys || preCred.gateKeys, nowAfter) : 0;
+  if (delayed || knownWait > nowAfter) {
+    // From the 429's arrival, not the request's start. An account-checked provider recorded it per account on arrival,
+    // and shows the longest wait that account is under (including one discovered when the post-fetch credential check
+    // linked another key to this account), so a shorter or un-gated answer never hides an active wait.
+    const until = Math.max(delayed ? (recordedUntil || nowAfter + res.retryAfter * 1000) : 0, knownWait);
     gate.set(p.id, until);
     fetched.delete(p.id); // the gate alone holds it back now
-    saveState({ gate: Object.fromEntries(gate) });
+    fetchedFor.delete(p.id);
+    saveState({ gate: Object.fromEntries(gate), accountGates: prunedAccountGates(nowAfter) });
+  } else if (p.peekCred) {
+    // A late 429 for another account may have temporarily armed `__weak__` (wiping `fetched`) while this request was
+    // out, and a second late response may already have cleared that expired gate before publish: always restore the
+    // polling floor and clear any stale live gate when the verified account has no active cooldown.
+    if (!fetched.has(p.id)) {
+      fetched.set(p.id, fetchedAt || nowAfter);
+      fetchedFor.set(p.id, { renewsFor: res.renewsFor || preCred.account, gateKeys: activeKeys.get(p.id) || res.gateKeys || preCred.gateKeys });
+    }
+    if (gate.delete(p.id)) saveState({ gate: Object.fromEntries(gate) });
   }
   if (res.error && res.soft) {
     // A rate limit, a timeout, a server error, no network: none is news or anything to act on, so none shows a
     // message. The numbers on screen stay, or the section waits for its first, and only their age says they've
     // fallen behind, past ten minutes, as for any provider. A 429 also ends an earlier error, since the endpoint
-    // did answer; other failures leave one that asks you to act (a sign-in).
-    if (!prev?.rows?.length && res.retryAfter) last.delete(p.id);
+    // did answer; other failures leave one that asks you to act (a sign-in), a 503 with a Retry-After too. Every
+    // provider's 429, and only its 429, comes back as 'Rate limited'.
+    if (res.error === 'Rate limited') {
+      if (!prev?.rows?.length) p.peekCred && cache[p.id] && !otherAccount(p, cache[p.id], res.renewsFor, res.gateKeys) ? last.set(p.id, cache[p.id]) : last.delete(p.id);
+    }
     return takeLocal(p);
   }
   // A fallback (it carries `why`) is an old observation, and can be older than the numbers on screen.
@@ -252,25 +934,62 @@ async function readFresh(p, force) {
   if (res.renewsAt === undefined && prev?.renewsAt > Date.now() && (res.renewsFor === undefined || res.renewsFor === prev.renewsFor)) {
     Object.assign(res, { renewsAt: prev.renewsAt, renewsGuess: prev.renewsGuess, renewsFor: prev.renewsFor });
   }
+  // Use the newest verified tier for this account (including one linked or settled while the post-fetch check was out),
+  // or preserve the same account's cached plan while a background tier lookup (loadCodeAssist) is still in flight.
+  const latestPlan = !res.error && res.renewsFor ? p.cachedPlan?.(res.renewsFor) : '';
+  if (latestPlan) res.plan = latestPlan;
+  else if (!res.error && !res.plan && prev?.plan && res.renewsFor && res.renewsFor === prev.renewsFor) {
+    res.plan = prev.plan;
+  }
+  if (res.error) clearResetNotice(p.id);
+  if (p.peekCred && res.error && !res.tokenHash) res.errSeq = reqSeq;
+  // A reading keeps every key its account was proven by, not just the ones this credential carried.
+  if (p.gateAliases && !res.error) res.gateKeys = provenKeys(p, [...(prev?.gateKeys || []), ...(cache[p.id]?.gateKeys || [])], res.gateKeys);
   last.set(p.id, res);
   // CPU and RAM fall all the time, which is no reset, and a reading from before a restart is no use. Nor is one
-  // Claude account's usage falling below another's.
+  // account's usage falling below another's.
   // ponytail: Codex keeps its old behaviour, so a Codex account switch can still beep; drop the id check to cover it.
   if (!res.error && !p.local) {
-    if (!(p.id === 'claude' && otherAccount(p, prev, res.renewsFor))) showResetNotice(p, resetRows(prev?.rows, res.rows));
+    if (!((p.id === 'claude' || p.id === 'antigravity') && otherAccount(p, prev, res.renewsFor))) showResetNotice(p, resetRows(prev?.rows, res.rows));
     cache[p.id] = res;
     saveState({ cache });
   }
 }
 
 // Whether a reading on hand is another account's than the one a read or local copy names. A reading that can't tell
-// whose it is (no sign-in to read) says nothing either way, but Claude's saved before readings named theirs can't be
-// shown to be this account's, so they count as another's.
-const otherAccount = (p, r, account) => !!(r && account && (r.renewsFor ? r.renewsFor !== account : p.id === 'claude'));
+// whose it is (no sign-in to read) says nothing either way, but Claude's and Antigravity's saved before readings named
+// theirs can't be shown to be this account's, so they count as another's. An account-checked provider's reading stays
+// this account's when it was read with a key the credential's keys are, or are proven to be (p.gateAliases): a dropped
+// email or a named bearer changes the account's name, not the account. `__weak__` proves nothing.
+const sameKeys = (p, r, keys) => !!(keys && p.gateAliases && r.gateKeys) && p.gateAliases(keys).some((k) => k !== '__weak__' && r.gateKeys.includes(k));
+const otherAccount = (p, r, account, keys) => !!(r && account && (r.renewsFor ? r.renewsFor !== account && !sameKeys(p, r, keys) : p.id === 'claude' || p.id === 'antigravity'));
+// Every key proven to be one account's: the named ones a reading had, the credential's, and all linked to them. A bearer
+// it had stays while linked (agAliases keeps 128, and a restart links the saved reading's), so the list stays bounded.
+const provenKeys = (p, had, keys) => p.gateAliases([...(had || []).filter((k) => !k.startsWith('tok:')), ...(keys || [])]).filter((k) => k !== '__weak__');
+const sameSet = (a, b) => a.length === b?.length && a.every((k) => b.includes(k));
 
-// Drop metadata that belongs to a different account. The reading keeps its account so a reset or local copy
-// never compares usage from different accounts.
-function forgetAccount(p, account) {
+// Drop data that belongs to a different account. For Antigravity, drop the entire stale reading and cache so a soft
+// failure for the new account never keeps the previous account's numbers on screen or triggers a false reset. The same
+// account's reading under its old name takes the new one, with every key it was read under, and stays.
+// Per-account 429 deadlines remain in accountGates so switching A -> B -> A still respects A's deadline.
+function forgetAccount(p, account, keys) {
+  if (p.id === 'antigravity') {
+    const kept = (r) => {
+      if (!r || !account) return r;
+      if (otherAccount(p, r, account, keys)) return undefined;
+      const gateKeys = provenKeys(p, r.gateKeys, keys);
+      return r.renewsFor === account && sameSet(gateKeys, r.gateKeys) ? r : { ...r, renewsFor: account, gateKeys };
+    };
+    const shown = kept(last.get(p.id));
+    if (shown !== last.get(p.id)) shown ? last.set(p.id, shown) : last.delete(p.id);
+    const saved = kept(cache[p.id]);
+    if (saved !== cache[p.id]) {
+      if (saved) cache[p.id] = saved;
+      else delete cache[p.id];
+      saveState({ cache });
+    }
+    return;
+  }
   const fields = ['renewsAt', 'renewsGuess'];
   if (p.id === 'claude') fields.push('plan', 'bankedResets', 'bankedResetExpiries');
   const forget = (r) => {
@@ -427,7 +1146,13 @@ function servePhone() {
       return json(res, { secret: link.secret() });
     }
     if (url === '/api/options') {
-      return json(res, { themes: THEME_GROUPS, providers: PROVIDERS.map(({ id, name, glyph, color }) => ({ id, name, glyph, color })), choices: NUMBER_CHOICES, pages: USAGE_PAGES });
+      // Only expose providers added after toggleProvider (Antigravity) to clients that request ?toggle=1 and can operate them.
+      const supportsToggle = new URL(req.url, 'http://localhost').searchParams.get('toggle') === '1';
+      const list = supportsToggle ? PROVIDERS : PROVIDERS.filter((p) => LEGACY_PROVIDERS.has(p.id));
+      const choices = supportsToggle
+        ? NUMBER_CHOICES
+        : Object.fromEntries(Object.entries(NUMBER_CHOICES).filter(([id]) => LEGACY_PROVIDERS.has(id)));
+      return json(res, { themes: THEME_GROUPS, providers: list.map(({ id, name, glyph, color }) => ({ id, name, glyph, color })), choices, pages: USAGE_PAGES, capabilities: { toggleProvider: true } });
     }
     if (url === '/api/settings' && req.method === 'POST') {
       // A form or a no-cors fetch from a page can't send JSON without a preflight, which this server never answers.
@@ -442,9 +1167,29 @@ function servePhone() {
       }
       if (!want || typeof want !== 'object' || Array.isArray(want)) return res.writeHead(400).end(); // null, a list, a bare value
       if (Object.hasOwn(want, 'keepAwake') && typeof want.keepAwake !== 'boolean') return res.writeHead(400).end();
+      const hasToggle = Object.hasOwn(want, 'toggleProvider');
+      if (hasToggle) {
+        const tp = want.toggleProvider;
+        if (!tp || typeof tp !== 'object' || Array.isArray(tp) || typeof tp.id !== 'string' || typeof tp.enabled !== 'boolean') return res.writeHead(400).end();
+        if (PROVIDERS.some((p) => p.id === tp.id)) {
+          setEnabled(tp.enabled ? [...enabled, tp.id] : enabled.filter((id) => id !== tp.id));
+        }
+      }
       if (typeof want.keepAwake === 'boolean') setKeepAwake(want.keepAwake);
       if (typeof want.theme === 'string') setTheme(want.theme);
-      if (Array.isArray(want.enabled)) setEnabled(want.enabled);
+      // When toggleProvider is present, ignore any companion legacy `enabled` list sent for older-PC compatibility.
+      if (!hasToggle && Array.isArray(want.enabled)) {
+        // Whole-list writes only manage the provider catalog that client version knows (LEGACY_PROVIDERS unless
+        // `known` is passed); unmanaged providers strictly keep the PC's current enabled state so a legacy APK can
+        // neither silently disable nor re-enable newer providers like Antigravity.
+        const managed = Array.isArray(want.known)
+          ? new Set(want.known.filter((id) => typeof id === 'string'))
+          : LEGACY_PROVIDERS;
+        const next = PROVIDERS
+          .filter((p) => (managed.has(p.id) ? want.enabled.includes(p.id) : enabled.includes(p.id)))
+          .map((p) => p.id);
+        setEnabled(next);
+      }
       if (want.choices && typeof want.choices === 'object') for (const [id, row] of Object.entries(want.choices)) setChoice(id, row);
       return json(res, phonePayload());
     }
@@ -564,6 +1309,7 @@ function pollCursor() {
     overSince = overSince || now;
     if (now - overSince >= OPEN_MS) {
       noticeUntil = 0;
+      noticeFor = null;
       setRevealed(true);
       setOpen(true);
     }
@@ -572,12 +1318,15 @@ function pollCursor() {
     if (noticeUntil > now) {
       closeAt = 0;
       setRevealed(true);
-    } else if (open || (autoHide && revealed)) {
-      if (!closeAt) closeAt = now + CLOSE_MS;
-      else if (now >= closeAt) {
-        closeAt = 0;
-        setOpen(false);
-        if (autoHide) setRevealed(false);
+    } else {
+      noticeFor = null;
+      if (open || (autoHide && revealed)) {
+        if (!closeAt) closeAt = now + CLOSE_MS;
+        else if (now >= closeAt) {
+          closeAt = 0;
+          setOpen(false);
+          if (autoHide) setRevealed(false);
+        }
       }
     }
   }
@@ -734,9 +1483,37 @@ function setTheme(id) {
 }
 
 function setEnabled(ids) {
+  const prev = new Set(enabled);
   // Keep the declared order however you toggle them, so cells never shuffle.
   enabled = PROVIDERS.filter((q) => ids.includes(q.id)).map((q) => q.id);
-  saveState({ enabled, known: PROVIDERS.map((q) => q.id) });
+  for (const p of PROVIDERS) {
+    if (!p.peekCred) continue;
+    const nowOn = enabled.includes(p.id);
+    if (!nowOn && prev.has(p.id)) {
+      bumpGen(p.id);
+      disableGen.set(p.id, (disableGen.get(p.id) || 0) + 1);
+      if (inflightToken.has(p.id)) {
+        fetched.delete(p.id);
+        fetchedFor.delete(p.id);
+      }
+      inflight.delete(p.id);
+      inflightKeys.delete(p.id);
+      inflightToken.delete(p.id);
+      activeKeys.delete(p.id);
+      activeToken.delete(p.id);
+      clearResetNotice(p.id);
+    } else if (nowOn && !prev.has(p.id)) {
+      // Hide any prior state until live credentials confirm the account, and clear backoff so tick() verifies immediately.
+      unverified.add(p.id);
+      credAnswered(p);
+    }
+  }
+  const st = readState();
+  const extra = (list) => (Array.isArray(list) ? list.filter((id) => typeof id === 'string' && !PROVIDERS.some((q) => q.id === id)) : []);
+  const savedEnabled = [...enabled, ...extra(st.enabled)];
+  const known = [...extra(st.known), ...PROVIDERS.map((q) => q.id)];
+  const disabled = [...extra(st.disabled), ...PROVIDERS.filter((q) => !enabled.includes(q.id)).map((q) => q.id)];
+  saveState({ enabled: savedEnabled, known, disabled });
   tray.setContextMenu(menu());
   setOpen(false);
   place(true);
@@ -880,6 +1657,7 @@ function toggle() {
     if (!autoHide) setRevealed(true);
     tick();
   } else {
+    noticeFor = null;
     noticeUntil = 0;
     win.webContents.send('reset', null);
     win.hide();
@@ -899,13 +1677,17 @@ function savedReading(v) {
   }
   // An older build could save Codex's count from /usage beside a newer list's dates; the list counts, as readCodex does now.
   if (Array.isArray(reading.bankedResetExpiries)) reading.bankedResets = reading.bankedResetExpiries.length;
+  // The keys a reading's account was proven by are matched and linked as strings; anything else proves nothing.
+  if (!(Array.isArray(reading.gateKeys) && reading.gateKeys.every((k) => typeof k === 'string'))) delete reading.gateKeys;
   return reading;
 }
 
 function loadState() {
   const st = readState();
-  // A provider added after the state was saved starts on; `known` is what the saving build had.
-  if (Array.isArray(st.enabled)) enabled = PROVIDERS.filter((p) => st.enabled.includes(p.id) || !(st.known || ['claude', 'codex']).includes(p.id)).map((p) => p.id);
+  // A provider added after the state was saved starts on; `known` is what the saving build had, and `disabled` survives
+  // a rollback to an older build whose save rewrote `known` without providers it did not know.
+  const disabled = new Set(Array.isArray(st.disabled) ? st.disabled : []);
+  if (Array.isArray(st.enabled)) enabled = PROVIDERS.filter((p) => st.enabled.includes(p.id) || (!disabled.has(p.id) && !(st.known || ['claude', 'codex']).includes(p.id))).map((p) => p.id);
   const saved = { claude: st.claudeRing, ...(st.rings || {}) }; // claudeRing is the oldest key
   for (const [id, list] of Object.entries(NUMBER_CHOICES)) if (list.some(([, row]) => row === saved[id])) choices[id] = saved[id];
   if (THEMES.some(([id]) => id === st.theme)) theme = st.theme;
@@ -921,10 +1703,48 @@ function loadState() {
   if (typeof st.along === 'number') along = Math.max(0, Math.min(1, st.along));
   displayId = screen.getAllDisplays().some((d) => d.id === st.displayId) ? st.displayId : screen.getPrimaryDisplay().id;
   // Last good numbers, so a restart paints real levels before the first request comes back.
+  // Account-checked providers (Antigravity) stay hidden until their credentials confirm the restored reading belongs to the current account.
+  unverified.clear();
+  credRetryAt.clear();
+  credFails.clear();
+  credChecked.clear();
+  publishedQuota.clear();
+  activeKeys.clear();
+  activeToken.clear();
+  fetchedFor.clear();
   if (st.cache && typeof st.cache === 'object') cache = Object.fromEntries(Object.entries(st.cache).map(([id, v]) => [id, savedReading(v)]));
-  for (const [id, v] of Object.entries(cache)) last.set(id, v);
+  for (const [id, v] of Object.entries(cache)) {
+    last.set(id, v);
+    if (!SHOT && PROVIDERS.find((p) => p.id === id)?.peekCred) unverified.add(id);
+  }
   for (const [id, account] of Object.entries(st.signedIn || {})) if (typeof account === 'string') signedIn.set(id, account);
-  for (const [id, v] of Object.entries(st.gate || {})) if (v > Date.now()) gate.set(id, v);
+  authRejected.clear();
+  authAnswered.clear();
+  rateCleared.clear();
+  for (const [id, v] of Object.entries(st.authRejected || {})) {
+    if (!v || typeof v !== 'object') continue;
+    const m = new Map();
+    if (typeof v.tokenHash === 'string' && typeof v.error === 'string') {
+      m.set(v.tokenHash, { error: v.error, authError: true });
+    } else {
+      for (const [hash, entry] of Object.entries(v)) {
+        if (typeof entry === 'string') m.set(hash, { error: entry, authError: true });
+        else if (entry && typeof entry === 'object' && typeof entry.error === 'string') {
+          m.set(hash, { error: entry.error, authError: !!entry.authError });
+        }
+      }
+    }
+    if (m.size) authRejected.set(id, m);
+  }
+  const now = Date.now();
+  for (const [id, v] of Object.entries(st.gate || {})) if (v > now && !PROVIDERS.find((p) => p.id === id)?.peekCred) gate.set(id, v);
+  accountGates.clear();
+  for (const p of PROVIDERS) {
+    const list = p.gateList ? p.gateList(st.accountGates?.[p.id], now) : [];
+    if (list.length) accountGates.set(p.id, list);
+    p.restoreTierGates?.(st.tierGates?.[p.id]);
+    p.restoreLinks?.(cache[p.id], accountGates.get(p.id) || [], st.accountLinks?.[p.id]);
+  }
   try {
     if (st.consoleSession) setConsoleKey(safeStorage.decryptString(Buffer.from(st.consoleSession, 'base64')), cache.claude?.apiCredit);
     hasConsoleKey = !!st.consoleSession;
