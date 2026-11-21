@@ -1446,9 +1446,117 @@ configuredProvider.read()
       assert.ok(sentAuth.some(([, a]) => a === 'Bearer override-tok') && !sentAuth.some(([, a]) => a === 'Bearer t3-fresh'), 'ANTIGRAVITY_AUTH_FILE overrides T3 Code token');
       delete process.env.ANTIGRAVITY_AUTH_FILE;
       fs.rmSync(path.join(codexHome, '.t3'), { recursive: true, force: true });
+
+      // In-memory renewal for expired refreshable tokens: renews once and caches in memory, deduplicates
+      // concurrent checks, prefers newer live stored tokens, never leaks across accounts or sign-out,
+      // cools down for 5 minutes on renewal failure, and invalidates on 401.
+      {
+        mod.clearAntigravityRenewed();
+        let renewCalls = 0;
+        let renewMode = 'ok';
+        let releaseRenew = null;
+        mod.setAntigravityRenewer(async (raw) => {
+          renewCalls++;
+          if (renewMode === 'hold') {
+            await new Promise((r) => (releaseRenew = r));
+          }
+          if (renewMode === 'fail') return null;
+          return {
+            ...raw,
+            token: {
+              ...raw.token,
+              access_token: `renewed-tok-${renewCalls}`,
+              expiry: new Date(clock + 60 * 60_000).toISOString(),
+            },
+          };
+        });
+        try {
+          // Concurrent peekCred on an expired refreshable token deduplicates to one renewal call.
+          sentAuth.length = 0;
+          renewMode = 'hold';
+          mod.setAntigravityCredReader(async () => ({
+            status: 'ok',
+            data: { id_token_email: 'idle@example.com', token: { access_token: 'idle-expired', refresh_token: 'idle-rt-1', expiry: new Date(clock - 30 * 60_000).toISOString() } },
+          }));
+          const p1 = ag.peekCred();
+          const p2 = ag.peekCred();
+          await new Promise((r) => setImmediate(r));
+          assert.strictEqual(renewCalls, 1, 'concurrent peekCred deduplicates renewal');
+          releaseRenew();
+          const [c1, c2] = await Promise.all([p1, p2]);
+          assert.strictEqual(c1.expired, false);
+          assert.strictEqual(c1.accessToken, 'renewed-tok-1');
+          assert.strictEqual(c2.accessToken, 'renewed-tok-1');
+          // Subsequent reads reuse the in-memory renewed bearer without re-invoking the renewer.
+          renewMode = 'ok';
+          const liveFromRenewed = await ag.read();
+          assert.strictEqual(liveFromRenewed.rows.length, 4);
+          assert.strictEqual(renewCalls, 1, 'in-memory renewed token is reused until expiry');
+          assert.ok(sentAuth.some(([, a]) => a === 'Bearer renewed-tok-1'));
+
+          // Switching to another account never reuses the previous account's in-memory renewed bearer.
+          sentAuth.length = 0;
+          mod.setAntigravityCredReader(async () => ({
+            status: 'ok',
+            data: { id_token_email: 'other-idle@example.com', token: { access_token: 'other-expired', refresh_token: 'idle-rt-2', expiry: new Date(clock - 5 * 60_000).toISOString() } },
+          }));
+          await ag.read();
+          assert.strictEqual(renewCalls, 2, 'account switch renews for the new account');
+          assert.ok(sentAuth.some(([, a]) => a === 'Bearer renewed-tok-2'));
+
+          // 401 on the in-memory renewed bearer invalidates it (with 1m retry cooldown).
+          quotaStatus = 401;
+          const refusedRenewed = await ag.read();
+          assert.ok(refusedRenewed.soft && refusedRenewed.authError);
+          quotaStatus = 200;
+          assert.strictEqual((await ag.peekCred()).expired, true, '401 invalidates the in-memory renewed token');
+          assert.strictEqual(renewCalls, 2, '1m cooldown prevents immediate renewal loop after 401');
+          clock += 61_000;
+          const reRenewed = await ag.peekCred();
+          assert.strictEqual(reRenewed.expired, false);
+          assert.strictEqual(reRenewed.accessToken, 'renewed-tok-3');
+          assert.strictEqual(renewCalls, 3);
+
+          // Live stored token beats in-memory renewed token and clears it.
+          sentAuth.length = 0;
+          mod.setAntigravityCredReader(async () => ({
+            status: 'ok',
+            data: { id_token_email: 'other-idle@example.com', token: { access_token: 'disk-fresh', refresh_token: 'idle-rt-2', expiry: new Date(clock + 60 * 60_000).toISOString() } },
+          }));
+          await ag.read();
+          assert.ok(sentAuth.some(([, a]) => a === 'Bearer disk-fresh'), 'live stored token takes precedence over in-memory renewed token');
+
+          // Sign-out clears any in-memory renewed token.
+          mod.setAntigravityCredReader(async () => ({ status: 'not_found' }));
+          assert.strictEqual((await ag.peekCred()).status, 'signed_out');
+
+          // Failed renewal falls back to soft expired and backs off for 5 minutes.
+          renewMode = 'fail';
+          const callsBeforeFail = renewCalls;
+          mod.setAntigravityCredReader(async () => ({
+            status: 'ok',
+            data: { id_token_email: 'fail@example.com', token: { access_token: 'fail-expired', refresh_token: 'fail-rt', expiry: new Date(clock - 10 * 60_000).toISOString() } },
+          }));
+          const failed1 = await ag.read();
+          assert.ok(failed1.soft && failed1.authError, 'failed renewal falls back to soft expired');
+          assert.strictEqual(renewCalls, callsBeforeFail + 1);
+          await ag.read();
+          assert.strictEqual(renewCalls, callsBeforeFail + 1, 'failed renewal cools down for 5 minutes');
+          clock += 5 * 60_000 + 1000;
+          renewMode = 'ok';
+          const recoveredRenew = await ag.read();
+          assert.strictEqual(recoveredRenew.rows.length, 4, 'renewal resumes after 5m failure cooldown');
+          assert.strictEqual(renewCalls, callsBeforeFail + 2);
+        } finally {
+          mod.setAntigravityRenewer(null);
+          mod.clearAntigravityRenewed();
+        }
+      }
     } finally {
       Date.now = realNow;
       mod.setAntigravityCredReader(null);
+      mod.setAntigravityRenewer(null);
+      mod.clearAntigravityRenewed();
       global.fetch = originalFetch;
       fs.rmSync(agCliFallback, { force: true });
       fs.rmSync(path.join(codexHome, '.t3'), { recursive: true, force: true });

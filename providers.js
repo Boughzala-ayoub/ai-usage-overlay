@@ -3,7 +3,7 @@
 //   { plan, rows: [{ label, percent, resetsAt }], error, updatedAt }
 // Pure shaping is exported separately so test.js can check it without touching disk or network.
 
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -29,6 +29,7 @@ const ANTIGRAVITY_API = 'https://daily-cloudcode-pa.googleapis.com/v1internal';
 const ANTIGRAVITY_UA = 'antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64)';
 const ANTIGRAVITY_AUTH = path.join(HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
 const T3_ANTIGRAVITY_DIR = path.join(HOME, '.t3', 'userdata', 'providers', 'antigravity');
+const T3_AGY_TOOLS_DIR = path.join(HOME, '.t3', 'tools', 'antigravity-acp', `${process.platform}-${process.arch}`);
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -1056,14 +1057,14 @@ function antigravityIdentity(raw) {
     const account = accountKey(strong);
     // Include the hashed refresh token alongside email so rotating the bearer when email is absent/added still matches Retry-After.
     const gateKeys = [...new Set([account, ...(refreshHash ? [refreshHash] : []), ...(tokenHash ? [`tok:${tokenHash}`] : [])])];
-    return { account, gateKey: account, gateKeys, tokenHash, hasRefresh: !!refresh, identityWeak: false };
+    return { account, gateKey: account, gateKeys, tokenHash, refreshHash, hasRefresh: !!refresh, identityWeak: false };
   }
   if (access) {
     // Access-token-only credentials cannot distinguish rotation from account switch, so 429 gating is conservative,
     // and carrying the hashed bearer token preserves backoff if refresh_token/email is later added to the same token.
-    return { account: tokenHash, gateKey: '__weak__', gateKeys: ['__weak__', `tok:${tokenHash}`], tokenHash, hasRefresh: false, identityWeak: true };
+    return { account: tokenHash, gateKey: '__weak__', gateKeys: ['__weak__', `tok:${tokenHash}`], tokenHash, refreshHash: null, hasRefresh: false, identityWeak: true };
   }
-  return { account: null, gateKey: null, gateKeys: [], tokenHash: null, hasRefresh: false, identityWeak: true };
+  return { account: null, gateKey: null, gateKeys: [], tokenHash: null, refreshHash: null, hasRefresh: false, identityWeak: true };
 }
 
 // Which backoff keys belong to one account. An email, a refresh token and a bearer each name a single account, so every
@@ -1439,6 +1440,188 @@ function clearTierPlans() {
   antigravityTierPending.clear();
   tierRejected.clear(); // the API's Retry-After (tierGates) still holds
   quotaAnswers.clear();
+  clearAntigravityRenewed();
+}
+
+// ---- In-memory Antigravity OAuth renewal via the local `agy` binary's ACP stdio protocol.
+// Google access tokens expire after 1 hour; when Antigravity sits idle past that, neither Windows Credential
+// Manager nor T3 Code rotates the token until the user sends a prompt. Renewing inside an isolated temp dir
+// with AGY_ACP_FORCE_FILE_STORAGE=1 and SSH_CONNECTION set keeps the refreshed access token in memory only,
+// never mutates user credentials on disk, never races with a running ACP server, and never opens a browser.
+const AGY_BIN = process.platform === 'win32' ? 'agy.exe' : 'agy';
+let agRenewed = null; // { refreshHash, account, data, tokenHash, expiry }
+let agRenewInflight = null; // { refreshHash, promise }
+let agRenewGen = 0;
+const agRenewRetryAt = new Map(); // refreshHash -> ms before next renewal attempt after failure
+
+function clearAntigravityRenewed() {
+  agRenewGen++;
+  agRenewed = null;
+  agRenewInflight = null;
+  agRenewRetryAt.clear();
+}
+
+function findAgyBinary() {
+  if (process.env.ANTIGRAVITY_CLI_PATH && fs.existsSync(process.env.ANTIGRAVITY_CLI_PATH)) return process.env.ANTIGRAVITY_CLI_PATH;
+  try {
+    const active = JSON.parse(fs.readFileSync(path.join(T3_AGY_TOOLS_DIR, 'active.json'), 'utf8'));
+    if (typeof active?.releaseId === 'string' && /^[\w.-]+$/.test(active.releaseId)) {
+      const p = path.join(T3_AGY_TOOLS_DIR, 'versions', active.releaseId, AGY_BIN);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch { /* fall through to versions scan */ }
+  try {
+    const vDir = path.join(T3_AGY_TOOLS_DIR, 'versions');
+    const vers = fs.readdirSync(vDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => {
+        const p = path.join(vDir, e.name, AGY_BIN);
+        try { return { p, m: fs.statSync(p).mtimeMs }; } catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.m - a.m);
+    if (vers.length) return vers[0].p;
+  } catch { /* no T3-managed agy binary */ }
+  for (const p of [
+    path.join(HOME, '.gemini', 'antigravity-cli', 'bin', AGY_BIN),
+    path.join(HOME, '.antigravity', 'bin', AGY_BIN),
+  ]) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function defaultAntigravityRenewer(rawData) {
+  const agy = findAgyBinary();
+  if (!agy) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let tmpDir;
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-usage-ag-'));
+      const appDir = path.join(tmpDir, 'ag');
+      fs.mkdirSync(appDir, { recursive: true });
+      fs.writeFileSync(path.join(appDir, 'antigravity-oauth-token'), JSON.stringify(rawData), { mode: 0o600 });
+    } catch {
+      if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      return resolve(null);
+    }
+    const tokFile = path.join(tmpDir, 'ag', 'antigravity-oauth-token');
+    const cleanEnv = { ...process.env };
+    for (const k of Object.keys(cleanEnv)) {
+      if (/^(?:AGY_|ANTIGRAVITY_|GEMINI_HOME|T3)/i.test(k)) delete cleanEnv[k];
+    }
+    Object.assign(cleanEnv, {
+      AGY_ACP_FORCE_FILE_STORAGE: '1',
+      AGY_CLI_DISABLE_AUTO_UPDATE: '1',
+      SSH_CONNECTION: '127.0.0.1 1 127.0.0.1 22',
+    });
+    let done = false;
+    let authOk = false;
+    let sentAuth = false;
+    let buf = '';
+    let killTimer = null;
+    const child = spawn(agy, ['acp', '--stdio', '--disable-telemetry', '--gemini-dir', tmpDir, '--app-data-dir', 'ag'], {
+      env: cleanEnv,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      clearTimeout(killTimer);
+      let refreshed = null;
+      if (ok) {
+        const res = readCredFile(tokFile);
+        if (res.status === 'ok' && hasAntigravityAccessToken(res.data)) {
+          const exp = antigravityExpiry(res.data);
+          if (Number.isFinite(exp) && exp > Date.now()) refreshed = res.data;
+        }
+      }
+      try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); } catch {}
+      resolve(refreshed);
+    };
+    const deadline = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish(false);
+    }, 12_000);
+    child.stdin.on('error', () => {});
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s) continue;
+        let msg;
+        try { msg = JSON.parse(s); } catch { continue; }
+        if (msg.id === 1 && !sentAuth) {
+          sentAuth = true;
+          const methodId = rawData?.auth_method === 'business' ? 'oauth-business' : 'oauth-personal';
+          try {
+            child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'authenticate', params: { methodId } }) + '\n');
+          } catch {}
+        } else if (msg.id === 2) {
+          authOk = !msg.error;
+          try { child.stdin.end(); } catch {}
+          killTimer = setTimeout(() => { try { child.kill(); } catch {} }, 1500);
+        }
+      }
+    });
+    child.on('error', () => finish(false));
+    child.on('close', () => finish(authOk));
+    try {
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1, clientCapabilities: {} } }) + '\n');
+    } catch {
+      try { child.kill(); } catch {}
+      finish(false);
+    }
+  });
+}
+
+let antigravityRenewer = defaultAntigravityRenewer;
+function setAntigravityRenewer(fn) {
+  antigravityRenewer = fn || defaultAntigravityRenewer;
+}
+
+async function tryRenewAntigravity(rawData, account, refreshHash) {
+  const now = Date.now();
+  if ((agRenewRetryAt.get(refreshHash) || 0) > now) return null;
+  if (agRenewInflight && agRenewInflight.refreshHash === refreshHash) return agRenewInflight.promise;
+  const gen = agRenewGen;
+  const run = (async () => {
+    let data = null;
+    try {
+      data = await antigravityRenewer(rawData);
+    } catch {
+      data = null;
+    }
+    const exp = data && hasAntigravityAccessToken(data) ? antigravityExpiry(data) : NaN;
+    if (data && Number.isFinite(exp) && exp > Date.now()) {
+      const merged = !data.id_token_email && rawData?.id_token_email ? { ...data, id_token_email: rawData.id_token_email } : data;
+      const tok = merged?.token || merged;
+      const access = typeof tok?.access_token === 'string' ? tok.access_token : '';
+      const id = antigravityIdentity(merged);
+      if (gen === agRenewGen && id.account === account && (!id.refreshHash || id.refreshHash === refreshHash)) {
+        agRenewRetryAt.delete(refreshHash);
+        agRenewed = { refreshHash, account, data: merged, tokenHash: accountKey(access), expiry: exp };
+        return merged;
+      }
+      return null;
+    }
+    if (gen === agRenewGen) {
+      for (const [k, until] of agRenewRetryAt) if (until <= Date.now()) agRenewRetryAt.delete(k);
+      agRenewRetryAt.set(refreshHash, Date.now() + 5 * MIN);
+    }
+    return null;
+  })();
+  const entry = { refreshHash, promise: run };
+  agRenewInflight = entry;
+  try {
+    return await run;
+  } finally {
+    if (agRenewInflight === entry) agRenewInflight = null;
+  }
 }
 
 // isOn: main.js's say that Antigravity is still switched on, asked before a retry.
@@ -1533,19 +1716,47 @@ async function peekAntigravityCred() {
   const cred = await readAntigravityCreds();
   if (cred.status === 'error') return { status: 'error', error: cred.message, soft: true };
   if (cred.status === 'invalid') {
-    if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+    if (seq > latestPeek) {
+      [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+      clearAntigravityRenewed();
+    }
     return { status: 'signed_out', error: 'Antigravity credentials unreadable — open Antigravity to sign in.', signedOut: true };
   }
   const tok = cred.status === 'ok' ? (cred.data?.token || cred.data) : null;
-  const accessToken = typeof tok?.access_token === 'string' && tok.access_token.trim() ? tok.access_token : '';
+  let accessToken = typeof tok?.access_token === 'string' && tok.access_token.trim() ? tok.access_token : '';
   if (!accessToken) {
-    if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+    if (seq > latestPeek) {
+      [latestPeek, latestBearer, latestExpiry] = [seq, null, NaN];
+      clearAntigravityRenewed();
+    }
     return { status: 'signed_out', error: 'No Antigravity credentials — open Antigravity to sign in.', signedOut: true };
   }
-  const { account, gateKey, gateKeys, tokenHash, hasRefresh, identityWeak } = antigravityIdentity(cred.data);
+  let { account, gateKey, gateKeys, tokenHash, refreshHash, hasRefresh, identityWeak } = antigravityIdentity(cred.data);
   // A date or epoch ms. Anything else (null, an object) is no expiry: never coerced, which can throw or read null as 1970.
-  const expiry = typeof tok.expiry === 'string' ? Date.parse(tok.expiry) : typeof tok.expiry === 'number' ? tok.expiry : NaN;
-  const expired = Number.isFinite(expiry) && expiry <= Date.now();
+  let expiry = typeof tok.expiry === 'string' ? Date.parse(tok.expiry) : typeof tok.expiry === 'number' ? tok.expiry : NaN;
+  let expired = Number.isFinite(expiry) && expiry <= Date.now();
+  // When the stored 1-hour access token has lapsed while Antigravity sits idle, reuse or fetch an in-memory
+  // renewed bearer for the exact same account + refresh_token without mutating user credentials on disk.
+  if (expired && hasRefresh && refreshHash) {
+    const activeData = agRenewed && agRenewed.refreshHash === refreshHash && agRenewed.account === account && agRenewed.expiry > Date.now()
+      ? agRenewed.data
+      : await tryRenewAntigravity(cred.data, account, refreshHash);
+    if (activeData) {
+      const rTok = activeData?.token || activeData;
+      const rAccess = typeof rTok?.access_token === 'string' && rTok.access_token.trim() ? rTok.access_token : '';
+      const rExpiry = antigravityExpiry(activeData);
+      if (rAccess && Number.isFinite(rExpiry) && rExpiry > Date.now()) {
+        const rId = antigravityIdentity(activeData);
+        accessToken = rAccess;
+        expiry = rExpiry;
+        expired = false;
+        tokenHash = rId.tokenHash;
+        gateKeys = [...new Set([...gateKeys, ...rId.gateKeys])];
+      }
+    }
+  } else if (!expired && agRenewed && agRenewed.refreshHash === refreshHash && (!Number.isFinite(expiry) || expiry >= agRenewed.expiry)) {
+    agRenewed = null;
+  }
   if (seq > latestPeek) [latestPeek, latestBearer, latestExpiry] = [seq, tokenHash, expiry];
   // `linked` tells the caller a new link formed, for main.js to save (antigravityLinks).
   const linked = linkAntigravityKeys(gateKeys);
@@ -1626,6 +1837,10 @@ async function readAntigravity(preCred, opts = {}) {
     // With a refresh_token on disk the 1-hour access token simply lapsed while Antigravity sat idle, so return soft
     // to keep the last good numbers on screen unless a newer check drops refresh_token.
     if (isAntigravityAuthError(e)) {
+      if (agRenewed && agRenewed.tokenHash === cred.tokenHash) {
+        agRenewRetryAt.set(agRenewed.refreshHash, Date.now() + MIN);
+        agRenewed = null;
+      }
       answered(true);
       return {
         error: 'Session expired — open Antigravity.',
@@ -1681,4 +1896,4 @@ const PROVIDERS = [
   { id: 'ram', name: 'RAM', glyph: '▤', color: '#bc7eff', color2: '#dab2ff', everyMs: 0, local: true, read: readRam },
 ];
 
-module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, setAntigravityCredReader, clearAntigravityAliases, clearAntigravityTierGates,shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeAntigravity, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits, retryAfterSeconds };
+module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, setAntigravityCredReader, setAntigravityRenewer, clearAntigravityRenewed, clearAntigravityAliases, clearAntigravityTierGates, shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeAntigravity, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits, retryAfterSeconds };
