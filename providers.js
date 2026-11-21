@@ -28,6 +28,7 @@ const CURSOR_DASHBOARD_API = 'https://api2.cursor.sh/aiserver.v1.DashboardServic
 const ANTIGRAVITY_API = 'https://daily-cloudcode-pa.googleapis.com/v1internal';
 const ANTIGRAVITY_UA = 'antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64)';
 const ANTIGRAVITY_AUTH = path.join(HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+const T3_ANTIGRAVITY_DIR = path.join(HOME, '.t3', 'userdata', 'providers', 'antigravity');
 let resetDetailsRetryAt = 0;
 const ORCA_CODEX_HOME = process.env.ORCA_CODEX_HOME || (process.env.APPDATA && path.join(process.env.APPDATA, 'orca', 'codex-runtime-home', 'home'));
 const CODEX_HOMES = [...new Set([process.env.CODEX_HOME, ORCA_CODEX_HOME, path.join(HOME, '.codex')].filter(Boolean))];
@@ -940,15 +941,96 @@ function readCredFile(file) {
   }
 }
 
+function antigravityExpiry(data) {
+  const tok = data?.token || data;
+  return typeof tok?.expiry === 'string' ? Date.parse(tok.expiry) : typeof tok?.expiry === 'number' ? tok.expiry : NaN;
+}
+
+function hasAntigravityAccessToken(data) {
+  const tok = data?.token || data;
+  return typeof tok?.access_token === 'string' && !!tok.access_token.trim();
+}
+
+function readT3AntigravityCreds() {
+  let entries;
+  try {
+    entries = fs.readdirSync(T3_ANTIGRAVITY_DIR, { withFileTypes: true });
+  } catch {
+    return { valid: [], sawInvalid: false, sawError: null };
+  }
+  const valid = [];
+  let sawInvalid = false;
+  let sawError = null;
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const file = path.join(T3_ANTIGRAVITY_DIR, e.name, 'antigravity-acp', 'antigravity-oauth-token');
+    const res = readCredFile(file);
+    if (res.status === 'ok' && hasAntigravityAccessToken(res.data)) {
+      let mtimeMs = 0;
+      try { mtimeMs = fs.statSync(file).mtimeMs; } catch { /* file rotated away mid-scan */ }
+      valid.push({ data: res.data, expiry: antigravityExpiry(res.data), mtimeMs, priority: 1 });
+    } else if (res.status === 'invalid') {
+      sawInvalid = true;
+    } else if (res.status === 'error' && !sawError) {
+      sawError = res;
+    }
+  }
+  return { valid, sawInvalid, sawError };
+}
+
+function compareAntigravityCreds(a, b, now) {
+  const aLive = !(Number.isFinite(a.expiry) && a.expiry <= now);
+  const bLive = !(Number.isFinite(b.expiry) && b.expiry <= now);
+  if (aLive !== bLive) return aLive ? 1 : -1;
+  const aExp = Number.isFinite(a.expiry);
+  const bExp = Number.isFinite(b.expiry);
+  if (aExp !== bExp) return aExp ? 1 : -1;
+  if (aExp && a.expiry !== b.expiry) return a.expiry > b.expiry ? 1 : -1;
+  if (a.priority !== b.priority) return a.priority > b.priority ? 1 : -1;
+  if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs > b.mtimeMs ? 1 : -1;
+  return 0;
+}
+
+function pickAntigravityCred(candidates, now = Date.now()) {
+  let best = candidates[0];
+  for (let i = 1; i < candidates.length; i++) {
+    if (compareAntigravityCreds(candidates[i], best, now) > 0) best = candidates[i];
+  }
+  return best;
+}
+
 async function readAntigravityCreds() {
   if (process.env.ANTIGRAVITY_AUTH_FILE) return readCredFile(process.env.ANTIGRAVITY_AUTH_FILE);
+  let win = null;
   if (process.platform === 'win32' || winCredReader !== defaultWinCredReader) {
-    const win = await winCredReader();
-    // Only fall back to the CLI token file on confirmed absence (ERROR_NOT_FOUND); a helper timeout, Win32
-    // error, or corrupted/empty credential entry must never silently select another account from an old file.
-    if (win.status !== 'not_found') return win;
+    win = await winCredReader();
+    // Only consider file sources when Windows Credential Manager either succeeded or confirmed absence
+    // (ERROR_NOT_FOUND); a helper timeout, Win32 error, or corrupted/empty credential entry must never
+    // silently select another account from an old file.
+    if (win.status !== 'ok' && win.status !== 'not_found') return win;
   }
-  return readCredFile(ANTIGRAVITY_AUTH);
+  const candidates = [];
+  if (win?.status === 'ok' && hasAntigravityAccessToken(win.data)) {
+    candidates.push({ data: win.data, expiry: antigravityExpiry(win.data), mtimeMs: 0, priority: 2 });
+  }
+  const t3 = readT3AntigravityCreds();
+  candidates.push(...t3.valid);
+  // Only fall back to the headless CLI token file on confirmed Windows Credential Manager absence.
+  if (!win || win.status === 'not_found') {
+    const cli = readCredFile(ANTIGRAVITY_AUTH);
+    if (cli.status === 'ok' && hasAntigravityAccessToken(cli.data)) {
+      let mtimeMs = 0;
+      try { mtimeMs = fs.statSync(ANTIGRAVITY_AUTH).mtimeMs; } catch { /* file rotated away mid-scan */ }
+      candidates.push({ data: cli.data, expiry: antigravityExpiry(cli.data), mtimeMs, priority: 0 });
+    } else if (!candidates.length && cli.status !== 'not_found') {
+      return cli;
+    }
+  }
+  if (candidates.length) return { status: 'ok', data: pickAntigravityCred(candidates).data };
+  if (win?.status === 'ok') return win;
+  if (t3.sawError) return t3.sawError;
+  if (t3.sawInvalid) return { status: 'invalid' };
+  return { status: 'not_found' };
 }
 
 // Whitespace-only token hashes that an earlier build could have linked across distinct accounts before blank tokens
@@ -1589,14 +1671,14 @@ function readRam() {
 }
 
 const PROVIDERS = [
-  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', everyMs: 5 * 60_000, read: readClaude, readLocal: readClaudeLocal },
-  { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', everyMs: 5 * 60_000, read: readCodex },
-  { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', everyMs: 5 * 60_000, read: readOpenCodeGo },
+  { id: 'claude', name: 'Claude', glyph: '✳', color: '#ff7043', color2: '#ff966b', everyMs: 5 * 60_000, read: readClaude, readLocal: readClaudeLocal },
+  { id: 'codex', name: 'Codex', glyph: '◉', color: '#00d09c', color2: '#38f0be', everyMs: 5 * 60_000, read: readCodex },
+  { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#ff9f43', color2: '#ffc77d', everyMs: 5 * 60_000, read: readOpenCodeGo },
   // xAI's mark is monochrome, so it wears the theme's own ink.
-  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', everyMs: 5 * 60_000, read: readXai },
-  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', everyMs: 5 * 60_000, read: readAntigravity, peekCred: peekAntigravityCred, gateAliases: antigravityAliases, gateUntil, gateSet, gateList, tierGates: () => tierGates.filter((g) => g.until > Date.now()), restoreTierGates, links: antigravityLinks, restoreLinks: restoreAntigravityLinks, watchTierGates: (fn) => (tierGatesChanged = fn), onSignedOut: clearTierPlans, cachedPlan: (account) => (account ? (newestTier(account)?.plan || '') : '') },
-  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', everyMs: 0, local: true, read: readCpu },
-  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', everyMs: 0, local: true, read: readRam },
+  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', color2: 'color-mix(in srgb, var(--fg) 72%, var(--dim))', everyMs: 5 * 60_000, read: readXai },
+  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#3b8bff', color2: '#72b3ff', everyMs: 5 * 60_000, read: readAntigravity, peekCred: peekAntigravityCred, gateAliases: antigravityAliases, gateUntil, gateSet, gateList, tierGates: () => tierGates.filter((g) => g.until > Date.now()), restoreTierGates, links: antigravityLinks, restoreLinks: restoreAntigravityLinks, watchTierGates: (fn) => (tierGatesChanged = fn), onSignedOut: clearTierPlans, cachedPlan: (account) => (account ? (newestTier(account)?.plan || '') : '') },
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#36a9ff', color2: '#76ceff', everyMs: 0, local: true, read: readCpu },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#bc7eff', color2: '#dab2ff', everyMs: 0, local: true, read: readRam },
 ];
 
 module.exports = { PROVIDERS, readClaudeLocal, setConsoleKey, setAntigravityCredReader, clearAntigravityAliases, clearAntigravityTierGates,shapeApiCredit, creditExpired, fmtReset, nextMonthly, shapeClaude, shapeCodex, shapeCodexUsage, shapeCodexRenewal, shapeOpenCodeGo, shapeXai, shapeAntigravity, shapeCodexResetCredits, windowLabel, ringPercent, resetRows, lastRateLimits, retryAfterSeconds };

@@ -38,6 +38,7 @@ const USAGE_PAGES = {
   codex: 'https://chatgpt.com/codex/settings/usage',
   'opencode-go': 'https://opencode.ai/workspace/wrk_01M26JF7B3TC3JG56RDM1940Q5/go',
   xai: 'https://grok.com/?_s=usage',
+  antigravity: 'https://antigravity.google.com/remote?settingsOpen=true&settingsScreen=General',
 };
 const THEMES = THEME_GROUPS.flatMap(([, list]) => list); // [id, label, css]
 const SIZES = [
@@ -260,7 +261,7 @@ function snapshot() {
     // One fixed line: the helper's own message can carry its whole PowerShell command line or a local path.
     const lookupError = credFails.get(p.id) >= 2 && (unverified.has(p.id) || !last.get(p.id)) ? `${p.name} credential lookup failing — retrying every minute.` : '';
     if (unverified.has(p.id) || lookupError) {
-      return { id: p.id, name: p.name, glyph: p.glyph, color: p.color, local: p.local, ringPercent: 0, rows: [], waitMs: 0, ...(lookupError ? { error: lookupError } : {}) };
+      return { id: p.id, name: p.name, glyph: p.glyph, color: p.color, color2: p.color2, local: p.local, ringPercent: 0, rows: [], waitMs: 0, ...(lookupError ? { error: lookupError } : {}) };
     }
     const d = last.get(p.id) || {};
     const until = gate.get(p.id) || 0;
@@ -269,6 +270,7 @@ function snapshot() {
       name: p.name,
       glyph: p.glyph,
       color: p.color,
+      color2: p.color2, // the bar's second stop
       local: p.local, // CPU and RAM, which the footers leave out of "Updated"
       ...d,
       // Past its deadline a balance isn't funds, whatever kept the reading: a gated or skipped read, a soft
@@ -320,7 +322,7 @@ function showResetNotice(p, rows) {
   noticeUntil = Date.now() + NOTICE_MS;
   closeAt = 0;
   setRevealed(true);
-  win.webContents.send('reset', { id: p.id, name: p.name, glyph: p.glyph, color: p.color, rows: rows.map(shownRow) });
+  win.webContents.send('reset', { id: p.id, name: p.name, glyph: p.glyph, color: p.color, color2: p.color2, rows: rows.map(shownRow) });
 }
 
 function bumpGen(id) {
@@ -1284,7 +1286,10 @@ function servePhone() {
       const choices = supportsToggle
         ? NUMBER_CHOICES
         : Object.fromEntries(Object.entries(NUMBER_CHOICES).filter(([id]) => LEGACY_PROVIDERS.has(id)));
-      return json(res, { themes: THEME_GROUPS, providers: list.map(({ id, name, glyph, color }) => ({ id, name, glyph, color })), choices, pages: USAGE_PAGES, capabilities: { toggleProvider: true } });
+      const pages = supportsToggle
+        ? USAGE_PAGES
+        : Object.fromEntries(Object.entries(USAGE_PAGES).filter(([id]) => LEGACY_PROVIDERS.has(id)));
+      return json(res, { themes: THEME_GROUPS, providers: list.map(({ id, name, glyph, color, color2 }) => ({ id, name, glyph, color, color2 })), choices, pages, capabilities: { toggleProvider: true } });
     }
     if (url === '/api/settings' && req.method === 'POST') {
       // A form or a no-cors fetch from a page can't send JSON without a preflight, which this server never answers.

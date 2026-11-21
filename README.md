@@ -65,8 +65,10 @@ refresh token does the xAI section say to run `grok`, with a dash on the chip. T
 the section says no usage windows were reported. xAI's mark is monochrome, so on both screens it
 takes the theme's text colour.
 
-Antigravity reads its Google OAuth token from Windows Credential Manager (`gemini:antigravity`), or
-from `~/.gemini/antigravity-cli/antigravity-oauth-token` (or `ANTIGRAVITY_AUTH_FILE`) if present.
+Antigravity reads its Google OAuth token from Windows Credential Manager (`gemini:antigravity`) and
+T3 Code's provider store (`~/.t3/userdata/providers/antigravity/*/antigravity-acp/antigravity-oauth-token`),
+picking the freshest valid token, or from `~/.gemini/antigravity-cli/antigravity-oauth-token` (or
+`ANTIGRAVITY_AUTH_FILE`) if present.
 It queries `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` for the 5-hour
 and weekly buckets across both model groups (`Gemini 5h`, `Gemini wk`, `Other 5h`, `Other wk`),
 converting `remainingFraction` into percentage used, and reads the subscription tier once per token

@@ -23,27 +23,29 @@ fs.mkdirSync(shots, { recursive: true });
 const h = 3600_000;
 let cpuLoad = 23; // changes at every read on the real PC
 const providers = (hot) => [
-  { id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: hot ? 96 : 34, renewsAt: Date.now() + 232 * h, renewsGuess: true, renewsIn: 'in 9d 16h', bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
+  { id: 'claude', name: 'Claude', glyph: '✳', color: '#ff7043', color2: '#ff966b', plan: 'Max 5x', ringPercent: hot ? 96 : 34, renewsAt: Date.now() + 232 * h, renewsGuess: true, renewsIn: 'in 9d 16h', bankedResets: 1, bankedResetExpiries: [Date.parse('2026-10-22T16:00:00Z')], updatedAt: Date.now(), waitMs: 0,
     apiCredit: { leftCents: 9195, grantedCents: 10000, expiresAt: Date.parse('2099-10-27T00:00:00Z'), ...(hot ? { error: 'API credit not refreshed (HTTP 503), showing the last reading.' } : {}) },
     rows: [{ label: 'Session', percent: hot ? 96 : 34, resets: 'in 3h 2m' }, { label: 'All models', percent: 56, resets: 'in 3h 42m' }, { label: 'Fable', percent: 0, resets: 'in 3h 42m' }] },
-  { id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: hot ? 100 : 3, renewsAt: Date.now() + 193 * h, renewsIn: 'in 8d 1h', bankedResets: 2, bankedResetExpiries: [Date.parse('2026-10-28T10:00:00Z'), Date.parse('2026-11-04T10:00:00Z')], updatedAt: Date.now() - (hot ? h : 0), waitMs: hot ? 90_000 : 0,
+  { id: 'codex', name: 'Codex', glyph: '◉', color: '#00d09c', color2: '#38f0be', plan: 'Pro Lite', ringPercent: hot ? 100 : 3, renewsAt: Date.now() + 193 * h, renewsIn: 'in 8d 1h', bankedResets: 2, bankedResetExpiries: [Date.parse('2026-10-28T10:00:00Z'), Date.parse('2026-11-04T10:00:00Z')], updatedAt: Date.now() - (hot ? h : 0), waitMs: hot ? 90_000 : 0,
     rows: [{ label: 'Weekly', percent: hot ? 100 : 3, resets: 'in 6d 12h' }] },
-  { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', plan: 'Go', ringPercent: hot ? 78 : 61, updatedAt: Date.now(), waitMs: 0,
+  { id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#ff9f43', color2: '#ffc77d', plan: 'Go', ringPercent: hot ? 78 : 61, updatedAt: Date.now(), waitMs: 0,
     rows: [{ label: '5h limit', percent: 0, resets: 'in 5h' }, { label: 'Weekly', percent: 1, resets: 'in 4d 2h' }, { label: 'Monthly', percent: hot ? 78 : 61, resets: 'in 2d 23h' }] },
   // Hot, xAI is the provider whose usage is unavailable: signed out, no numbers at all.
-  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: hot ? 0 : 42.5, updatedAt: Date.now(), waitMs: 0,
+  { id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', color2: 'color-mix(in srgb, var(--fg) 72%, var(--dim))', plan: '', ringPercent: hot ? 0 : 42.5, updatedAt: Date.now(), waitMs: 0,
     ...(hot ? { rows: [], error: 'Grok sign-in expired — run `grok` to renew it.' } : { rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }] }) },
-  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', plan: 'AI Ultra', ringPercent: hot ? 82 : 4.6, updatedAt: Date.now(), waitMs: 0,
-    rows: [{ label: 'Gemini 5h', percent: hot ? 82 : 4.6, resets: 'in 3h 50m' }, { label: 'Gemini wk', percent: 2.4, resets: 'in 6d 22h' }, { label: 'Other 5h', percent: 0, resets: 'in 5h' }, { label: 'Other wk', percent: 0, resets: 'in 7d' }] },
+  { id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#3b8bff', color2: '#72b3ff', plan: 'AI Ultra', ringPercent: hot ? 82 : 4.6, updatedAt: Date.now(), waitMs: 0,
+    // Hot, its grid at its widest numbers, a fifth window and a note under them.
+    rows: [{ label: 'Gemini 5h', percent: hot ? 82 : 4.6, resets: 'in 3h 50m' }, { label: 'Gemini wk', percent: hot ? 100 : 2.4, resets: 'in 6d 22h' }, { label: 'Other 5h', percent: 0, resets: 'in 5h' }, { label: 'Other wk', percent: 0, resets: 'in 7d' },
+      ...(hot ? [{ label: 'Gemini 4 Argon 5h', percent: 18.5, resets: 'in 1h 5m' }] : [])], ...(hot ? { note: 'Live refresh unavailable; showing the most recent usage.' } : {}) },
   // This PC, as main.js sends it: a long CPU model, RAM's GB in the reset column.
-  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: cpuLoad, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'Load', percent: cpuLoad, resets: '' }] },
-  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', plan: '127.8 GB', ringPercent: hot ? 93 : 58, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'In use', percent: hot ? 93 : 58, resets: '112.4 GB' }] },
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#36a9ff', color2: '#76ceff', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: cpuLoad, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'Load', percent: cpuLoad, resets: '' }] },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#bc7eff', color2: '#dab2ff', plan: '127.8 GB', ringPercent: hot ? 93 : 58, local: true, updatedAt: Date.now(), waitMs: 0, rows: [{ label: 'In use', percent: hot ? 93 : 58, resets: '112.4 GB' }] },
 ];
 const options = {
   themes: THEME_GROUPS,
   providers: providers(false).map(({ id, name, glyph, color }) => ({ id, name, glyph, color })),
   choices: { claude: [['Highest limit', ''], ['Session', 'Session'], ['Weekly', 'All models'], ['Fable', 'Fable']], 'opencode-go': [['Highest limit', ''], ['5-hour', '5h limit'], ['Weekly', 'Weekly'], ['Monthly', 'Monthly']], antigravity: [['Highest limit', ''], ['Gemini 5h', 'gemini-5h'], ['Gemini weekly', 'gemini-weekly'], ['Other 5h', '3p-5h'], ['Other weekly', '3p-weekly']] },
-  pages: { claude: 'https://claude.ai/settings/usage', codex: 'https://chatgpt.com/codex/settings/usage', xai: 'https://grok.com/?_s=usage' },
+  pages: { claude: 'https://claude.ai/settings/usage', codex: 'https://chatgpt.com/codex/settings/usage', xai: 'https://grok.com/?_s=usage', antigravity: 'https://antigravity.google.com/remote?settingsOpen=true&settingsScreen=General' },
   capabilities: { toggleProvider: true },
 };
 
@@ -374,6 +376,32 @@ try {
           if (m.shown < Math.min(m.all, 200)) fail(`${tag}: only ${m.shown}px of ${m.all}px of limits on show`);
           if (m.sx > 0) fail(`${tag}: the panel scrolls sideways by ${m.sx}`);
           if (m.spill.length) fail(`${tag}: text spills: ${m.spill.join(' | ')}`);
+          // As the PC lays them out: Antigravity's four windows two to a line, CPU and RAM side by side, while the
+          // panel is wide enough for two columns.
+          const lay = await page.evaluate(() => {
+            const secs = [...document.querySelectorAll('#sections .prov')];
+            const [cpu, ram] = [secs[5], secs[6]].map((s) => s.getBoundingClientRect());
+            const ag = secs[4];
+            const visibleAgRows = [...ag.querySelectorAll('.row')].filter((r) => r.getClientRects().length);
+            return {
+              two: getComputedStyle(document.querySelector('#sections')).gridTemplateColumns.trim().split(' ').length === 2,
+              paired: Math.abs(cpu.top - ram.top) < 1 && cpu.right <= ram.left,
+              agCols: ag.classList.contains('cells') ? new Set(visibleAgRows.map((r) => Math.round(r.getBoundingClientRect().left))).size : 0,
+              agMoreFolded: !!ag.querySelector('.ag-more') && !ag.querySelector('.ag-more').open && visibleAgRows.length === 2,
+              // Offsets, not rects: the card may still be scaling in. Visible known windows keep their name on one line,
+              // and a line under the grid takes its whole width.
+              wrapped: visibleAgRows.map((r) => r.querySelector('.l')).filter((l) => l.offsetHeight > parseFloat(getComputedStyle(l).lineHeight) * 1.4).map((l) => l.textContent),
+              narrowLines: [...ag.querySelectorAll('p')].filter((p) => p.offsetWidth < ag.clientWidth - 24).map((p) => p.textContent),
+              // The glow is the fill's alone: none on the track, none at 0%. Its layer is as wide as the fill.
+              glow: [...document.querySelectorAll('#sections .hair')].filter((h) => h.getClientRects().length).flatMap((h) => {
+                const cs = getComputedStyle(h);
+                const want = (parseFloat(cs.width) * parseFloat(cs.getPropertyValue('--p'))) / 100;
+                const got = parseFloat(getComputedStyle(h, '::before').width);
+                return cs.filter !== 'none' || !(Math.abs(got - want) < 0.5) ? [h.parentNode.querySelector('.l').textContent + ': ' + cs.filter + ', ' + got + ' of ' + want] : [];
+              }),
+            };
+          });
+          if (!lay.two || !lay.paired || lay.agCols !== 2 || !lay.agMoreFolded || lay.wrapped.length || lay.narrowLines.length || lay.glow.length) fail(`${tag}: cards not laid out as on the PC: ${JSON.stringify(lay)}`);
           const off = await outOfView();
           if (off.length) fail(`${tag}: off screen: ${off.slice(0, 4).join(' | ')}`);
           if ([320, 412].includes(width) || (width === 768 && at === 'middle')) await page.screenshot({ path: path.join(shots, `open-${state}-${width}-${side}-${at}.png`) });
@@ -396,7 +424,56 @@ try {
         }
       }
     }
+
+    // ---- a folded phone's cover screen, 280px across: one column, and Antigravity's windows and the vitals go back to
+    // plain lines and whole cards, no bars, each plan level with its name, as every other provider.
+    const tag = `${state} 280x653 narrow`;
+    await open(280, 653, 'right', 120);
+    const narrow = await page.evaluate(() => {
+      const secs = [...document.querySelectorAll('#sections .prov')];
+      const all = document.querySelector('#sections').getBoundingClientRect().width;
+      return {
+        usage: document.querySelector('#usage').clientWidth,
+        one: getComputedStyle(document.querySelector('#sections')).gridTemplateColumns.trim().split(' ').length === 1,
+        bars: [...document.querySelectorAll('#sections .hair')].filter((h) => h.getClientRects().length).length,
+        stacked: [...document.querySelectorAll('#sections .row')].filter((r) => r.getClientRects().length && (getComputedStyle(r).gridTemplateAreas !== 'none' || getComputedStyle(r).gridTemplateColumns.split(' ').length !== 3)).length,
+        halves: secs.slice(5).filter((s) => s.getBoundingClientRect().width < 0.8 * all).length,
+        askew: secs.filter((s) => {
+          const [b, p] = [s.querySelector('header b'), s.querySelector('header span:last-child')].map((e) => e.getBoundingClientRect());
+          return p.height && Math.abs(b.top + b.height / 2 - (p.top + p.height / 2)) > 2;
+        }).map((s) => s.querySelector('header b').textContent),
+      };
+    });
+    if (!(narrow.usage <= 220) || !narrow.one || narrow.bars || narrow.stacked || narrow.halves || narrow.askew.length) fail(`${tag}: cards not one plain column: ${JSON.stringify(narrow)}`);
+    await page.screenshot({ path: path.join(shots, `open-${state}-280-narrow.png`) });
+    await closes(() => page.evaluate(() => shut()));
+    await resize(small);
   }
+
+  // ---- Antigravity Other drawer: folds by default, expands into 2 columns on tap without closing the card, stays open on live push.
+  answer = 'ok';
+  await open(412, 915, 'right', 120);
+  await page.click('.ag-more summary');
+  await settle();
+  if (await has('closing')) fail('tapping Antigravity Other drawer closed the phone card');
+  cpuLoad = 37;
+  tell();
+  await settle();
+  const agOpen = await page.evaluate(() => {
+    const ag = [...document.querySelectorAll('#sections .prov')].find((s) => s.querySelector('header b')?.textContent === 'Antigravity');
+    const vis = [...ag.querySelectorAll('.row')].filter((r) => r.getClientRects().length);
+    return {
+      open: !!ag?.querySelector('.ag-more')?.open,
+      vis: vis.length,
+      cols: new Set(vis.map((r) => Math.round(r.getBoundingClientRect().left))).size,
+      wrapped: vis.map((r) => r.querySelector('.l')).filter((l) => l.offsetHeight > parseFloat(getComputedStyle(l).lineHeight) * 1.4).map((l) => l.textContent),
+    };
+  });
+  if (!agOpen.open || agOpen.vis !== 4 || agOpen.cols !== 2 || agOpen.wrapped.length) fail(`Antigravity Other drawer broken on phone: ${JSON.stringify(agOpen)}`);
+  await page.click('.ag-more summary');
+  await settle();
+  await closes(() => page.evaluate(() => shut()));
+  await resize(small);
 
   // ---- settings: the PC's menu and the phone's own, at every width. Keep PC awake carries its longest state: switched
   // off, with the PC still putting the sleep timers back.
@@ -1211,7 +1288,22 @@ try {
     await resize(small);
   }
   await page.evaluate(() => (Date.now = window.realNow));
+
+  // ---- an upgraded PC recolours the same providers: the page boots on the colours it saved, and the tab's rings and
+  // the lip take the new ones in place when the PC answers, no provider having come or gone.
+  const muted = providers(false).filter((p) => pc.enabled.includes(p.id)).map((p) => ({ ...p, color: '#808080' }));
+  await page.evaluate((list) => localStorage.setItem('usage', JSON.stringify({ css: '', theme: 'noir', enabled: list.map((p) => p.id), choices: {}, providers: list, run: 'saved', rev: 1, at: Date.now() })), muted);
+  await page.reload({ waitUntil: 'load' });
+  await until(() => document.body.classList.contains('away'), 'recolour: the page boots on its saved reading');
+  await page.evaluate(() => (window.kept = [...cells.children, ...lip.children]));
   answer = 'ok';
+  await page.evaluate(() => load());
+  await until(() => !document.body.classList.contains('away'), 'recolour: the PC answers');
+  const recolour = await page.evaluate(() => {
+    const now = [...cells.children, ...lip.children];
+    return { same: now.length === kept.length && now.every((el, i) => el === kept[i]), got: now.map((el) => el.style.getPropertyValue('--c')).join(), want: [...data.providers, ...data.providers].map((p) => p.color).join() };
+  });
+  if (!recolour.same || recolour.got !== recolour.want) fail(`recolour: the tab and lip show ${recolour.got}, not the PC's ${recolour.want}${recolour.same ? '' : ', rebuilt'}`);
 
   // ---- against main.js itself, the review's order: the page's first read waits on a slow provider; the
   // stream opens meanwhile on the cached 10% and then drops, its reconnections held; the read then answers

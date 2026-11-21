@@ -34,6 +34,8 @@
     --hot: color-mix(in srgb, #ff4d3d 78%, var(--fg));
     --soft: color-mix(in srgb, var(--fg) 84%, var(--bg));
     --halo: rgb(from var(--bg) r g b); /* the theme's background, made opaque */
+    /* A card's outline, inked as the panel's own border is: a glass theme's line alone is white on a white surface. */
+    --edge: color-mix(in srgb, var(--fg) 14%, var(--line));
     --gap: 8px; /* how far the capsule floats off the screen edge */
     font: 13px/1.35 Geist, 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
     color: var(--fg);
@@ -46,17 +48,19 @@
      baselines, so aligning them to the text's baseline leaves them riding at three different heights. */
   .g { display: inline-grid; place-items: center; width: 1.3em; height: 1.3em; color: var(--c); line-height: 1; }
 
-  /* ---- a hairline: every reading has one, filled to its percentage. Amber from 75%, red from 90%. */
+  /* ---- a hairline: every reading has one, filled to its percentage in the provider's two stops (--c to --c2, which
+     an older main doesn't send). Amber from 75%, red from 90%. */
   .hair {
     --tone: var(--c);
+    --tone2: var(--c2, var(--c));
     display: block;
     height: 2px;
     border-radius: 1px;
-    background: linear-gradient(90deg, var(--tone) var(--p), var(--track) var(--p));
+    background: linear-gradient(90deg, var(--tone), var(--tone2) var(--p), var(--track) var(--p));
     transition: --p 700ms var(--out);
   }
-  .warn > .hair { --tone: var(--warn); }
-  .hot > .hair { --tone: var(--hot); }
+  .warn > .hair { --tone: var(--warn); --tone2: var(--warn); }
+  .hot > .hair { --tone: var(--hot); --tone2: var(--hot); }
   .rewind .hair, .rewind #lip i { transition: none; } /* land on empty, so the next value sweeps up */
 
   /* ---- the capsule. At rest there is no surface at all: the marks, numbers and bars float on whatever
@@ -122,7 +126,7 @@
   .chip b { font-size: 20px; font-weight: 600; line-height: 20px; }
   .chip small { margin-left: 1px; color: var(--soft); font-size: 11px; font-weight: 500; letter-spacing: 0; }
   /* An opaque track: a see-through one turns to grey mud over a bright page, with nothing behind the pill to tint it. */
-  .chip .hair { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--tone) var(--p), color-mix(in srgb, var(--fg) 30%, var(--halo)) var(--p)); }
+  .chip .hair { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--tone), var(--tone2) var(--p), color-mix(in srgb, var(--fg) 30%, var(--halo)) var(--p)); }
   .chip.off small { display: none; }
   .chip.off b { color: var(--dim); font-weight: 400; }
   .chip.warn b { color: var(--warn); }
@@ -143,41 +147,56 @@
     flex-direction: column;
     width: min(300px, calc((100vw - 32px) / var(--z, 1)));
     max-height: calc((100vh - 26px - 60px * var(--s, 1)) / var(--z, 1));
-    padding: 2px 14px 10px;
+    padding: 8px 10px 8px;
     border-top: 1px solid var(--line);
     opacity: 0;
     transition: opacity 140ms linear;
   }
-  .e-bottom .inner { padding: 8px 14px 4px; border-top: 0; border-bottom: 1px solid var(--line); }
+  .e-bottom .inner { padding: 8px 10px 4px; border-top: 0; border-bottom: 1px solid var(--line); }
   /* Above or below a pill wider than the panel (six chips are 490px), the panel fills it rather than leave a bare strip. */
   .e-top .inner, .e-bottom .inner { min-width: min(100%, calc((100vw - 32px) / var(--z, 1))); }
   /* Beside the pill the panel can be the shorter of the two: it fills the height and centres on it. */
   .e-left .inner, .e-right .inner { justify-content: center; width: min(300px, calc((100vw - 26px - 86px * var(--s, 1)) / var(--z, 1))); max-height: calc((100vh - 36px) / var(--z, 1)); padding-top: 8px; border-top: 0; }
-  .e-left .inner { padding-left: 12px; border-left: 1px solid var(--line); }
-  .e-right .inner { padding-right: 12px; border-right: 1px solid var(--line); }
+  .e-left .inner { padding-left: 10px; border-left: 1px solid var(--line); }
+  .e-right .inner { padding-right: 10px; border-right: 1px solid var(--line); }
   .open .inner { opacity: 1; transition-delay: 110ms; }
 
-  #sections { min-height: 0; margin-right: -8px; padding-right: 8px; overflow-y: auto; }
+  /* Two columns, which only a pair of vitals uses side by side (below); every other card spans both. */
+  #sections { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-content: start; gap: 6px; min-height: 0; margin-right: -8px; padding: 0 8px 8px 0; overflow-y: auto; }
   /* The -webkit- form, because the standard scrollbar-width keeps Windows' arrow buttons. */
   #sections::-webkit-scrollbar { width: 4px; }
   #sections::-webkit-scrollbar-thumb { border-radius: 2px; background: var(--line); }
-  /* A hairline between providers, with equal room either side, so the table reads as one ledger. */
-  .prov { padding: 9px 0 10px; }
-  .prov + .prov { border-top: 1px solid var(--line); }
-  /* The mark's box is as tall as the name's first line, so the two share a centre even when the plan wraps. */
-  header { display: flex; align-items: flex-start; gap: 6px; padding-bottom: 2px; }
-  header .g { width: 14px; height: calc(13px * 1.35); font-size: 12px; }
+  /* Each provider is a card washed in its own colour, so they part without rules. All from the theme's surfaces, so a
+     light theme gets light cards. */
+  .prov, #notice {
+    min-width: 0;
+    padding: 7px 10px 8px;
+    border-radius: 11px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--c) 9%, var(--bg-hi)), color-mix(in srgb, var(--bg-hi) 55%, transparent));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 22%, var(--edge)), inset 0 1px 0 var(--highlight);
+  }
+  .prov { grid-column: 1 / -1; }
+  /* CPU and RAM next to each other share a line, half a card each; either alone spans it. */
+  .local:has(+ .local), .local + .local { grid-column: auto; }
+  header { display: flex; align-items: center; gap: 7px; padding-bottom: 3px; }
+  /* The mark in a square of its colour. */
+  header .g { flex-shrink: 0; width: 18px; height: 18px; border-radius: 5px; font-size: 11px; background: color-mix(in srgb, var(--c) 18%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 34%, transparent); }
   header b { flex-shrink: 0; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; } /* the plan tag gives way, never the name */
-  header span:last-child { padding-top: 1px; color: var(--dim); font-size: 11.5px; }
-  /* The plan is a tag, outlined in the same hairline as the rules. */
-  /* One line: a long plan ellipsizes, with the whole name in its tooltip, rather than wrapping into a box. */
-  .prov header span:last-child { min-width: 0; margin: 1px 0 0 auto; padding: 0 6px; border-radius: 5px; box-shadow: inset 0 0 0 1px var(--line); font-size: 11px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header span:last-child { color: var(--dim); font-size: 11.5px; }
+  /* The plan is a pill, ringed in the provider's colour. One line: a long plan ellipsizes, with the whole name in its
+     tooltip, rather than wrapping into a box. */
+  .prov header span:last-child { min-width: 0; margin-left: auto; padding: 0 7px; border-radius: 9px; background: color-mix(in srgb, var(--bg) 50%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 24%, var(--edge)); font-size: 11px; line-height: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .prov header span:empty { display: none; } /* OpenCode Go's plan repeats its name, so the renderer drops it */
   /* The label column is fixed and the bar takes the rest, so it runs from the name to its number. */
   /* 44px for the number: OpenCode Go reports 18.4%, and 40px left it touching the bar. */
-  .row { display: grid; grid-template-columns: 72px minmax(24px, 1fr) 44px 62px; align-items: center; column-gap: 8px; min-height: 22px; font-size: 12.5px; }
+  .row { display: grid; grid-template-columns: 70px minmax(24px, 1fr) 44px 62px; align-items: center; column-gap: 7px; min-height: 22px; font-size: 12.5px; }
   .row .l { color: var(--soft); overflow-wrap: anywhere; }
-  .row .hair { height: 4px; border-radius: 2px; }
+  .row .hair { position: relative; height: 5px; border-radius: 3px; }
+  /* A tick at 75%, where the bar turns amber. Not on the reset's countdown, which is a timer, not a limit. */
+  .row .hair:not(.life) { background: linear-gradient(90deg, transparent calc(75% - 0.5px), color-mix(in srgb, var(--fg) 22%, transparent) 0 calc(75% + 0.5px), transparent 0), linear-gradient(90deg, var(--tone), var(--tone2) var(--p), var(--track) var(--p)); }
+  /* A glow of the fill's own colour, on a layer as wide as the fill: the track and an empty bar have none. --p isn't
+     inherited by itself, so the layer takes the bar's, sweep and all. */
+  .row .hair::before { content: ''; position: absolute; inset: 0 auto 0 0; --p: inherit; width: var(--p); border-radius: inherit; box-shadow: 0 0 6px color-mix(in srgb, var(--tone) 40%, transparent); }
   .row .pc { font-weight: 600; text-align: right; }
   .row .pc small { margin-left: 1px; color: var(--dim); font-size: 10.5px; font-weight: 500; letter-spacing: 0; }
   .row .rs { color: var(--dim); font-size: 11.5px; text-align: right; white-space: nowrap; }
@@ -185,10 +204,40 @@
   .row.zero .l, .row.zero .pc b { color: var(--dim); } /* unused limits step back, so the used ones read first */
   .row.warn .pc b { color: var(--warn); }
   .row.hot .pc b { color: var(--hot); }
-  /* Too narrow for the bar: the number says it alone. */
+  .row .rs:empty { display: none; }
+  /* Antigravity's secondary windows (Other 5h / Other wk) fold under a compact summary line to save panel height. */
+  .ag-more { margin-top: 2px; border-top: 1px solid color-mix(in srgb, var(--c) 14%, var(--line)); }
+  .ag-more summary { display: flex; align-items: center; gap: 6px; padding-top: 5px; list-style: none; cursor: pointer; color: var(--dim); font-size: 11px; font-weight: 500; transition: color 120ms; }
+  .ag-more summary::-webkit-details-marker { display: none; }
+  .ag-more summary:hover { color: var(--soft); }
+  .ag-more summary:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; border-radius: 4px; }
+  .ag-more summary .val { margin-left: auto; color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .ag-more summary .val.warn { color: var(--warn); }
+  .ag-more summary .val.hot { color: var(--hot); }
+  .ag-more summary::after { content: ''; flex-shrink: 0; width: 5px; height: 5px; margin: 0 2px 2px 2px; border: solid currentColor; border-width: 0 1.4px 1.4px 0; transform: rotate(45deg); transition: transform 160ms var(--out); }
+  .ag-more[open] > summary::after { margin-bottom: -2px; transform: rotate(-135deg); }
+  .ag-more-rows { padding-top: 5px; }
+  .ag-more:not([open]) .ag-more-rows { display: none; }
+  /* Only while the panel has two columns: Antigravity's windows two to a line, and a pair of vitals, each limit
+     stacked, its name and number over its bar, the reset under it. */
+  @container (width > 250px) {
+    .cells, .cells .ag-more[open] .ag-more-rows { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 12px; }
+    .cells > :not(.row) { grid-column: 1 / -1; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'l pc' 'bar bar' 'rs rs'; align-items: baseline; gap: 3px 6px; min-height: 0; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .l { grid-area: l; font-size: 11.5px; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .pc { grid-area: pc; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .hair { grid-area: bar; align-self: center; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .rs { grid-area: rs; font-size: 11px; }
+    /* Half a card is too narrow for the plan beside the name ("127.8 GB" would clip): it goes under it, and wraps
+       there rather than lose the end of a CPU's model. */
+    :is(.local:has(+ .local), .local + .local) header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 7px; }
+    :is(.local:has(+ .local), .local + .local) header span:last-child { grid-column: 1 / -1; justify-self: start; max-width: 100%; margin: 0; padding: 1px 7px; white-space: normal; overflow-wrap: anywhere; line-height: 15px; }
+  }
+  /* Too narrow for the bar: the number says it alone, and the cards stack, each a plain list as above. */
   @container (max-width: 250px) {
     .row { grid-template-columns: minmax(0, 1fr) 44px 62px; }
     .row .hair { display: none; }
+    #sections { grid-template-columns: minmax(0, 1fr); }
   }
   .bank, .status { padding-top: 3px; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
   .bank b { color: var(--soft); font-weight: 600; }
@@ -220,9 +269,9 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* A reset takes the panel over for six seconds, then gives it back. */
-  #notice { display: none; padding: 10px 0 2px; }
+  #notice { display: none; }
   .noticing #notice { display: block; }
-  #notice header span:last-child { color: var(--c); font-weight: 500; } /* the event, in the provider's colour */
+  #notice header span:last-child { margin-left: auto; color: var(--c); font-weight: 500; } /* the event, in the provider's colour */
   .noticing #sections, .noticing .foot { display: none; }
   .life { animation: life 6s linear forwards; }
   @keyframes life { from { --p: 100%; } to { --p: 0%; } }
@@ -371,6 +420,8 @@
   const esc = (s) => String(s ?? '').replace(/[<&"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '"': '&quot;' })[c]);
   const level = (pct) => (pct >= 90 ? 'hot' : pct >= 75 ? 'warn' : '');
   const pctText = (n) => String(Math.round(n * 10) / 10);
+  // A provider's colours as custom properties: --c, and the bar's second stop when main sends one.
+  const tint = (p) => '--c:' + esc(p.color) + (p.color2 ? ';--c2:' + esc(p.color2) : '');
   const setP = (el, p) => el.style.setProperty('--p', Math.max(0, Math.min(100, p)) + '%');
   const ago = (t) => {
     const m = Math.floor((Date.now() - t) / 60000);
@@ -397,7 +448,7 @@
   function buildSummary() {
     summary.dataset.ids = ids();
     summary.innerHTML = data.map((p, i) =>
-      '<div class="chip" role="img" style="--c:' + esc(p.color) + '">' +
+      '<div class="chip" role="img" style="' + tint(p) + '">' +
         '<span class="g">' + esc(p.glyph) + '</span><span class="fig"><b>—</b><small>%</small></span>' +
         '<i class="hair" style="transition-delay:' + i * 70 + 'ms"></i>' +
       '</div>').join('');
@@ -415,6 +466,10 @@
       const pct = off ? 0 : p.ringPercent ?? 0;
       const chip = summary.children[i];
       const tab = lip.children[i];
+      // Same providers can still bring new colours (an upgraded main's): repainted in place, so nothing sweeps again.
+      chip.style.setProperty('--c', p.color);
+      p.color2 ? chip.style.setProperty('--c2', p.color2) : chip.style.removeProperty('--c2');
+      tab.style.setProperty('--c', p.color);
       setP(chip.querySelector('.hair'), pct);
       setP(tab, pct);
       for (const el of [chip, tab]) {
@@ -480,6 +535,9 @@
     return '<p class="bank renews">Renews ' + (p.renewsGuess ? 'about ' : '') + '<b class="fig">' + esc(when) + '</b>' + (p.renewsIn ? ' · ' + esc(p.renewsIn) : '') + '</p>';
   }
 
+  let agMoreOpen = false;
+  const isAgPrimary = (r) => r.id === 'gemini-5h' || r.id === 'gemini-weekly' || /^gemini\s+(?:5h|wk|weekly)\b/i.test(r.label || '');
+
   function section(p) {
     const rows = p.rows || [];
     const lines = [];
@@ -490,19 +548,36 @@
     // not, a provider says how old its numbers are.
     if (p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push([ago(p.updatedAt), '']);
     const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : ''; // OpenCode Go's plan is "Go": say it once
-    return '<section class="prov" style="--c:' + esc(p.color) + '">' +
+    const rowHtml = (r) =>
+      '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + (r.id ? 'id:' + r.id : 'label:' + r.label)) + '" data-p="' + r.percent + '">' +
+        '<span class="l">' + esc(r.label) + '</span><i class="hair"></i>' +
+        '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span>' +
+        '<span class="rs">' + esc(r.resets) + '</span>' +
+      '</div>';
+    // Antigravity keeps Gemini 5h & weekly up front and tucks Other / extra windows into a compact collapsible drawer.
+    const primary = p.id === 'antigravity' ? rows.filter(isAgPrimary) : [];
+    const extra = primary.length ? rows.filter((r) => !isAgPrimary(r)) : [];
+    const shown = extra.length ? primary : rows;
+    const morePeak = extra.length ? Math.max(...extra.map((r) => r.percent)) : 0;
+    const moreHtml = extra.length
+      ? '<details class="ag-more"' + (agMoreOpen ? ' open' : '') + '><summary><span>Other</span><span class="val fig ' + level(morePeak) + '">' +
+          extra.map((r) => pctText(r.percent) + '%').join(' · ') + '</span></summary><div class="ag-more-rows">' + extra.map(rowHtml).join('') + '</div></details>'
+      : '';
+    // CPU and RAM are local, which pairs them; Antigravity's windows go two to a line.
+    const cls = (p.local ? ' local' : '') + (p.id === 'antigravity' && (shown.length > 1 || extra.length > 1) ? ' cells' : '');
+    return '<section class="prov' + cls + '" style="' + tint(p) + '">' +
       '<header><span class="g">' + esc(p.glyph) + '</span><b>' + esc(p.name) + '</b><span title="' + esc(plan) + '">' + esc(plan) + '</span></header>' +
-      rows.map((r) =>
-        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '" data-k="' + esc(p.id + '/' + (r.id ? 'id:' + r.id : 'label:' + r.label)) + '" data-p="' + r.percent + '">' +
-          '<span class="l">' + esc(r.label) + '</span><i class="hair"></i>' +
-          '<span class="pc fig"><b>' + pctText(r.percent) + '</b><small>%</small></span>' +
-          '<span class="rs">' + esc(r.resets) + '</span>' +
-        '</div>').join('') +
+      shown.map(rowHtml).join('') + moreHtml +
       banked(p) + credit(p) + renews(p) +
       // Providers write commands in backticks ("run `claude` to sign in"); show them as code.
       lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
     '</section>';
   }
+  sections.addEventListener('toggle', (e) => {
+    if (!e.target.classList?.contains('ag-more')) return;
+    agMoreOpen = e.target.open;
+    sendRects();
+  }, true);
 
   // Hairlines start where the previous markup left them, or empty when the panel is opening.
   function drawSections(opening) {
@@ -558,7 +633,7 @@
     clearTimeout(noticeTimer);
     notice = n;
     if (n) {
-      noticeEl.style.setProperty('--c', n.color);
+      noticeEl.style.cssText = tint(n);
       noticeEl.innerHTML =
         '<header><span class="g">' + esc(n.glyph) + '</span><b>' + esc(n.name) + '</b><span>limit reset</span></header>' +
         n.rows.map((r) => '<div class="row"><span class="l">' + esc(r.label) + '</span><i class="hair life"></i>' +

@@ -13,6 +13,7 @@
   :root {
     /* Noir, until the PC says which theme it wears. */
     --bg: #171b23;
+    --bg-hi: #222833;
     --line: #a4adbb26;
     --fg: #f3f5f8;
     --dim: #a4adbb;
@@ -30,6 +31,8 @@
     --hot: color-mix(in srgb, #ff4d3d 78%, var(--fg));
     --soft: color-mix(in srgb, var(--fg) 84%, var(--bg));
     --surface-or-sheen: var(--surface, linear-gradient(180deg, color-mix(in srgb, var(--fg) 6%, transparent), transparent 120px));
+    /* A card's outline, inked as the panel's own border is: a glass theme's line alone is white on a white surface. */
+    --edge: color-mix(in srgb, var(--fg) 14%, var(--line));
     --z: 1; /* the bubble's size on this phone: Small 0.85, Medium 1, Large 1.2 */
     font: 14px/1.35 Geist, system-ui, sans-serif;
     color: var(--fg);
@@ -120,7 +123,7 @@
       width: 100%;
       max-width: 420px;
       min-height: 0;
-      padding: 4px 16px 10px;
+      padding: 10px 10px 8px;
       border-radius: 22px;
       background-color: var(--bg);
       background-image: var(--surface-or-sheen);
@@ -139,35 +142,80 @@
   @keyframes pull { from { opacity: 0; transform: scale(0.3); } }
   @keyframes push { to { opacity: 0; transform: scale(0.3); } }
 
-  /* ---- the panel, ruled as the PC's: one line per limit, the columns lined up across providers */
+  /* ---- the panel, as the PC's: a card per provider washed in its colour, one line per limit, the columns lined up
+     across providers */
   #usage, #prefs { min-height: 0; overflow-y: auto; overscroll-behavior: contain; container-type: inline-size; }
   .prefs #usage, #prefs { display: none; }
-  .prefs #prefs { display: block; }
-  .prov { padding: 11px 0 12px; }
-  .prov + .prov { border-top: 1px solid var(--line); }
-  header { display: flex; align-items: flex-start; gap: 7px; padding-bottom: 4px; }
-  header .g { width: 16px; height: calc(15px * 1.35); font-size: 14px; }
-  header .logo { width: 14px; height: 14px; }
+  .prefs #prefs { display: flex; }
+  /* Two columns, which only a pair of vitals uses side by side; every other card spans both. */
+  #sections { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 7px; padding-bottom: 8px; }
+  .prov { grid-column: 1 / -1; min-width: 0; padding: 8px 11px 9px; border-radius: 14px; background: linear-gradient(135deg, color-mix(in srgb, var(--c) 9%, var(--bg-hi)), color-mix(in srgb, var(--bg-hi) 55%, transparent)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 22%, var(--edge)), inset 0 1px 0 var(--highlight); }
+  /* CPU and RAM next to each other share a line, half a card each; either alone spans it. */
+  .local:has(+ .local), .local + .local { grid-column: auto; }
+  header { display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+  /* The mark in a square of its colour. */
+  header .g { flex-shrink: 0; width: 22px; height: 22px; border-radius: 6px; font-size: 12px; background: color-mix(in srgb, var(--c) 18%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 34%, transparent); }
+  header .logo { width: 12px; height: 12px; }
   header b { flex-shrink: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
-  header span:last-child { min-width: 0; margin: 1px 0 0 auto; padding: 0 7px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--line); color: var(--dim); font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* The plan, a pill ringed in the provider's colour. */
+  header span:last-child { min-width: 0; margin-left: auto; padding: 0 8px; border-radius: 10px; background: color-mix(in srgb, var(--bg) 50%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 24%, var(--edge)); color: var(--dim); font-size: 12px; line-height: 19px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header span:empty { display: none; }
   .row { display: grid; grid-template-columns: 78px minmax(24px, 1fr) 48px 70px; align-items: center; column-gap: 9px; min-height: 28px; }
-  /* Beside the tab on a narrow phone: too narrow for the bar, so the number says it alone. */
+  .row .l { color: var(--soft); overflow-wrap: anywhere; }
+  /* Filled in the provider's two stops (--c to --c2, which an older PC doesn't send). */
+  .hair { --tone: var(--c); --tone2: var(--c2, var(--c)); position: relative; display: block; height: 5px; border-radius: 3px; background: linear-gradient(90deg, var(--tone), var(--tone2) var(--p), var(--track) var(--p)); animation: fill 700ms var(--out) both; }
+  @keyframes fill { from { --p: 0%; } }
+  /* A glow of the fill's own colour, on a layer as wide as the fill: the track and an empty bar have none. --p isn't
+     inherited by itself, so the layer takes the bar's, sweep and all. */
+  .hair::before { content: ''; position: absolute; inset: 0 auto 0 0; --p: inherit; width: var(--p); border-radius: inherit; box-shadow: 0 0 6px color-mix(in srgb, var(--tone) 40%, transparent); }
+  /* A tick at 75%, where the bar turns amber. */
+  .row .hair { background: linear-gradient(90deg, transparent calc(75% - 0.5px), color-mix(in srgb, var(--fg) 22%, transparent) 0 calc(75% + 0.5px), transparent 0), linear-gradient(90deg, var(--tone), var(--tone2) var(--p), var(--track) var(--p)); }
+  .row .pc { font-weight: 600; text-align: right; }
+  .pc small { margin-left: 1px; color: var(--dim); font-size: 11px; font-weight: 500; letter-spacing: 0; }
+  .row .rs { color: var(--dim); font-size: 12.5px; text-align: right; white-space: nowrap; }
+  .row .rs:empty { display: none; }
+  .row.zero .l, .row.zero .pc { color: var(--dim); }
+  .row.warn .hair { --tone: var(--warn); --tone2: var(--warn); }
+  .row.warn .pc { color: var(--warn); }
+  .row.hot .hair { --tone: var(--hot); --tone2: var(--hot); }
+  .row.hot .pc { color: var(--hot); }
+  /* Antigravity's secondary windows (Other 5h / Other wk) fold under a compact summary line to save panel height. */
+  .ag-more { margin-top: 2px; border-top: 1px solid color-mix(in srgb, var(--c) 14%, var(--line)); }
+  .ag-more summary { display: flex; align-items: center; gap: 6px; min-height: 28px; padding-top: 4px; list-style: none; cursor: pointer; color: var(--dim); font-size: 12px; font-weight: 500; }
+  .ag-more summary::-webkit-details-marker { display: none; }
+  .ag-more summary:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; border-radius: 4px; }
+  .ag-more summary .val { margin-left: auto; color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .ag-more summary .val.warn { color: var(--warn); }
+  .ag-more summary .val.hot { color: var(--hot); }
+  .ag-more summary::after { content: ''; flex-shrink: 0; width: 5px; height: 5px; margin: 0 2px 2px 2px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); transition: transform 160ms var(--out); }
+  .ag-more[open] > summary::after { margin-bottom: -2px; transform: rotate(-135deg); }
+  .ag-more-rows { padding-top: 6px; }
+  .ag-more:not([open]) .ag-more-rows { display: none; }
+  /* Only while the panel has two columns: Antigravity's windows two to a line, and a pair of vitals, each limit
+     stacked, its name and number over its bar, the reset under it. Every figure the PC shows, none cut. */
+  /* Sized so "Gemini wk 100%" keeps one line in the 98px a window gets at 320px with a Large bubble. */
+  @container (width > 220px) {
+    .cells, .cells .ag-more[open] .ag-more-rows { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 10px; }
+    .cells > :not(.row) { grid-column: 1 / -1; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'l pc' 'bar bar' 'rs rs'; align-items: baseline; gap: 4px 4px; min-height: 0; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .l { grid-area: l; font-size: 12px; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .pc { grid-area: pc; font-size: 13.5px; }
+    :is(.cells, .local:has(+ .local), .local + .local) .row .hair { grid-area: bar; align-self: center; display: block; } /* kept below 270px: it has the card's width */
+    :is(.cells, .local:has(+ .local), .local + .local) .row .rs { grid-area: rs; font-size: 12px; }
+    /* Half a card is too narrow for the plan beside the name: it goes under it, and wraps there rather than lose the
+       end of a CPU's model. */
+    :is(.local:has(+ .local), .local + .local) header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 8px; }
+    :is(.local:has(+ .local), .local + .local) header span:last-child { grid-column: 1 / -1; justify-self: start; max-width: 100%; margin: 0; padding: 1px 8px; white-space: normal; overflow-wrap: anywhere; line-height: 16px; }
+  }
+  /* Beside the tab on a narrow phone: too narrow for the bar, so the number says it alone. Narrower still, the cards
+     stack, each a plain list as above. */
   @container (max-width: 270px) {
     .row { grid-template-columns: minmax(0, 1fr) 48px 70px; }
     .row .hair { display: none; }
   }
-  .row .l { color: var(--soft); overflow-wrap: anywhere; }
-  .hair { --tone: var(--c); display: block; height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--tone) var(--p), var(--track) var(--p)); animation: fill 700ms var(--out) both; }
-  @keyframes fill { from { --p: 0%; } }
-  .row .pc { font-weight: 600; text-align: right; }
-  .pc small { margin-left: 1px; color: var(--dim); font-size: 11px; font-weight: 500; letter-spacing: 0; }
-  .row .rs { color: var(--dim); font-size: 12.5px; text-align: right; white-space: nowrap; }
-  .row.zero .l, .row.zero .pc { color: var(--dim); }
-  .row.warn .hair { --tone: var(--warn); }
-  .row.warn .pc { color: var(--warn); }
-  .row.hot .hair { --tone: var(--hot); }
-  .row.hot .pc { color: var(--hot); }
+  @container (max-width: 220px) {
+    #sections { grid-template-columns: minmax(0, 1fr); }
+  }
   .bank, .status { padding-top: 4px; color: var(--dim); font-size: 12.5px; overflow-wrap: anywhere; }
   .bank b { color: var(--soft); font-weight: 600; }
   .status.warn { color: var(--warn); }
@@ -178,7 +226,8 @@
   code { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, currentColor 13%, transparent); font: 0.95em ui-monospace, monospace; }
 
   /* ---- settings, in the same card: the PC's tray menu, plus what only this phone has */
-  #prefs { --ring: var(--fg); padding-bottom: 6px; } /* the page's own ink, for the chosen theme's outline */
+  #prefs { --ring: var(--fg); flex-direction: column; gap: 7px; padding-bottom: 6px; } /* --ring: the page's own ink, for the chosen theme's outline */
+  #prefs > * { flex-shrink: 0; }
   #prefs h4 { padding: 6px 0 6px; font-size: 12px; font-weight: 500; color: var(--dim); }
   .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 8px; }
   /* Each swatch's chip wears its own theme: the theme's colours are set on the chip, and its name stays in the page's. */
@@ -199,16 +248,16 @@
   .pick { padding: 4px 0 10px; }
   .pick .who { display: flex; align-items: center; gap: 6px; padding-bottom: 6px; color: var(--soft); font-size: 13px; }
   .seg { display: flex; flex-wrap: wrap; gap: 6px; }
-  .seg button, .links button { width: auto; height: 34px; margin: 0; padding: 0 12px; border-radius: 17px; box-shadow: inset 0 0 0 1px var(--line); color: var(--soft); font: 500 13px/1 Geist, system-ui, sans-serif; }
+  .seg button, .links button { width: auto; height: 34px; margin: 0; padding: 0 12px; border-radius: 17px; box-shadow: inset 0 0 0 1px var(--edge); color: var(--soft); font: 500 13px/1 Geist, system-ui, sans-serif; }
   .seg button[aria-pressed='true'] { background: var(--fg); box-shadow: none; color: var(--bg); }
   .links { display: flex; flex-wrap: wrap; gap: 6px; }
   .links button { display: inline-flex; align-items: center; gap: 6px; }
-  #remove { width: 100%; height: 44px; margin: 18px 0 0; border-radius: 12px; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hot) 40%, transparent); color: var(--hot); font: 600 14px/1 Geist, system-ui, sans-serif; }
-  #prefs .err { padding-top: 12px; color: var(--hot); font-size: 12.5px; }
-  /* Each group folds to one line, with what it's set to now on the right. */
-  #prefs .awake { margin-top: 6px; }
-  #prefs .awake small { display: block; padding: 2px 0 4px; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
-  #prefs details { border-top: 1px solid var(--line); }
+  #remove { width: 100%; height: 44px; margin: 5px 0 0; border-radius: 14px; background: color-mix(in srgb, var(--hot) 8%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hot) 40%, transparent); color: var(--hot); font: 600 14px/1 Geist, system-ui, sans-serif; }
+  #prefs .err { padding-top: 6px; color: var(--hot); font-size: 12.5px; }
+  /* Keep PC awake and each group are cards; a group folds to one line, with what it's set to now on the right. */
+  #prefs .awake, #prefs details { padding: 0 12px; border-radius: 14px; background: color-mix(in srgb, var(--bg-hi) 70%, transparent); box-shadow: inset 0 0 0 1px var(--edge); }
+  #prefs .awake { padding-block: 8px; } /* room above and below its note, when there is one */
+  #prefs .awake small { display: block; padding-top: 2px; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   #prefs details[open] { padding-bottom: 12px; }
   #prefs summary { display: flex; align-items: center; gap: 10px; min-height: 48px; list-style: none; font-size: 14px; font-weight: 600; color: var(--soft); }
   #prefs summary::-webkit-details-marker { display: none; }
@@ -221,7 +270,7 @@
   .foot { display: flex; align-items: center; flex-shrink: 0; padding-top: 6px; border-top: 1px solid var(--line); } /* the buttons' own padding spaces their icons */
   #ft { flex: 1; min-width: 0; color: var(--dim); font-size: 12.5px; }
   button { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px; padding: 0; color: var(--dim); background: transparent; border: 0; border-radius: 12px; font: inherit; }
-  .foot button:last-child { margin-right: -12px; }
+  .foot button:last-child { margin-right: -6px; }
   button:active:not(:disabled) { color: var(--fg); background: color-mix(in srgb, var(--fg) 10%, transparent); }
   button:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
   button:disabled { opacity: 0.4; }
@@ -311,6 +360,8 @@
   const esc = (s) => String(s ?? '').replace(/[<&"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '"': '&quot;' })[c]);
   const level = (pct) => (pct >= 90 ? 'hot' : pct >= 75 ? 'warn' : '');
   const pctText = (n) => String(Math.round(n * 10) / 10);
+  // A provider's colours as custom properties: --c, and the bar's second stop when the PC sends one.
+  const tint = (p) => '--c:' + esc(p.color) + (p.color2 ? ';--c2:' + esc(p.color2) : '');
   const ago = (t) => {
     const m = Math.floor((Date.now() - t) / 60000);
     return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.floor(m / 60) + ' hr ago' : Math.floor(m / 1440) + ' d ago';
@@ -435,6 +486,10 @@
       const off = !(p.rows || []).length;
       const pct = Math.round(off ? 0 : p.ringPercent ?? 0);
       const c = cells.children[i];
+      // Same providers can still bring new colours (an upgraded PC's, over the ones saved here): repainted in place,
+      // so the rings don't sweep again.
+      c.style.setProperty('--c', p.color);
+      lip.children[i].style.setProperty('--c', p.color);
       c.className = 'cell ' + (off ? 'off' : level(pct));
       c.style.setProperty('--n', Math.max(0, Math.min(100, pct)));
       c.querySelector('b').innerHTML = off ? '—' : pct + '<small>%</small>';
@@ -484,6 +539,9 @@
     return '<p class="bank renews">Renews ' + (p.renewsGuess ? 'about ' : '') + '<b class="fig">' + esc(when) + '</b>' + (p.renewsIn && reached ? ' · ' + esc(p.renewsIn) : '') + '</p>';
   }
 
+  let agMoreOpen = false;
+  const isAgPrimary = (r) => r.id === 'gemini-5h' || r.id === 'gemini-weekly' || /^gemini\s+(?:5h|wk|weekly)\b/i.test(r.label || '');
+
   function section(p) {
     const rows = p.rows || [];
     const lines = [];
@@ -493,19 +551,34 @@
     // not, a provider says how old its numbers are.
     if (p.updatedAt && Date.now() - p.updatedAt > 10 * 60000) lines.push(['Updated ' + ago(p.updatedAt), '']);
     const plan = p.plan && !p.name.endsWith(p.plan) ? p.plan : '';
-    return '<section class="prov" style="--c:' + esc(p.color) + '">' +
+    const rowHtml = (r, i) =>
+      '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '">' +
+        '<span class="l">' + esc(r.label) + '</span>' +
+        '<i class="hair" style="--p:' + Math.max(0, Math.min(100, r.percent)) + '%;animation-delay:' + (120 + i * 40) + 'ms"></i>' +
+        '<span class="pc fig">' + pctText(r.percent) + '<small>%</small></span>' +
+        '<span class="rs">' + esc(r.resets) + '</span>' +
+      '</div>';
+    // Antigravity keeps Gemini 5h & weekly up front and tucks Other / extra windows into a compact collapsible drawer.
+    const primary = p.id === 'antigravity' ? rows.filter(isAgPrimary) : [];
+    const extra = primary.length ? rows.filter((r) => !isAgPrimary(r)) : [];
+    const shown = extra.length ? primary : rows;
+    const morePeak = extra.length ? Math.max(...extra.map((r) => r.percent)) : 0;
+    const moreHtml = extra.length
+      ? '<details class="ag-more"' + (agMoreOpen ? ' open' : '') + '><summary><span>Other</span><span class="val fig ' + level(morePeak) + '">' +
+          extra.map((r) => pctText(r.percent) + '%').join(' · ') + '</span></summary><div class="ag-more-rows">' + extra.map(rowHtml).join('') + '</div></details>'
+      : '';
+    // CPU and RAM are local, which pairs them; Antigravity's windows go two to a line.
+    const cls = (p.local ? ' local' : '') + (p.id === 'antigravity' && (shown.length > 1 || extra.length > 1) ? ' cells' : '');
+    return '<section class="prov' + cls + '" style="' + tint(p) + '">' +
       '<header>' + mark(p, 'g') + '<b>' + esc(p.name) + '</b><span>' + esc(plan) + '</span></header>' +
-      rows.map((r, i) =>
-        '<div class="row ' + (level(r.percent) || (r.percent ? '' : 'zero')) + '">' +
-          '<span class="l">' + esc(r.label) + '</span>' +
-          '<i class="hair" style="--p:' + Math.max(0, Math.min(100, r.percent)) + '%;animation-delay:' + (120 + i * 40) + 'ms"></i>' +
-          '<span class="pc fig">' + pctText(r.percent) + '<small>%</small></span>' +
-          '<span class="rs">' + esc(r.resets) + '</span>' +
-        '</div>').join('') +
+      shown.map(rowHtml).join('') + moreHtml +
       banked(p) + credit(p) + renews(p) +
       lines.map(([text, cls]) => '<p class="status' + cls + '">' + esc(text).replace(/`([^`]+)`/g, '<code>$1</code>') + '</p>').join('') +
     '</section>';
   }
+  sections.addEventListener('toggle', (e) => {
+    if (e.target.classList?.contains('ag-more')) agMoreOpen = e.target.open;
+  }, true);
 
   // ---- settings. The theme, the providers and each summary number belong to the PC and are shared with
   // it; the size and hiding at the edge are this phone's own.

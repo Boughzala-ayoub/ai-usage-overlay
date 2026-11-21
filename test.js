@@ -1391,11 +1391,67 @@ configuredProvider.read()
       mod.setAntigravityCredReader(async () => ({ status: 'ok', data: { id_token_email: 'win@example.com', token: { access_token: 'win-tok', expiry: new Date(clock + 3600_000).toISOString() } } }));
       await ag.read();
       assert.ok(sentAuth.some(([, a]) => a === 'Bearer win-tok'));
+
+      // T3 Code provider store (~/.t3/userdata/providers/antigravity/*/antigravity-acp/antigravity-oauth-token):
+      // beats an expired or older Windows cred, yields to a fresher Windows cred, ignores corrupt sibling dirs,
+      // never bypasses Windows helper timeout/corruption, and yields to explicit ANTIGRAVITY_AUTH_FILE.
+      const t3Root = path.join(codexHome, '.t3', 'userdata', 'providers', 'antigravity');
+      const t3FileA = path.join(t3Root, 'inst-a', 'antigravity-acp', 'antigravity-oauth-token');
+      const t3FileB = path.join(t3Root, 'inst-b', 'antigravity-acp', 'antigravity-oauth-token');
+      const t3FileBad = path.join(t3Root, 'inst-bad', 'antigravity-acp', 'antigravity-oauth-token');
+      for (const f of [t3FileA, t3FileB, t3FileBad]) fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(t3FileBad, '{broken json');
+      fs.writeFileSync(t3FileA, JSON.stringify({ id_token_email: 'win@example.com', token: { access_token: 't3-expired', refresh_token: 'rt-1', expiry: new Date(clock - 10 * 60_000).toISOString() } }));
+      fs.writeFileSync(t3FileB, JSON.stringify({ id_token_email: 'win@example.com', token: { access_token: 't3-fresh', refresh_token: 'rt-1', expiry: new Date(clock + 50 * 60_000).toISOString() } }));
+
+      // Expired Windows cred + live T3 Code token -> picks live T3 token.
+      sentAuth.length = 0;
+      mod.setAntigravityCredReader(async () => ({ status: 'ok', data: { id_token_email: 'win@example.com', token: { access_token: 'win-expired', refresh_token: 'rt-1', expiry: new Date(clock - 40 * 60_000).toISOString() } } }));
+      const fromT3OverExpiredWin = await ag.read();
+      assert.strictEqual(fromT3OverExpiredWin.rows.length, 4, 'live T3 Code token supersedes expired Windows cred');
+      assert.ok(sentAuth.some(([, a]) => a === 'Bearer t3-fresh'));
+
+      // Live Windows cred older than live T3 Code token -> picks fresher T3 token.
+      sentAuth.length = 0;
+      mod.setAntigravityCredReader(async () => ({ status: 'ok', data: { id_token_email: 'win@example.com', token: { access_token: 'win-older', refresh_token: 'rt-1', expiry: new Date(clock + 10 * 60_000).toISOString() } } }));
+      await ag.read();
+      assert.ok(sentAuth.some(([, a]) => a === 'Bearer t3-fresh'), 'fresher live T3 Code token beats older live Windows cred');
+
+      // Live Windows cred fresher than live T3 Code token -> Windows cred wins.
+      sentAuth.length = 0;
+      mod.setAntigravityCredReader(async () => ({ status: 'ok', data: { id_token_email: 'win@example.com', token: { access_token: 'win-newest', refresh_token: 'rt-1', expiry: new Date(clock + 60 * 60_000).toISOString() } } }));
+      await ag.read();
+      assert.ok(sentAuth.some(([, a]) => a === 'Bearer win-newest'), 'fresher live Windows cred beats older T3 Code token');
+
+      // Confirmed Windows absence -> picks live T3 Code token even with expired + corrupt sibling T3 folders.
+      sentAuth.length = 0;
+      fs.rmSync(agCliFallback, { force: true });
+      mod.setAntigravityCredReader(async () => ({ status: 'not_found' }));
+      const fromT3Only = await ag.read();
+      assert.strictEqual(fromT3Only.rows.length, 4, 'confirmed Windows absence uses live T3 Code token');
+      assert.ok(sentAuth.some(([, a]) => a === 'Bearer t3-fresh'));
+
+      // Windows helper timeout or corruption MUST NOT fall back to T3 Code token files.
+      sentAuth.length = 0;
+      mod.setAntigravityCredReader(async () => ({ status: 'error', message: 'Antigravity credential lookup timed out' }));
+      assert.ok((await ag.read()).soft && sentAuth.length === 0, 'Windows timeout never falls back to T3 Code token');
+      mod.setAntigravityCredReader(async () => ({ status: 'invalid' }));
+      assert.ok((await ag.read()).signedOut && sentAuth.length === 0, 'corrupt Windows cred never falls back to T3 Code token');
+
+      // Explicit ANTIGRAVITY_AUTH_FILE ignores T3 Code token files.
+      sentAuth.length = 0;
+      fs.writeFileSync(agAuthFile, JSON.stringify({ id_token_email: 'override@example.com', token: { access_token: 'override-tok', expiry: new Date(clock + 5 * 60_000).toISOString() } }));
+      process.env.ANTIGRAVITY_AUTH_FILE = agAuthFile;
+      await ag.read();
+      assert.ok(sentAuth.some(([, a]) => a === 'Bearer override-tok') && !sentAuth.some(([, a]) => a === 'Bearer t3-fresh'), 'ANTIGRAVITY_AUTH_FILE overrides T3 Code token');
+      delete process.env.ANTIGRAVITY_AUTH_FILE;
+      fs.rmSync(path.join(codexHome, '.t3'), { recursive: true, force: true });
     } finally {
       Date.now = realNow;
       mod.setAntigravityCredReader(null);
       global.fetch = originalFetch;
       fs.rmSync(agCliFallback, { force: true });
+      fs.rmSync(path.join(codexHome, '.t3'), { recursive: true, force: true });
       if (originalAgAuth === undefined) delete process.env.ANTIGRAVITY_AUTH_FILE;
       else process.env.ANTIGRAVITY_AUTH_FILE = originalAgAuth;
     }
@@ -2104,6 +2160,7 @@ async function antigravityMainChecks() {
       assert.strictEqual(reenabled.providers.find((p) => p.id === 'antigravity').rows.length, 0, 're-enabling hides previous account rows from immediate phone payload');
       const desktopPush = sent.find(([ch, d]) => ch === 'data' && d.some((p) => p.id === 'antigravity'));
       assert.strictEqual(desktopPush[1].find((p) => p.id === 'antigravity').rows.length, 0, 'and from immediate desktop broadcast');
+      assert.ok(desktopPush[1].every((p) => typeof p.color2 === 'string' && p.color2), "every provider, a hidden one too, carries its bar's second stop");
       for (let i = 0; i < 50 && !releaseReenableB; i++) await new Promise((r) => setTimeout(r, 5));
       assert.ok(releaseReenableB, 're-enabling verifies credentials and fetches B immediately despite recent 5m fetch');
       releaseReenableB();
@@ -7751,9 +7808,12 @@ async function antigravityMainChecks() {
     const legacyOpts = JSON.parse((await ask('GET', '/api/options')).body);
     assert.ok(!legacyOpts.providers.some((p) => p.id === 'antigravity'), 'bare /api/options omits Antigravity from legacy clients that cannot toggle it');
     assert.strictEqual(legacyOpts.choices.antigravity, undefined, 'and omits Antigravity choices for legacy clients');
+    assert.strictEqual(legacyOpts.pages.antigravity, undefined, 'and omits Antigravity usage page for legacy clients');
     const optsResp = JSON.parse((await ask('GET', '/api/options?toggle=1')).body);
     assert.strictEqual(optsResp.capabilities?.toggleProvider, true, '/api/options?toggle=1 advertises toggleProvider support');
     assert.ok(optsResp.providers.some((p) => p.id === 'antigravity'), '/api/options?toggle=1 exposes Antigravity to toggle-capable clients');
+    assert.strictEqual(optsResp.pages.antigravity, 'https://antigravity.google.com/remote?settingsOpen=true&settingsScreen=General', '/api/options?toggle=1 exposes Antigravity usage page');
+    assert.ok(optsResp.providers.every((p) => typeof p.color2 === 'string' && p.color2), "and each provider's bar's second stop");
     for (const bad of [null, [], 'codex', { id: 1, enabled: true }, { id: 'codex', enabled: 'yes' }]) {
       assert.strictEqual((await ask('POST', '/api/settings', JSON.stringify({ toggleProvider: bad }))).status, 400);
     }

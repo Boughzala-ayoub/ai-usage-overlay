@@ -13,7 +13,7 @@ const chrome = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Applic
 const shots = path.join(os.tmpdir(), 'ai-usage-overlay-ui');
 const themes = process.env.UI_THEME ? THEMES.filter(([id]) => process.env.UI_THEME.split(',').includes(id)) : THEMES;
 const edges = ['left', 'right', 'top', 'bottom'];
-const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
+const states = ['hidden', 'rest', 'open', 'reset', 'codex', 'codex-zero', 'codex-offline', 'codex-expiry-missing', 'codex-multiple', 'ag-one', 'ag-many', 'ag-error', 'vitals-one', 'claude-banked', 'claude-credit', 'claude-credit-stale', 'claude-credit-lapsed', 'claude-credit-expired', 'warning', 'limited', 'limited-one', 'error', 'xai-unavailable', 'loading', 'long', 'refreshing'];
 const shows = ['hidden', 'rest', 'open', 'reset']; // what every theme is checked in
 const viewports = [320, 375, 768, 1024, 1280].map((width) => ({ width, height: 700 }));
 // The native windows at Size = Large for the seven providers below, each only on the edges main gives that shape.
@@ -33,7 +33,7 @@ const VXL = (320 - 32) / (7 * 56);
 viewports.push({ width: Math.ceil(8 + 86 * VXL + 375 + 16), height: 320, edges: ['left', 'right'], scale: VXL, panel: 1.25 });
 const data = [
   {
-    id: 'claude', name: 'Claude', glyph: '✳', color: '#d97757', plan: 'Max 5x', ringPercent: 37,
+    id: 'claude', name: 'Claude', glyph: '✳', color: '#ff7043', color2: '#ff966b', plan: 'Max 5x', ringPercent: 37,
     renewsAt: Date.now() + 232 * 3600_000, renewsGuess: true, renewsIn: 'in 9d 16h', // worked out, so "about"
     rows: [
       { label: 'Session', percent: 37, resets: 'in 2h 10m' },
@@ -43,7 +43,7 @@ const data = [
     updatedAt: Date.now(),
   },
   {
-    id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', plan: 'Pro Lite', ringPercent: 4,
+    id: 'codex', name: 'Codex', glyph: '◉', color: '#00d09c', color2: '#38f0be', plan: 'Pro Lite', ringPercent: 4,
     renewsAt: Date.now() + 193 * 3600_000, renewsIn: 'in 8d 1h',
     bankedResets: 1,
     bankedResetExpiries: [Date.parse('2026-10-04T05:36:14Z')],
@@ -51,7 +51,7 @@ const data = [
     updatedAt: Date.now(),
   },
   {
-    id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283', plan: 'Go', ringPercent: 33,
+    id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#ff9f43', color2: '#ffc77d', plan: 'Go', ringPercent: 33,
     rows: [
       { label: '5h limit', percent: 18, resets: 'in 3h 5m' },
       { label: 'Weekly', percent: 33, resets: 'in 4d 1h' },
@@ -61,12 +61,12 @@ const data = [
   },
   {
     // xAI's mark is monochrome, so it takes the theme's ink, in every theme.
-    id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', plan: '', ringPercent: 42.5,
+    id: 'xai', name: 'xAI', glyph: '✕', color: 'var(--fg)', color2: 'color-mix(in srgb, var(--fg) 72%, var(--dim))', plan: '', ringPercent: 42.5,
     rows: [{ label: 'Weekly', percent: 42.5, resets: 'in 5d 6h' }, { label: 'Monthly', percent: 25, resets: 'in 18d 12h' }],
     updatedAt: Date.now(),
   },
   {
-    id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#4285f4', plan: 'AI Ultra', ringPercent: 4.6,
+    id: 'antigravity', name: 'Antigravity', glyph: '✦', color: '#3b8bff', color2: '#72b3ff', plan: 'AI Ultra', ringPercent: 4.6,
     rows: [
       { id: 'gemini-5h', label: 'Gemini 5h', percent: 4.6, resets: 'in 3h 50m' },
       { id: 'gemini-weekly', label: 'Gemini wk', percent: 2.4, resets: 'in 6d 22h' },
@@ -76,8 +76,8 @@ const data = [
     updatedAt: Date.now(),
   },
   // This PC: a long CPU model in the plan tag, and RAM's GB in the reset column.
-  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#5b9cf5', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: 23, local: true, rows: [{ label: 'Load', percent: 23, resets: '' }], updatedAt: Date.now() },
-  { id: 'ram', name: 'RAM', glyph: '▤', color: '#b48cf2', plan: '127.8 GB', ringPercent: 58, local: true, rows: [{ label: 'In use', percent: 58, resets: '112.4 GB' }], updatedAt: Date.now() },
+  { id: 'cpu', name: 'CPU', glyph: '▦', color: '#36a9ff', color2: '#76ceff', plan: 'AMD Ryzen 9 7950X3D 16-Core Processor', ringPercent: 23, local: true, rows: [{ label: 'Load', percent: 23, resets: '' }], updatedAt: Date.now() },
+  { id: 'ram', name: 'RAM', glyph: '▤', color: '#bc7eff', color2: '#dab2ff', plan: '127.8 GB', ringPercent: 58, local: true, rows: [{ label: 'In use', percent: 58, resets: '112.4 GB' }], updatedAt: Date.now() },
 ];
 
 fs.mkdirSync(shots, { recursive: true });
@@ -124,6 +124,14 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
       if (state === 'codex-offline') delete data[1].bankedResets;
       if (state === 'codex-expiry-missing') delete data[1].bankedResetExpiries;
       if (state === 'codex-multiple') { data[1].bankedResets = 2; data[1].bankedResetExpiries.push(Date.parse('2026-10-12T18:15:00Z')); }
+      // Antigravity's grid as it degrades: one window, a fifth, none at all. And one vitals provider on its own.
+      if (state === 'ag-one') data[4].rows = data[4].rows.slice(0, 1);
+      if (state === 'ag-many') {
+        data[4].rows.push({ id: 'gemini-4-argon-5h', label: 'Gemini 4 Argon 5h', percent: 81, resets: 'in 1h 5m' });
+        data[4].note = 'Live refresh unavailable; showing the most recent usage.';
+      }
+      if (state === 'ag-error') { data[4].rows = []; data[4].error = 'Session expired — open Antigravity.'; }
+      if (state === 'vitals-one') data.splice(6, 1);
       if (state === 'warning') data[0].rows[0].percent = data[0].ringPercent = 96;
       if (state === 'limited') data.forEach((p) => (p.waitMs = 90000));
       if (state === 'limited-one') { data[0].waitMs = 90000; data[0].updatedAt = Date.now() - 15 * 60000; } // gated, and behind
@@ -141,7 +149,7 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
       ev.layout({ edge, count: data.length, theme, css, scale, panel: panelZoom });
       ev.data(data);
       ev.reveal(state !== 'hidden');
-      if (state === 'reset') ev.reset({ id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', rows: [{ label: 'Weekly', percent: 0 }] });
+      if (state === 'reset') ev.reset({ id: 'codex', name: 'Codex', glyph: '◉', color: '#00d09c', color2: '#38f0be', rows: [{ label: 'Weekly', percent: 0 }] });
       else if (!['hidden', 'rest'].includes(state)) ev.open(true);
       if (state === 'refreshing') document.querySelector('#rf').click();
     }, { data, edge, theme, css, state, scale, panelZoom });
@@ -182,6 +190,39 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
         status: [...document.querySelectorAll('.status')].map((el) => el.textContent),
         bank: [...document.querySelectorAll('.bank:not(.renews)')].map((el) => el.textContent),
         renews: [...document.querySelectorAll('.renews')].map((el) => el.textContent),
+        // Where the cards landed: Antigravity's windows two to a line, CPU and RAM side by side, each only while the
+        // panel is wide enough for two columns.
+        layout: (() => {
+          const secs = [...document.querySelectorAll('#sections .prov')];
+          const named = (n) => secs.find((s) => s.querySelector('header b')?.textContent === n);
+          const at = (el) => { const b = el?.getBoundingClientRect(); return b && { left: b.left, top: b.top, width: b.width }; };
+          const ag = named('Antigravity');
+          return {
+            wide: getComputedStyle(document.querySelector('#sections')).gridTemplateColumns.trim().split(' ').length === 2,
+            all: document.querySelector('#sections').getBoundingClientRect().width, // zoomed, as the cards' are
+            cells: !!ag?.classList.contains('cells'),
+            agCols: new Set((ag ? [...ag.querySelectorAll('.row')].filter((r) => r.getClientRects().length) : []).map((r) => Math.round(r.getBoundingClientRect().left))).size,
+            agNarrowLines: (ag ? [...ag.querySelectorAll('p')] : []).filter((p) => p.offsetWidth < ag.clientWidth - 22).length, // a line under the grid spans it
+            cpu: at(named('CPU')),
+            ram: at(named('RAM')),
+            // Narrow: every limit a plain line (three columns, no bar), and every plan level with its name.
+            bars: [...document.querySelectorAll('#sections .hair')].filter((h) => h.getClientRects().length).length,
+            stacked: [...document.querySelectorAll('#sections .row')].filter((r) => r.getClientRects().length && (getComputedStyle(r).gridTemplateAreas !== 'none' || getComputedStyle(r).gridTemplateColumns.split(' ').length !== 3)).length,
+            askew: secs.filter((s) => {
+              const [b, p] = [s.querySelector('header b'), s.querySelector('header span:last-child')].map((e) => e.getBoundingClientRect());
+              return p.height && Math.abs(b.top + b.height / 2 - (p.top + p.height / 2)) > 2;
+            }).map((s) => s.querySelector('header b').textContent),
+          };
+        })(),
+        // The glow is the fill's alone: none on the track, none at 0%. Its layer is as wide as the fill.
+        glow: [...document.querySelectorAll('#sections .hair, #notice .hair')].filter((h) => h.getClientRects().length).flatMap((h) => {
+          const cs = getComputedStyle(h);
+          const want = (parseFloat(cs.width) * parseFloat(cs.getPropertyValue('--p'))) / 100;
+          const got = parseFloat(getComputedStyle(h, '::before').width);
+          return cs.filter !== 'none' || !(Math.abs(got - want) < 0.5) ? [h.parentNode.querySelector('.l').textContent + ': ' + cs.filter + ', ' + got + ' of ' + want] : [];
+        }),
+        // The reset's countdown is a bar alone: no 75% tick.
+        lifeLayers: (getComputedStyle(document.querySelector('#notice .hair') || document.body).backgroundImage.match(/gradient\(/g) || []).length,
         rects: window.__rects,
       };
     }, { state, edge });
@@ -203,6 +244,23 @@ for (const { width, height, edges: only, scale, panel: panelZoom } of viewports)
     if (state === 'reset' && !result.noticing) bad.push('reset notice');
     if (['open', 'warning', 'refreshing'].includes(state) && result.rows !== 15) bad.push('one row per limit');
     if (state === 'long' && result.rows !== 20) bad.push('long rows');
+    if (state === 'ag-many' && result.rows !== 16) bad.push('a fifth Antigravity window');
+    if (panel && result.layout.wide) {
+      const { all, cells, agCols, cpu, ram } = result.layout;
+      const agRows = { 'ag-one': 1, 'ag-error': 0 }[state] ?? 2;
+      if (cells !== agRows > 1 || agCols !== agRows || result.layout.agNarrowLines) bad.push('Antigravity grid');
+      const paired = cpu && ram && Math.abs(cpu.top - ram.top) < 1 && cpu.left < ram.left && cpu.width < 0.6 * all && ram.width < 0.6 * all;
+      if (state === 'vitals-one' ? ram || !(cpu.width > 0.8 * all) : !paired) bad.push('vitals pairing');
+    }
+    // One column: Antigravity's windows and the vitals go back to plain lines and whole cards, as every other provider.
+    if (panel && !result.layout.wide) {
+      const { all, bars, stacked, askew, cpu, ram } = result.layout;
+      if (bars || stacked) bad.push(`narrow rows: ${bars} bars, ${stacked} stacked`);
+      if ([cpu, ram].some((v) => v && v.width < 0.8 * all)) bad.push('narrow vitals still halves');
+      if (askew.length) bad.push('narrow plan under its name: ' + askew);
+    }
+    if (result.glow.length) bad.push('glow off the fill: ' + result.glow.join(' | '));
+    if (state === 'reset' && result.lifeLayers !== 1) bad.push('a 75% tick on the reset countdown');
     if (['limited', 'refreshing'].includes(state) !== result.disabled) bad.push('refresh enabled state');
     // A rate limit is never shown, in any state. Numbers that have fallen behind say how old they are, gated or not.
     if (result.status.some((s) => s.includes('Rate limited'))) bad.push('rate-limit line');
@@ -289,6 +347,12 @@ for (const edge of edges) {
     check(document.querySelector('#details').getAnimations().length > 0, 'Capsule does not grow');
     check(document.querySelector('#sections .row .hair').getAnimations().length > 0, 'Rows do not fill as the panel opens');
     check(document.querySelector('#sections .row .pc b').textContent === '0', 'Row numbers do not count up as the panel opens');
+    // Mid-sweep, the glow's layer is as wide as the fill is then.
+    await new Promise((r) => setTimeout(r, 400));
+    const hair = getComputedStyle(document.querySelector('#sections .row .hair'));
+    const p = parseFloat(hair.getPropertyValue('--p'));
+    const glow = parseFloat(getComputedStyle(document.querySelector('#sections .row .hair'), '::before').width);
+    check(p > 0 && Math.abs(glow - (parseFloat(hair.width) * p) / 100) < 0.5, `The glow does not follow the sweep: ${glow}px at ${p}%`);
     await settle();
     check(still(chipsAt(), before), 'Chips moved while the capsule grew: ' + before + ' -> ' + chipsAt());
     check(document.querySelector('#details').getBoundingClientRect().width > 250, 'Panel did not open');
@@ -304,7 +368,7 @@ for (const edge of edges) {
     await settle();
     check(document.querySelector('#details').getBoundingClientRect().width === 0, 'Panel did not close');
     check(still(chipsAt(), before), 'Chips moved while the capsule shrank');
-    ev.reset({ id: 'codex', name: 'Codex', glyph: '◉', color: '#10a37f', rows: [{ label: 'Weekly', percent: 0 }] });
+    ev.reset({ id: 'codex', name: 'Codex', glyph: '◉', color: '#00d09c', color2: '#38f0be', rows: [{ label: 'Weekly', percent: 0 }] });
     await settle();
     check(document.body.classList.contains('noticing') && document.querySelector('#notice').offsetHeight > 0, 'Reset notice did not open the capsule');
     ev.open(true);
@@ -335,9 +399,46 @@ await page.evaluate((data) => {
   const ev = window.__overlayEvents;
   ev.layout({ edge: 'right', theme: 'noir' });
   ev.data(data);
-  ev.data([data[1], { ...data[0], id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#fab283' }]);
+  ev.data([data[1], { ...data[0], id: 'opencode-go', name: 'OpenCode Go', glyph: '▣', color: '#ff9f43', color2: '#ffc77d' }]);
   const chips = [...document.querySelectorAll('.chip')].map((c) => c.querySelector('.g').textContent + c.style.getPropertyValue('--c'));
-  if (chips.join() !== '◉#10a37f,▣#fab283') throw new Error('Chips kept the old providers\' marks: ' + chips);
+  if (chips.join() !== '◉#00d09c,▣#ff9f43') throw new Error('Chips kept the old providers\' marks: ' + chips);
+}, data);
+// New colours for the same providers (an upgraded main's) reach the chips and the lip in place, a second stop dropped
+// with them.
+await page.evaluate((data) => {
+  const ev = window.__overlayEvents;
+  ev.data(data);
+  const kept = [...document.querySelectorAll('.chip, #lip i')];
+  ev.data(data.map((p, i) => ({ ...p, color: '#123456', color2: i ? '#654321' : undefined })));
+  const now = [...document.querySelectorAll('.chip, #lip i')];
+  const got = now.map((el) => el.style.getPropertyValue('--c') + '/' + el.style.getPropertyValue('--c2')).join();
+  const want = [...data.map(() => '#123456/'), ...data.map((p, i) => '#123456/' + (i ? '#654321' : ''))].join(); // the lip comes first
+  ev.data(data);
+  if (got !== want || now.some((el, i) => el !== kept[i])) throw new Error('Recoloured providers kept their old colours: ' + got);
+}, data);
+// Antigravity's Other windows fold by default, expand into two columns on click, and stay open across data redraws.
+await page.evaluate(async (data) => {
+  const ev = window.__overlayEvents;
+  ev.layout({ edge: 'right', theme: 'noir' });
+  ev.data(data);
+  ev.reveal(true);
+  ev.open(true);
+  const ag = [...document.querySelectorAll('#sections .prov')].find((s) => s.querySelector('header b')?.textContent === 'Antigravity');
+  const more = ag?.querySelector('.ag-more');
+  if (!more || more.open) throw new Error('Antigravity Other drawer should start folded');
+  if ([...ag.querySelectorAll('.row')].filter((r) => r.getClientRects().length).length !== 2) throw new Error('Folded Antigravity should show only Gemini 5h and Gemini wk');
+  more.querySelector('summary').click();
+  await new Promise((r) => setTimeout(r, 20));
+  if (!more.open) throw new Error('Clicking Antigravity Other summary did not expand it');
+  const vis = [...ag.querySelectorAll('.row')].filter((r) => r.getClientRects().length);
+  if (vis.length !== 4) throw new Error('Expanded Antigravity should show all 4 rows, got ' + vis.length);
+  // A fresh data push keeps the drawer open.
+  ev.data(data.map((p) => p.id === 'antigravity' ? { ...p, rows: p.rows.map((r) => ({ ...r, percent: r.percent + 1 })) } : p));
+  const after = [...document.querySelectorAll('#sections .prov')].find((s) => s.querySelector('header b')?.textContent === 'Antigravity')?.querySelector('.ag-more');
+  if (!after?.open) throw new Error('Antigravity Other drawer collapsed after a data update');
+  after.querySelector('summary').click();
+  await new Promise((r) => setTimeout(r, 20));
+  ev.data(data);
 }, data);
 // The footer dates the usage, not CPU and RAM, which are always fresh; with only those two it dates them.
 await page.evaluate((data) => {
