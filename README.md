@@ -15,8 +15,8 @@ Includes a paired **Android companion bubble** (`phone/`) that mirrors live quot
     <th align="center">Android Companion Bubble</th>
   </tr>
   <tr>
-    <td align="center"><img src="docs/pc-demo.gif" alt="Windows desktop AI usage overlay HUD animated demo" width="420" /></td>
-    <td align="center"><img src="docs/phone-demo.gif" alt="Android companion floating bubble animated demo" width="320" /></td>
+    <td align="center"><img src="docs/pc-demo.webp" alt="Windows desktop AI usage overlay HUD animated demo" width="420" /></td>
+    <td align="center"><img src="docs/phone-demo.webp" alt="Android companion floating bubble animated demo" width="320" /></td>
   </tr>
 </table>
 
