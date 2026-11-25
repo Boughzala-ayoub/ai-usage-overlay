@@ -7,6 +7,30 @@ panel grows out with its own surface: a compact table of every provider and ever
 what's used and when it resets. Drag the numbers to any edge of any monitor. The rest of the window
 is transparent and click-through, so the overlay never eats a click meant for whatever is under it.
 
+Includes a paired **Android companion bubble** (`phone/`) that mirrors live quotas from your PC over LAN/SSE, lets you switch themes or toggle providers remotely, and works over any app.
+
+<table>
+  <tr>
+    <th align="center">Windows Desktop HUD</th>
+    <th align="center">Android Companion Bubble</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/pc-demo.gif" alt="Windows desktop AI usage overlay HUD animated demo" width="420" /></td>
+    <td align="center"><img src="docs/phone-demo.gif" alt="Android companion floating bubble animated demo" width="320" /></td>
+  </tr>
+</table>
+
+<details>
+<summary>Static high-DPI screenshots (PC &amp; Android)</summary>
+<br />
+<table>
+  <tr>
+    <td align="center"><img src="docs/pc-overlay.png" alt="PC desktop overlay expanded panel" width="420" /></td>
+    <td align="center"><img src="docs/phone-overlay.png" alt="Android companion expanded panel" width="320" /></td>
+  </tr>
+</table>
+</details>
+
 ```
 npm install
 node node_modules/electron/install.js   # electron no longer fetches its binary on install; this does
