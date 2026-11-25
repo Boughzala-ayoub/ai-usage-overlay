@@ -2,3 +2,5 @@ node_modules/
 dist*/
 *.log
 phone/out/
+
+mockup-redesign.html
