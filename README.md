@@ -1,4 +1,6 @@
-# AI usage overlay v3
+# AI Usage Overlay
+
+[![CI](https://github.com/Boughzala-ayoub/ai-usage-overlay/actions/workflows/ci.yml/badge.svg)](https://github.com/Boughzala-ayoub/ai-usage-overlay/actions/workflows/ci.yml)
 
 A few numbers floating just off a screen edge, with no box behind them. For each AI subscription
 there is the provider's mark, its usage and a thin bar filled to that percentage. A thin outline in
@@ -40,16 +42,9 @@ npm run test:ui                         # the renderer in headless Chrome, every
 npm run build                           # dist\AIUsageOverlayV3-Setup-3.0.0.exe
 ```
 
-## v3 beside v2
+## Credentials & Privacy
 
-v3 is its own app, not an upgrade. It installs as `AI Usage Overlay v3` from
-`AIUsageOverlayV3-Setup-<version>.exe`, with app id `com.local.ai-usage-overlay-v3`, its own install
-folder and its own settings in `%APPDATA%\ai-usage-overlay-v3`, so installing or removing it leaves
-v2 as it was. On its first save it copies v2's `state.json` (edge, theme, size, providers, last
-readings, rate-limit gate) and never writes to v2's file.
-
-While both run, both poll the endpoints, and whichever started first owns Ctrl+Alt+U. The v3 tray
-icon is three level rows, so you can tell the two apart.
+All credential lookups are **strictly read-only and local**: tokens are read from the provider CLI credential files already on your machine and sent only to each provider's own usage endpoint over HTTPS. Nothing is logged, stored elsewhere, or forwarded to any third-party server. Note that some providers expose usage via undocumented internal endpoints, which can change without notice.
 
 ## Providers
 
